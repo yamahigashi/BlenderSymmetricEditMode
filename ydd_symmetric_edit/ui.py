@@ -25,7 +25,7 @@ class YSE_AddonPreferences(bpy.types.AddonPreferences):
         enabled: BoolProperty(
             name="Enable Symmetric Edit Mode",
             description=(
-                "Mirror Blender's native Knife, Loop Cut, Offset Edge Loop Cut, Vertex Connect, and Merge Vertices"
+                "Mirror Blender's native Knife, Loop Cut, Offset Edge Loop Cut, Rip, Vertex Connect, and Merge Vertices"
             ),
             default=False,
             update=_update_persistent_mode,
@@ -34,7 +34,7 @@ class YSE_AddonPreferences(bpy.types.AddonPreferences):
     def draw(self, _context):
         layout = self.layout
         layout.prop(self, "enabled", toggle=True)
-        layout.label(text="Knife, Loop Cut, Offset Edge Loop Cut, Connect (J), Merge (M)")
+        layout.label(text="Knife, Loop Cut, Offset Edge Loop Cut, Rip (V), Connect (J), Merge (M)")
         layout.label(text="Native events and tools are not replaced.")
 
 
@@ -127,7 +127,7 @@ class VIEW3D_PT_ydd_symmetric_edit(bpy.types.Panel):
         layout.prop(settings, "tolerance")
         box = layout.box()
         if preferences is not None and preferences.enabled:
-            box.label(text="Cut, Connect (J), and Merge (M) are mirrored.")
+            box.label(text="Cut, Rip (V), Connect (J), and Merge (M) are mirrored.")
         else:
             box.label(text="Symmetric editing is disabled.")
         box.label(text="Use the native tool on one side, then confirm.")

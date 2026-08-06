@@ -68,6 +68,44 @@ class PathEdgeSignature:
 PathSignature: TypeAlias = tuple[PathEdgeSignature, ...]
 
 
+@dataclass(frozen=True, slots=True, order=True)
+class RipDupSignature:
+    """One duplicated-vertex-ID group in a native Rip result."""
+
+    vertex_id: int
+    coordinates: tuple[Coordinate3D, ...]
+
+
+RipSignature: TypeAlias = tuple[RipDupSignature, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class RipVertexRecord:
+    """Pre-rip facts about one vertex in the selection or its one-ring."""
+
+    vertex_id: int
+    location: Coordinate3D
+    mirror_vertex_id: int | None
+    face_ids: tuple[int, ...]
+    selected: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RipSnapshot:
+    """Immutable pre-rip capture for the REFLECT Rip postprocess.
+
+    Covers the selected vertices and their one-ring neighborhood; every edge
+    the native Rip can duplicate has both endpoints inside this region.
+    """
+
+    axis_index: int
+    tolerance: float
+    vertices: tuple[RipVertexRecord, ...]
+
+    def record_by_id(self) -> dict[int, RipVertexRecord]:
+        return {record.vertex_id: record for record in self.vertices}
+
+
 @dataclass(frozen=True, slots=True)
 class MeshSelectionMode:
     """Blender's vertex / edge / face selection-mode flags."""
@@ -206,10 +244,11 @@ class KnifeSession:
     symmetry_flags: SymmetryAxes = SymmetryAxes(False, False, False)
     symmetry_suspended: bool = False
     modal_absent_since: float | None = None
-    path_signature: PathSignature | None = None
+    path_signature: PathSignature | RipSignature | None = None
     stable_path_ticks: int = 0
     offset_use_cap_endpoint: bool = False
     native_operator_pointer: int = 0
+    rip: RipSnapshot | None = None
 
 
 @dataclass

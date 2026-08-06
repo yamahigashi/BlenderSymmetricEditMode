@@ -7,9 +7,9 @@ symmetrical mesh:
 - **Cut tools** — **Knife**, **Loop Cut**, and **Offset Edge Loop Cut**. The
   native modal interaction stays untouched; once the operation is confirmed,
   the new topology is reproduced on the opposite side.
-- **Topology edits** — **Vertex Connect (J)** and **Merge Vertices (M)**. The
-  operation runs on the selected side and is applied to the mirrored vertices
-  in the same step.
+- **Topology edits** — **Rip (V / Alt+V)**, **Vertex Connect (J)**, and
+  **Merge Vertices (M)**. The operation runs on the selected side and is
+  applied to the mirrored vertices in the same step.
 
 In both cases the native tool remains the one you are using: shortcuts, modal
 controls, operator options, and the Adjust Last Operation (F9) panel all stay
@@ -57,6 +57,33 @@ Undo and Redo treat each confirmed native-plus-mirrored result as one
 operation. Loop Cut and Offset changes made through **Adjust Last Operation
 (F9)** receive the same mirrored post-process; the redo panel itself remains
 the native operator.
+
+## Rip (V / Alt+V)
+
+With the add-on enabled and one symmetry axis active, **Rip** and **Rip Fill**
+are mirrored after the native confirmation:
+
+- Press **V** (or **Alt+V** for Rip Fill) on a selection on one side, drag,
+  and confirm as usual. The same seam is then opened on the opposite side and
+  the mirrored vertices receive the reflected final positions. Fill bridge
+  faces are recreated with the source fill's material, smoothing, and UVs.
+- Edge paths, single vertices, mesh-boundary seams, and zero-distance rips
+  (including Esc, which natively keeps the rip) are all reproduced. Native
+  Rip tears one connected seam per press; the mirror follows exactly what the
+  native tool ripped.
+- The whole native-plus-mirrored result is one undo step. If the mirror side
+  cannot be reproduced (asymmetric topology, missing counterparts), the
+  native rip is kept, the mirror step is rolled back completely, and a
+  warning is reported.
+
+Rip passes through to the native tool without mirroring — with a report —
+when the selection touches the symmetry plane, spans both sides, or when
+Proportional Editing or Auto Merge is enabled.
+
+**Adjust Last Operation (F9) is not supported for Rip.** This is a limitation
+of Blender itself: re-executing `Rip and Move` cannot repeat the rip, so the
+native redo panel moves the un-ripped vertices instead (with or without this
+add-on). Adjust the gap by moving the still-selected vertices (G) instead.
 
 ## Vertex Connect and Merge (J / M)
 

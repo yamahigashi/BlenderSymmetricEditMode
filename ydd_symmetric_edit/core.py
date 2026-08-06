@@ -50,6 +50,7 @@ FACE_SELECTION_LAYER = ".yse_face_selection"
 VERT_HIDDEN_LAYER = ".yse_vertex_hidden"
 EDGE_HIDDEN_LAYER = ".yse_edge_hidden"
 VERT_BACKUP_ID_LAYER = ".yse_backup_vertex_id"
+VERT_RIP_ID_LAYER = ".yse_rip_vertex_id"
 
 TEMP_LAYER_NAMES = (
     EDGE_ORIGINAL_LAYER,
@@ -63,6 +64,7 @@ TEMP_LAYER_NAMES = (
     VERT_HIDDEN_LAYER,
     EDGE_HIDDEN_LAYER,
     VERT_BACKUP_ID_LAYER,
+    VERT_RIP_ID_LAYER,
 )
 
 AXIS_INDEX = {"X": 0, "Y": 1, "Z": 2}
@@ -309,6 +311,7 @@ def remove_temporary_layers(bm: bmesh.types.BMesh) -> bool:
         (bm.verts.layers.int, VERT_HIDDEN_LAYER),
         (bm.edges.layers.int, EDGE_HIDDEN_LAYER),
         (bm.verts.layers.int, VERT_BACKUP_ID_LAYER),
+        (bm.verts.layers.int, VERT_RIP_ID_LAYER),
     )
     for layers, name in layer_groups:
         layer = layers.get(name)
@@ -335,6 +338,8 @@ def prepare_topology(
     axis_index: int,
     tolerance: float,
     history_token: int = 0,
+    *,
+    mark_vertex_ids: bool = False,
 ) -> TopologyPreparation:
     """Mark original topology and calculate mirrored face correspondences.
 
@@ -353,14 +358,17 @@ def prepare_topology(
     face_hidden_layer = bm.faces.layers.int.new(FACE_HIDDEN_LAYER)
     history_token_layer = bm.faces.layers.int.new(HISTORY_TOKEN_LAYER)
     vertex_hidden_layer = bm.verts.layers.int.new(VERT_HIDDEN_LAYER)
+    vertex_rip_id_layer = bm.verts.layers.int.new(VERT_RIP_ID_LAYER) if mark_vertex_ids else None
 
     # Adding a CustomData layer can invalidate previously held BMesh wrappers,
     # so all elements are intentionally acquired only after both layers exist.
     for edge_id, edge in enumerate(bm.edges, start=1):
         edge[edge_layer] = edge_id
         edge[edge_hidden_layer] = int(edge.hide)
-    for vertex in bm.verts:
+    for vertex_id, vertex in enumerate(bm.verts, start=1):
         vertex[vertex_hidden_layer] = int(vertex.hide)
+        if vertex_rip_id_layer is not None:
+            vertex[vertex_rip_id_layer] = vertex_id
 
     hidden_by_face_id: HiddenFaceMap = {}
     key_to_face_ids: dict[FaceKey, list[FaceId]] = defaultdict(list)

@@ -14,7 +14,7 @@ import bpy
 from bpy.app.handlers import persistent
 from bpy.props import StringProperty
 
-from . import core
+from . import core, rip
 from ._types import (
     Coordinate3D,
     FaceId,
@@ -26,6 +26,7 @@ from ._types import (
     OperatorResult,
     PathEdgeSignature,
     PathSignature,
+    RipSignature,
     SymmetryAxes,
     TopologyBackup,
     ViewState,
@@ -44,6 +45,10 @@ class ToolProfile:
     passthrough_handoff_grace: float
     passthrough_stable_ticks: int
     supports_nested_offset: bool
+    # Adjust Last Operation re-executes the native operator via exec.  Rip's
+    # macro cannot repeat (MESH_OT_rip has no exec; contract §5-7), so only
+    # tools whose native repeat is sound take part in the F9 baseline flow.
+    supports_adjust_repeat: bool
 
 
 TOOL_PROFILES: dict[str, ToolProfile] = {
@@ -57,6 +62,7 @@ TOOL_PROFILES: dict[str, ToolProfile] = {
         passthrough_handoff_grace=0.01,
         passthrough_stable_ticks=2,
         supports_nested_offset=False,
+        supports_adjust_repeat=False,
     ),
     "LOOP_CUT": ToolProfile(
         kind="LOOP_CUT",
@@ -68,6 +74,7 @@ TOOL_PROFILES: dict[str, ToolProfile] = {
         passthrough_handoff_grace=0.04,
         passthrough_stable_ticks=3,
         supports_nested_offset=False,
+        supports_adjust_repeat=True,
     ),
     "OFFSET_LOOP_CUT": ToolProfile(
         kind="OFFSET_LOOP_CUT",
@@ -79,6 +86,19 @@ TOOL_PROFILES: dict[str, ToolProfile] = {
         passthrough_handoff_grace=0.04,
         passthrough_stable_ticks=3,
         supports_nested_offset=True,
+        supports_adjust_repeat=True,
+    ),
+    "RIP": ToolProfile(
+        kind="RIP",
+        label="Rip",
+        wm_operator_names=("RIP_MOVE",),
+        primary_wm_operator="MESH_OT_RIP_MOVE",
+        tool_idnames=(),
+        keymap_operator="mesh.rip_move",
+        passthrough_handoff_grace=0.04,
+        passthrough_stable_ticks=3,
+        supports_nested_offset=False,
+        supports_adjust_repeat=False,
     ),
 }
 
@@ -88,7 +108,7 @@ MODAL_IDENTIFIER_TOKENS = {profile.kind: profile.wm_operator_names for profile i
 _PASSTHROUGH_HANDOFF_GRACE = {profile.kind: profile.passthrough_handoff_grace for profile in TOOL_PROFILES.values()}
 _PASSTHROUGH_STABLE_TICKS = {profile.kind: profile.passthrough_stable_ticks for profile in TOOL_PROFILES.values()}
 _WM_OPERATOR_TO_TOOL = {
-    profile.primary_wm_operator: profile.kind for profile in TOOL_PROFILES.values() if profile.kind != "KNIFE"
+    profile.primary_wm_operator: profile.kind for profile in TOOL_PROFILES.values() if profile.supports_adjust_repeat
 }
 
 _SESSIONS: dict[int, KnifeSession] = {}
@@ -399,17 +419,35 @@ def _prepare_session(
         return False
 
     _axis_name, axis_index = enabled_axes[0]
+    if tool_kind == "RIP":
+        guard = rip.prepare_guard_reason(context, bm, axis_index, settings.tolerance)
+        if guard is not None:
+            level, reason = guard
+            bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+            if level == "WARNING":
+                report({"WARNING"}, f"Rip is not mirrored: {reason}")
+            return False
+
     history_token = _new_history_token()
     topology = core.prepare_topology(
         bm,
         axis_index,
         settings.tolerance,
         history_token,
+        mark_vertex_ids=tool_kind == "RIP",
     )
     if topology.matched_faces == 0:
         core.remove_temporary_layers(bm)
         bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
         return False
+
+    rip_snapshot = None
+    if tool_kind == "RIP":
+        rip_snapshot = rip.build_snapshot(bm, axis_index, settings.tolerance)
+        if rip_snapshot is None:
+            core.remove_temporary_layers(bm)
+            bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+            return False
 
     bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
     session = KnifeSession(
@@ -436,6 +474,7 @@ def _prepare_session(
             y=bool(obj.use_mesh_mirror_y),
             z=bool(obj.use_mesh_mirror_z),
         ),
+        rip=rip_snapshot,
     )
     _SESSIONS[window_pointer] = session
     _suspend_mesh_symmetry(session, obj)
@@ -559,6 +598,63 @@ def _remove_backup(backup) -> None:
         bpy.data.meshes.remove(backup.mesh)
 
 
+def _finish_rip_session(
+    operator: bpy.types.Operator,
+    session: KnifeSession,
+    obj,
+    window_pointer: int,
+) -> OperatorResult:
+    """Mirror a confirmed native Rip.  All-or-nothing (contract §2.5).
+
+    The native result already changed the mesh, so this always returns
+    FINISHED; a mirror failure restores the pre-mirror state and reports a
+    WARNING while keeping the native rip intact (undo stays one step).
+    """
+
+    backup_mesh = None
+    mirrored_count = 0
+    reason: str | None = None
+    try:
+        if session.rip is None:
+            reason = "the pre-rip snapshot was lost"
+        else:
+            bm = bmesh.from_edit_mesh(obj.data)
+            reason = rip.preflight_reason(bm, session.rip, session.mirror_face_ids)
+            if reason is None:
+                backup_mesh = _create_topology_backup(bm)
+                bm = bmesh.from_edit_mesh(obj.data)
+                mirrored_count, reason = rip.apply_mirrored_rip(bm, session.rip, session.mirror_face_ids)
+                if reason is None:
+                    bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=True)
+                else:
+                    mirrored_count = 0
+                    _restore_topology_backup(obj.data, backup_mesh)
+    except Exception as exc:
+        traceback.print_exc()
+        reason = str(exc)
+        if backup_mesh is not None:
+            try:
+                _restore_topology_backup(obj.data, backup_mesh)
+            except Exception:
+                traceback.print_exc()
+    finally:
+        if obj is not None and obj.mode == "EDIT":
+            try:
+                bm = bmesh.from_edit_mesh(obj.data)
+                core.remove_temporary_layers(bm)
+                bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=True)
+            except (ReferenceError, RuntimeError):
+                pass
+        _remove_backup(backup_mesh)
+        cleanup_session(window_pointer, keep_history_record=True)
+
+    if reason is not None:
+        operator.report({"WARNING"}, f"ydd Symmetric Edit: Rip was not mirrored: {reason}")
+    else:
+        operator.report({"INFO"}, f"Mirrored Rip across {mirrored_count} seam edge(s)")
+    return {"FINISHED"}
+
+
 class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
     bl_idname = "mesh.ydd_symmetric_edit_finish"
     bl_label = "Apply Mirrored ydd Symmetric Edit Cut"
@@ -582,6 +678,9 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
             cleanup_session(window_pointer)
             self.report({"ERROR"}, f"The edited mesh changed during {tool_label}")
             return {"CANCELLED"}
+
+        if session.tool_kind == "RIP":
+            return _finish_rip_session(self, session, obj, window_pointer)
 
         cutter = None
         cutter_mesh = None
@@ -853,7 +952,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
         return result
 
 
-def _session_new_path_signature(session: KnifeSession) -> PathSignature | None:
+def _session_new_path_signature(session: KnifeSession) -> PathSignature | RipSignature | None:
     """Return a stable signature for topology created by the native tool."""
 
     obj = bpy.data.objects.get(session.object_name)
@@ -862,6 +961,8 @@ def _session_new_path_signature(session: KnifeSession) -> PathSignature | None:
     try:
         if obj.mode == "EDIT":
             bm = bmesh.from_edit_mesh(obj.data)
+            if session.tool_kind == "RIP":
+                return rip.rip_result_signature(bm)
             marker_layer = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
             if marker_layer is None:
                 return None
@@ -898,6 +999,8 @@ def _session_has_new_path(session: KnifeSession) -> bool:
     try:
         if obj.mode == "EDIT":
             bm = bmesh.from_edit_mesh(obj.data)
+            if session.tool_kind == "RIP":
+                return rip.has_rip_result(bm)
             marker_layer = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
             if marker_layer is None:
                 return False
