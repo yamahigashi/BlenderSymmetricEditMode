@@ -15,6 +15,8 @@ In both cases the native tool remains the one you are using: shortcuts, modal
 controls, operator options, and the Adjust Last Operation (F9) panel all stay
 native.
 
+![Symmetric knife cut demo](docs/yse.gif)
+
 ## Install
 
 In Blender 4.2 or later, open **Edit > Preferences > Add-ons**, choose
@@ -26,8 +28,8 @@ In Blender 4.2 or later, open **Edit > Preferences > Add-ons**, choose
 1. The mesh must already have matching topology around its object-local origin.
 2. In Edit Mode, enable exactly one of Blender's own **Mesh Symmetry X / Y / Z**
    settings in the 3D Viewport header or Tool settings.
-3. Open **N panel > Edit > ydd Symmetric Edit** and enable **Enable for Native
-   Cut Tools**.
+3. Open **N panel > Edit > ydd Symmetric Edit** and turn on **Enable Symmetric
+   Edit Mode**.
 4. Work on one side of the mesh with the supported tools and confirm normally.
 5. The toggle persists across sessions.
 
@@ -86,13 +88,6 @@ Exact coordinate symmetry of **By Distance** results follows the native
 `Merge by Distance` behavior of the running Blender version; pairs straddling
 the plane merge once, and mismatches stay within the merge distance.
 
-## Edge Slide (GG)
-
-Standalone **Edge Slide (GG)** is not intercepted: it moves existing topology,
-which Blender's own **Mirror Editing** option already handles. This add-on
-covers the operations that create or remove topology, which has no native
-mirrored equivalent.
-
 ## Direct operator calls
 
 Menu, F3, and scripted calls to the native cut operators bypass the keymap
@@ -101,6 +96,8 @@ Connect and Merge are mirrored through their J / M bindings and the M menu.
 
 ## Scope and data
 
+- Covered operations create or remove topology. Tools that only move existing
+  topology, such as Edge Slide (GG), are left to Blender's own Mirror Editing.
 - One mesh object in Edit Mode at a time.
 - Exactly one Blender Mesh Symmetry axis enabled per operation.
 - Both halves must already exist as editable geometry. A missing half supplied

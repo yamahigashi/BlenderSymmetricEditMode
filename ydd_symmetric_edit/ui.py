@@ -23,9 +23,9 @@ class YSE_AddonPreferences(bpy.types.AddonPreferences):
         enabled: bool
     else:
         enabled: BoolProperty(
-            name="Enable for Native Cut Tools",
+            name="Enable Symmetric Edit Mode",
             description=(
-                "Attach symmetric post-processing to Blender's Knife, Loop Cut, and Offset Edge Loop Cut routes"
+                "Mirror Blender's native Knife, Loop Cut, Offset Edge Loop Cut, Vertex Connect, and Merge Vertices"
             ),
             default=False,
             update=_update_persistent_mode,
@@ -34,7 +34,7 @@ class YSE_AddonPreferences(bpy.types.AddonPreferences):
     def draw(self, _context):
         layout = self.layout
         layout.prop(self, "enabled", toggle=True)
-        layout.label(text="Knife, Loop Cut, and Offset Edge Loop Cut")
+        layout.label(text="Knife, Loop Cut, Offset Edge Loop Cut, Connect (J), Merge (M)")
         layout.label(text="Native events and tools are not replaced.")
 
 
@@ -59,7 +59,9 @@ class YSE_PG_settings(bpy.types.PropertyGroup):
     else:
         source_side: EnumProperty(
             name="Source Side",
-            description="Side on which the native tool creates new topology",
+            description=(
+                "Side on which the native cut tools create new topology; Connect and Merge follow the selection"
+            ),
             items=(
                 ("AUTO", "Auto", "Use the side containing most of the new cut path"),
                 ("NEGATIVE", "Negative", "Mirror cuts drawn on the negative half"),
@@ -102,7 +104,7 @@ class VIEW3D_PT_ydd_symmetric_edit(bpy.types.Panel):
             layout.prop(
                 preferences,
                 "enabled",
-                text="Enable for Native Cut Tools",
+                text="Enable Symmetric Edit Mode",
                 icon="MOD_MIRROR",
                 toggle=True,
             )
@@ -125,9 +127,9 @@ class VIEW3D_PT_ydd_symmetric_edit(bpy.types.Panel):
         layout.prop(settings, "tolerance")
         box = layout.box()
         if preferences is not None and preferences.enabled:
-            box.label(text="Knife and both Loop Cut tools are enabled.")
+            box.label(text="Cut, Connect (J), and Merge (M) are mirrored.")
         else:
-            box.label(text="Symmetric cut post-processing is disabled.")
+            box.label(text="Symmetric editing is disabled.")
         box.label(text="Use the native tool on one side, then confirm.")
         box.label(text="GG Edge Slide uses Blender's native mirror.")
 
