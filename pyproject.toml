@@ -1,0 +1,53 @@
+[project]
+name = "ydd-symmetric-edit"
+version = "0.5.0"
+description = "Blender add-on that makes native cut, connect, and merge tools symmetry-aware."
+requires-python = ">=3.11"
+
+[dependency-groups]
+dev = [
+    "fake-bpy-module-4.2",
+    "ruff",
+    "ty",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+# Blender 4.2 LTS and later use Python 3.11 or newer.
+target-version = "py311"
+line-length = 120
+src = ["ydd_symmetric_edit"]
+include = ["ydd_symmetric_edit/**/*.py", "tests/**/*.py"]
+extend-exclude = ["dist", "**/__pycache__"]
+
+[tool.ruff.lint]
+# Keep the default correctness checks and add import-order, bugbear, and Python-upgrade validation.
+select = ["E4", "E7", "E9", "F", "I", "B", "UP"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ydd_symmetric_edit"]
+
+[tool.ruff.lint.per-file-ignores]
+# Blender's dynamic RNA registration and bpy.ops operator stubs require constant attribute access at this boundary.
+"ydd_symmetric_edit/__init__.py" = ["B010"]
+"ydd_symmetric_edit/operators.py" = ["B009"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
+
+[tool.ty.environment]
+# Match Ruff and Blender 4.2 LTS's minimum Python version.
+python-version = "3.11"
+python-platform = "all"
+root = ["."]
+
+[tool.ty.src]
+include = ["ydd_symmetric_edit"]
+exclude = ["tests/", "dist/", "**/__pycache__/"]
+
+[tool.ty.terminal]
+output-format = "concise"

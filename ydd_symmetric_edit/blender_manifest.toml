@@ -1,0 +1,19 @@
+schema_version = "1.0.0"
+
+id = "ydd_symmetric_edit"
+version = "0.5.0"
+name = "ydd Symmetric Edit"
+tagline = "Make native cut, connect, and merge tools symmetry-aware"
+maintainer = "yamahigashi"
+type = "add-on"
+
+blender_version_min = "4.2.0"
+license = ["SPDX:GPL-3.0-or-later"]
+copyright = ["2026 yamahigashi"]
+tags = ["Mesh"]
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  "/*.zip",
+]
