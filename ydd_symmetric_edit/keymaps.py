@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import traceback
+from dataclasses import dataclass
 
 import bpy
 
@@ -15,6 +16,8 @@ from .operators import TOOL_PROFILES
 INTERCEPT_OPERATOR = "mesh.ydd_symmetric_edit_intercept"
 CONNECT_OPERATOR = "mesh.ydd_symmetric_edit_connect"
 MERGE_MENU = "YSE_MT_merge"
+DELETE_MENU = "YSE_MT_delete"
+NATIVE_DELETE_MENU = "VIEW3D_MT_edit_mesh_delete"
 TOOL_KEYMAP_NAME = TOOL_PROFILES["KNIFE"].tool_idnames[0]
 TOOL_KEYMAP_NAMES = frozenset(tool_idname for profile in TOOL_PROFILES.values() for tool_idname in profile.tool_idnames)
 OPERATOR_TOOL_KINDS = {profile.keymap_operator: profile.kind for profile in TOOL_PROFILES.values()}
@@ -27,8 +30,28 @@ _RETRY_INTERVAL = 0.25
 _REGISTERED_ITEMS: list[tuple[object, KeymapEventLike]] = []
 _ROUTES_BY_KEY: dict[str, NativeRoute] = {}
 _FINGERPRINT: KeymapFingerprint | None = None
+_DELETE_FINGERPRINT: tuple[tuple[str, str, str, KeymapEvent], ...] | None = None
+_HAS_DELETE_ROUTES = False
 _ENABLED = False
 _RUNNING = False
+
+
+@dataclass(frozen=True, slots=True)
+class DeleteMenuRoute:
+    """One scanned native delete-menu binding to clone into the add-on config."""
+
+    keymap_name: str
+    space_type: str
+    region_type: str
+    event: KeymapEvent
+
+    @property
+    def keymap_identity(self) -> KeymapIdentity:
+        return KeymapIdentity(
+            name=self.keymap_name,
+            space_type=self.space_type,
+            region_type=self.region_type,
+        )
 
 
 def _window_manager():
@@ -161,10 +184,56 @@ def _native_routes(window_manager) -> tuple[list[NativeRoute], KeymapFingerprint
     return routes, fingerprint
 
 
+def _delete_menu_routes(
+    window_manager,
+) -> tuple[list[DeleteMenuRoute], tuple[tuple[str, str, str, KeymapEvent], ...]]:
+    """Scan user keymaps for active delete-menu call_menu bindings.
+
+    Does not touch ``_native_routes`` / ``OPERATOR_TOOL_KINDS`` (those only
+    match operator idnames).  Physical events are cloned via ``_event_signature``.
+    """
+
+    key_config = window_manager.keyconfigs.user
+    if key_config is None:
+        return [], ()
+
+    routes: list[DeleteMenuRoute] = []
+    seen: set[tuple[str, str, str, KeymapEvent]] = set()
+    for keymap in key_config.keymaps:
+        if keymap.is_modal:
+            continue
+        for item in keymap.keymap_items:
+            if not item.active:
+                continue
+            if item.idname != "wm.call_menu":
+                continue
+            if getattr(item.properties, "name", "") != NATIVE_DELETE_MENU:
+                continue
+            event = _event_signature(item)
+            identity = (keymap.name, keymap.space_type, keymap.region_type, event)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            routes.append(
+                DeleteMenuRoute(
+                    keymap_name=keymap.name,
+                    space_type=keymap.space_type,
+                    region_type=keymap.region_type,
+                    event=event,
+                )
+            )
+
+    fingerprint = tuple((route.keymap_name, route.space_type, route.region_type, route.event) for route in routes)
+    return routes, fingerprint
+
+
 def _is_owned_item(item) -> bool:
     if item.idname in _OWN_OPERATOR_IDS:
         return True
-    return item.idname == "wm.call_menu" and getattr(item.properties, "name", "") == MERGE_MENU
+    if item.idname != "wm.call_menu":
+        return False
+    menu_name = getattr(item.properties, "name", "")
+    return menu_name in {MERGE_MENU, DELETE_MENU}
 
 
 def _remove_owned_items(key_config) -> None:
@@ -246,7 +315,46 @@ def _register_replay_keymaps(window_manager) -> None:
     _REGISTERED_ITEMS.append((keymap, merge_menu))
 
 
-def _rebuild(window_manager, routes: list[NativeRoute]) -> None:
+def _register_delete_menu_keymaps(window_manager, routes: list[DeleteMenuRoute]) -> None:
+    """Register head=True YSE_MT_delete bindings for every scanned native event."""
+
+    addon_config = window_manager.keyconfigs.addon
+    if addon_config is None:
+        raise RuntimeError("Blender's add-on key configuration is unavailable")
+
+    addon_keymaps = {}
+    for route in routes:
+        keymap = addon_keymaps.get(route.keymap_identity)
+        if keymap is None:
+            keymap = addon_config.keymaps.new(
+                name=route.keymap_name,
+                space_type=route.space_type,
+                region_type=route.region_type,
+                modal=False,
+            )
+            addon_keymaps[route.keymap_identity] = keymap
+
+        item = keymap.keymap_items.new(
+            "wm.call_menu",
+            head=True,
+            **_event_arguments(route.event),
+        )
+        try:
+            item.properties.name = DELETE_MENU
+        except Exception:
+            keymap.keymap_items.remove(item)
+            raise
+        item.active = _ENABLED
+        _REGISTERED_ITEMS.append((keymap, item))
+
+
+def _rebuild(
+    window_manager,
+    routes: list[NativeRoute],
+    delete_routes: list[DeleteMenuRoute],
+) -> None:
+    global _HAS_DELETE_ROUTES
+
     addon_config = window_manager.keyconfigs.addon
     if addon_config is None:
         raise RuntimeError("Blender's add-on key configuration is unavailable")
@@ -254,22 +362,26 @@ def _rebuild(window_manager, routes: list[NativeRoute]) -> None:
     _remove_owned_items(addon_config)
     _REGISTERED_ITEMS.clear()
     _ROUTES_BY_KEY.clear()
+    _HAS_DELETE_ROUTES = False
 
     try:
         _register_routes(window_manager, routes)
         _register_replay_keymaps(window_manager)
+        _register_delete_menu_keymaps(window_manager, delete_routes)
     except Exception:
         _remove_owned_items(addon_config)
         _REGISTERED_ITEMS.clear()
+        _HAS_DELETE_ROUTES = False
         window_manager.keyconfigs.update()
         raise
 
     _ROUTES_BY_KEY.update((route.route_key, route) for route in routes)
+    _HAS_DELETE_ROUTES = bool(delete_routes)
     window_manager.keyconfigs.update()
 
 
 def _refresh(*, force: bool = False) -> bool:
-    global _FINGERPRINT
+    global _FINGERPRINT, _DELETE_FINGERPRINT
 
     window_manager = _window_manager()
     if window_manager is None:
@@ -283,9 +395,11 @@ def _refresh(*, force: bool = False) -> bool:
 
     window_manager.keyconfigs.update()
     routes, fingerprint = _native_routes(window_manager)
-    if force or fingerprint != _FINGERPRINT:
-        _rebuild(window_manager, routes)
+    delete_routes, delete_fingerprint = _delete_menu_routes(window_manager)
+    if force or fingerprint != _FINGERPRINT or delete_fingerprint != _DELETE_FINGERPRINT:
+        _rebuild(window_manager, routes, delete_routes)
         _FINGERPRINT = fingerprint
+        _DELETE_FINGERPRINT = delete_fingerprint
     return True
 
 
@@ -342,6 +456,12 @@ def route_tool_kind(route_key: str) -> str | None:
     return route.tool_kind if route is not None else None
 
 
+def has_delete_routes() -> bool:
+    """Return whether the latest scan registered one or more delete-menu routes."""
+
+    return _HAS_DELETE_ROUTES
+
+
 def sync(enabled: bool) -> None:
     """Apply the persistent toggle without changing Blender's native KMI."""
 
@@ -370,11 +490,13 @@ def sync(enabled: bool) -> None:
 
 
 def register(*, enabled: bool = False) -> None:
-    global _ENABLED, _FINGERPRINT, _RUNNING
+    global _ENABLED, _FINGERPRINT, _DELETE_FINGERPRINT, _HAS_DELETE_ROUTES, _RUNNING
 
     _RUNNING = True
     _ENABLED = bool(enabled)
     _FINGERPRINT = None
+    _DELETE_FINGERPRINT = None
+    _HAS_DELETE_ROUTES = False
     _REGISTERED_ITEMS.clear()
     _ROUTES_BY_KEY.clear()
 
@@ -395,7 +517,7 @@ def register(*, enabled: bool = False) -> None:
 
 
 def unregister() -> None:
-    global _ENABLED, _FINGERPRINT, _RUNNING
+    global _ENABLED, _FINGERPRINT, _DELETE_FINGERPRINT, _HAS_DELETE_ROUTES, _RUNNING
 
     _RUNNING = False
     _ENABLED = False
@@ -413,3 +535,5 @@ def unregister() -> None:
     _REGISTERED_ITEMS.clear()
     _ROUTES_BY_KEY.clear()
     _FINGERPRINT = None
+    _DELETE_FINGERPRINT = None
+    _HAS_DELETE_ROUTES = False

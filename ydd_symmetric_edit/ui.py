@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 import bpy
 from bpy.props import BoolProperty, EnumProperty, FloatProperty
 
-from . import core
+from . import core, keymaps
 
 
 def _update_persistent_mode(self, _context):
@@ -108,6 +108,8 @@ class VIEW3D_PT_ydd_symmetric_edit(bpy.types.Panel):
                 icon="MOD_MIRROR",
                 toggle=True,
             )
+            if preferences.enabled and not keymaps.has_delete_routes():
+                layout.label(text="Delete key route not found", icon="ERROR")
         else:
             layout.label(text="Persistent setting unavailable", icon="ERROR")
 
@@ -122,7 +124,6 @@ class VIEW3D_PT_ydd_symmetric_edit(bpy.types.Panel):
                 icon="ERROR",
             )
         status.label(text="Uses Blender's X / Y / Z symmetry setting")
-
         layout.prop(settings, "source_side")
         layout.prop(settings, "tolerance")
         box = layout.box()
