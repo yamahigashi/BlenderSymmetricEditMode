@@ -16,8 +16,10 @@ Serialized cases on an X-symmetric grid plane:
                 preflight declines, native result stays, WARNING path.
 4. rollback     an injected apply failure restores the mirror side from the
                 backup while keeping the native rip.
-5. crossing     selection contains a mirror pair: guard passes through and
-                the session never starts.
+5. bothsides    disjoint both-sides selection (no mirror pair): the session
+                runs and the result stays X-symmetric.
+6. crossing     selection contains a mirror pair: guard passes through and
+                the session never starts.  Must stay last (see case list).
 """
 
 from __future__ import annotations
@@ -301,13 +303,25 @@ def verify_rollback(bm):
 
 
 def verify_crossing_passthrough(bm):
-    # Both-side selection: the guard skips the session; native rips one
+    # Mirror-pair selection: the guard skips the session; native rips one
     # island unmirrored.
     assert not operators._SESSIONS, "crossing selection must not create a session"
     dv = len(bm.verts) - STATE["baseline"][0]
     assert dv in (0, 1, 2), f"expected a native-only rip at most, got dv={dv}"
     if dv:
         assert vertex_multiset(bm) != mirrored_multiset(bm), "crossing rip must not be mirrored"
+    assert_layers_removed(bm)
+
+
+def verify_bothsides_mirrored(bm):
+    # DISJOINT both-sides selection: the session runs.  Native rips only the
+    # connected +X path under the cursor; the far -X selected vertex stays
+    # untouched (same heuristic as the multi-island case), and the mirror
+    # reproduces exactly what native ripped, so the result is X-symmetric.
+    dv = len(bm.verts) - STATE["baseline"][0]
+    assert dv == 4, f"expected 4 new vertices (2 source + 2 mirror), got {dv}"
+    assert vertex_multiset(bm)[coordinate_key((-2.0, -1.0, 0.0))] == 1, "far-side vertex must stay unripped"
+    assert_x_symmetric(bm)
     assert_layers_removed(bm)
 
 
@@ -345,6 +359,11 @@ def start_test():
                 verify_rollback,
                 mutate=lambda bm: install_failure_injection(),
             ),
+            run_case("bothsides", [(4, 1), (4, 2), (1, 1)], (3.6, 2), verify_bothsides_mirrored),
+            # crossing must stay LAST: its native rip fails by design
+            # ("Rip failed" on a disconnected mirror pair), and a failed
+            # native rip leaves the simulated V route unable to start the
+            # next rip in this event-simulate environment (measured, 4.2).
             run_case("crossing", [(4, 2), (2, 2)], (3.6, 2), verify_crossing_passthrough),
         ]
         run_all(cases)

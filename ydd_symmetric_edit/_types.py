@@ -9,6 +9,7 @@ add runtime dependencies or create import cycles.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING, NewType, Protocol, TypeAlias
 
 if TYPE_CHECKING:
@@ -104,6 +105,33 @@ class RipSnapshot:
 
     def record_by_id(self) -> dict[int, RipVertexRecord]:
         return {record.vertex_id: record for record in self.vertices}
+
+
+class MirrorOverlap(Enum):
+    """How a selection S relates to its own mirror image ρ(S).
+
+    S⁰ is the on-plane part of S; the classification deliberately ignores it
+    because ρ is the identity there (ρ(S) ∩ S ⊇ S⁰ always holds).
+    """
+
+    DISJOINT = "disjoint"  # ρ(S∖S⁰) ∩ S = ∅
+    SELF_MIRRORED = "self_mirrored"  # ρ(S∖S⁰) = S∖S⁰ (complete, bidirectional)
+    PARTIAL = "partial"  # any other intersection
+
+
+@dataclass(frozen=True)
+class OverlapClassification:
+    """Selection/mirror-image overlap plus the pair table it was derived from.
+
+    ``complete`` is True when every off-plane selected vertex resolved to an
+    involutive pair (no missing counterparts, no ambiguous ties).  ``pairs``
+    covers the whole mesh and satisfies ``pairs[pairs[v]] == v``; on-plane
+    vertices pair with themselves.
+    """
+
+    overlap: MirrorOverlap
+    complete: bool
+    pairs: dict[int, int]
 
 
 @dataclass(frozen=True, slots=True)

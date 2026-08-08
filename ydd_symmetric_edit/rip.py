@@ -33,6 +33,7 @@ from ._types import (
     Coordinate3D,
     FaceId,
     MirrorFaceMap,
+    MirrorOverlap,
     RipDupSignature,
     RipSignature,
     RipSnapshot,
@@ -61,13 +62,31 @@ def prepare_guard_reason(context, bm: bmesh.types.BMesh, axis_index: int, tolera
     if not selected:
         return "INFO", "Nothing selected to rip"
 
+    # This on-plane guard stays ahead of the overlap classification: Rip does
+    # not support on-plane selections at all, classification aside.
     on_plane = sum(1 for vertex in selected if abs(vertex.co[axis_index]) <= tolerance)
     if on_plane:
         return "WARNING", f"{on_plane} selected vertex(es) lie on the mirror plane"
 
-    lookup = core.build_vertex_mirror_lookup([vertex.co for vertex in selected], axis_index, tolerance)
-    if any(lookup.find(vertex.co) is not None for vertex in selected):
-        return "INFO", "The selection already spans both sides of the mirror plane"
+    coords = [vertex.co.copy() for vertex in bm.verts]
+    selected_indices = [index for index, vertex in enumerate(bm.verts) if vertex.select and not vertex.hide]
+    classification = core.classify_selection_overlap(
+        coords,
+        selected_indices,
+        axis_index=axis_index,
+        tolerance=tolerance,
+    )
+    if classification.overlap is not MirrorOverlap.DISJOINT:
+        return "INFO", "The selection overlaps its own mirror image"
+    # Missing counterparts (incomplete classification) deliberately do NOT
+    # decline here: reports from this pre-session hook run inside the
+    # PASS_THROUGH intercept and never reach the user.  The session continues
+    # and the post-rip preflight declines with its visible WARNING
+    # ("a seam vertex has no mirrored counterpart") while the all-or-nothing
+    # rollback keeps the native result intact.
+    # DISJOINT and complete: the session continues even for a both-sides
+    # selection.  The mirrored-seam-ripped check in _derive and the
+    # all-or-nothing rollback stay in place as the safety net.
     return None
 
 
@@ -97,9 +116,13 @@ def build_snapshot(bm: bmesh.types.BMesh, axis_index: int, tolerance: float) -> 
     lookup = core.build_vertex_mirror_lookup([vertex.co for vertex in bm.verts], axis_index, tolerance)
     ids_by_index = [int(vertex[vertex_id_layer]) for vertex in bm.verts]
 
+    # Injective batch resolution: no two region vertices can claim the same
+    # mirrored counterpart.
+    region_vertices = tuple(region.values())
+    mirror_indices = lookup.find_all_mirrored([vertex.co for vertex in region_vertices])
+
     records = []
-    for vertex in region.values():
-        mirror_index = lookup.find(vertex.co)
+    for vertex, mirror_index in zip(region_vertices, mirror_indices, strict=True):
         records.append(
             RipVertexRecord(
                 vertex_id=int(vertex[vertex_id_layer]),

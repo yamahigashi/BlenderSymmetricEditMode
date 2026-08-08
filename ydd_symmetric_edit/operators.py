@@ -14,7 +14,7 @@ import bpy
 from bpy.app.handlers import persistent
 from bpy.props import StringProperty
 
-from . import core, rip
+from . import backup, core, rip
 from ._types import (
     Coordinate3D,
     FaceId,
@@ -28,7 +28,6 @@ from ._types import (
     PathSignature,
     RipSignature,
     SymmetryAxes,
-    TopologyBackup,
     ViewState,
     WindowContext,
 )
@@ -554,50 +553,6 @@ def _remove_cutter(cutter, mesh) -> None:
         bpy.data.meshes.remove(mesh)
 
 
-def _create_topology_backup(bm: bmesh.types.BMesh) -> TopologyBackup:
-    old_id_layer = bm.verts.layers.int.get(core.VERT_BACKUP_ID_LAYER)
-    if old_id_layer is not None:
-        bm.verts.layers.int.remove(old_id_layer)
-    id_layer = bm.verts.layers.int.new(core.VERT_BACKUP_ID_LAYER)
-    for vertex_id, vertex in enumerate(bm.verts, start=1):
-        vertex[id_layer] = vertex_id
-
-    shape_values = {}
-    for shape_layer in bm.verts.layers.shape.values():
-        shape_values[shape_layer.name] = [vertex[shape_layer].copy() for vertex in bm.verts]
-
-    backup_mesh = bpy.data.meshes.new("YSE_TemporaryBackup")
-    bm.to_mesh(backup_mesh)
-    return TopologyBackup(mesh=backup_mesh, shape_values=shape_values)
-
-
-def _restore_topology_backup(mesh, backup: TopologyBackup) -> None:
-    bm = bmesh.from_edit_mesh(mesh)
-    # Deleting elements keeps the live BMesh CustomData layer definitions and,
-    # crucially, shape-layer UIDs.  bm.clear()/from_mesh() would silently detach
-    # existing KeyBlocks and destroy shape-key deformations.
-    if len(bm.verts):
-        bmesh.ops.delete(bm, geom=list(bm.verts), context="VERTS")
-    bm.from_mesh(backup.mesh)
-
-    id_layer = bm.verts.layers.int.get(core.VERT_BACKUP_ID_LAYER)
-    if id_layer is None:
-        raise RuntimeError("Topology backup vertex IDs are missing")
-    for shape_name, values_by_id in backup.shape_values.items():
-        shape_layer = bm.verts.layers.shape.get(shape_name)
-        if shape_layer is None:
-            raise RuntimeError(f"Shape layer {shape_name!r} was lost during rollback")
-        for vertex in bm.verts:
-            vertex[shape_layer] = values_by_id[int(vertex[id_layer]) - 1]
-    bm.normal_update()
-    bmesh.update_edit_mesh(mesh, loop_triangles=True, destructive=True)
-
-
-def _remove_backup(backup) -> None:
-    if backup is not None and backup.mesh.name in bpy.data.meshes and backup.mesh.users == 0:
-        bpy.data.meshes.remove(backup.mesh)
-
-
 def _finish_rip_session(
     operator: bpy.types.Operator,
     session: KnifeSession,
@@ -621,20 +576,20 @@ def _finish_rip_session(
             bm = bmesh.from_edit_mesh(obj.data)
             reason = rip.preflight_reason(bm, session.rip, session.mirror_face_ids)
             if reason is None:
-                backup_mesh = _create_topology_backup(bm)
+                backup_mesh = backup.create_topology_backup(bm)
                 bm = bmesh.from_edit_mesh(obj.data)
                 mirrored_count, reason = rip.apply_mirrored_rip(bm, session.rip, session.mirror_face_ids)
                 if reason is None:
                     bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=True)
                 else:
                     mirrored_count = 0
-                    _restore_topology_backup(obj.data, backup_mesh)
+                    backup.restore_topology_backup(obj.data, backup_mesh)
     except Exception as exc:
         traceback.print_exc()
         reason = str(exc)
         if backup_mesh is not None:
             try:
-                _restore_topology_backup(obj.data, backup_mesh)
+                backup.restore_topology_backup(obj.data, backup_mesh)
             except Exception:
                 traceback.print_exc()
     finally:
@@ -645,7 +600,7 @@ def _finish_rip_session(
                 bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=True)
             except (ReferenceError, RuntimeError):
                 pass
-        _remove_backup(backup_mesh)
+        backup.remove_backup(backup_mesh)
         cleanup_session(window_pointer, keep_history_record=True)
 
     if reason is not None:
@@ -749,7 +704,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                 # impossible, so reproduce the same topology with BMesh.
                 core.reserve_source_path_marker(bm)
                 selection_state = core.add_selection_layers(bm)
-                backup_mesh = _create_topology_backup(bm)
+                backup_mesh = backup.create_topology_backup(bm)
                 mirrored_segment_count, collapsed_reason = core.apply_collapsed_offset_topology(
                     bm,
                     collapsed_target_markers,
@@ -786,7 +741,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                 # self-occluding surfaces. Rebuild the native cut topology on
                 # paired target faces instead, using exact reflected points.
                 selection_state = core.add_selection_layers(bm)
-                backup_mesh = _create_topology_backup(bm)
+                backup_mesh = backup.create_topology_backup(bm)
                 bm = bmesh.from_edit_mesh(obj.data)
                 source_edges, side, total_path_edges, crossing_count = core.collect_source_path_edges(
                     bm,
@@ -847,7 +802,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
 
             core.reserve_source_path_marker(bm)
             selection_state = core.add_selection_layers(bm)
-            backup_mesh = _create_topology_backup(bm)
+            backup_mesh = backup.create_topology_backup(bm)
             preexisting_vertex_keys = {hash(vertex) for vertex in bm.verts}
             # Layer creation invalidates held element wrappers; retrieve layers
             # and iterate faces again before changing visibility.
@@ -914,7 +869,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
 
             if backup_mesh is not None and not projection_committed:
                 try:
-                    _restore_topology_backup(obj.data, backup_mesh)
+                    backup.restore_topology_backup(obj.data, backup_mesh)
                 except Exception:
                     traceback.print_exc()
 
@@ -942,7 +897,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                 except (ReferenceError, RuntimeError):
                     pass
 
-            _remove_backup(backup_mesh)
+            backup.remove_backup(backup_mesh)
             cleanup_session(window_pointer, keep_history_record=True)
 
         if result == {"FINISHED"} and mirrored_segment_count:

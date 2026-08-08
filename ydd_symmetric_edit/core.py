@@ -28,6 +28,8 @@ from ._types import (
     FaceSelectionHistory,
     HiddenFaceMap,
     MirrorFaceMap,
+    MirrorOverlap,
+    OverlapClassification,
     QuantizedCoordinate,
     SelectionHistory,
     SelectionSnapshot,
@@ -51,6 +53,7 @@ VERT_HIDDEN_LAYER = ".yse_vertex_hidden"
 EDGE_HIDDEN_LAYER = ".yse_edge_hidden"
 VERT_BACKUP_ID_LAYER = ".yse_backup_vertex_id"
 VERT_RIP_ID_LAYER = ".yse_rip_vertex_id"
+VERT_MERGE_GROUP_LAYER = ".yse_merge_group"
 
 TEMP_LAYER_NAMES = (
     EDGE_ORIGINAL_LAYER,
@@ -65,6 +68,7 @@ TEMP_LAYER_NAMES = (
     EDGE_HIDDEN_LAYER,
     VERT_BACKUP_ID_LAYER,
     VERT_RIP_ID_LAYER,
+    VERT_MERGE_GROUP_LAYER,
 )
 
 AXIS_INDEX = {"X": 0, "Y": 1, "Z": 2}
@@ -153,6 +157,24 @@ def _chebyshev_distance_3d(
     )
 
 
+def coordinates_match(first, second, tolerance: float) -> bool:
+    """The single definition of coordinate identity: per-component (Chebyshev).
+
+    Every "are these the same point" acceptance test in the add-on must go
+    through this predicate.  Geometric quantities (segment distances, edge
+    lengths, KDTree radii) intentionally stay Euclidean and are marked so at
+    their use sites.
+    """
+
+    return (
+        _chebyshev_distance_3d(
+            (float(first[0]), float(first[1]), float(first[2])),
+            (float(second[0]), float(second[1]), float(second[2])),
+        )
+        <= tolerance
+    )
+
+
 class VertexMirrorLookup:
     """Index of registered coordinates for mirror-plane counterpart lookup.
 
@@ -170,6 +192,23 @@ class VertexMirrorLookup:
         self._axis_index = axis_index
         self._tolerance = tolerance
         self._bins = bins
+        self._on_plane_indices: frozenset[int] | None = None
+
+    def _on_plane_registered(self) -> frozenset[int]:
+        """Registered indices whose stored coordinate lies on the plane."""
+
+        cached = self._on_plane_indices
+        if cached is None:
+            axis_index = self._axis_index
+            tolerance = self._tolerance
+            cached = frozenset(
+                index
+                for entries in self._bins.values()
+                for index, stored in entries
+                if abs(stored[axis_index]) <= tolerance
+            )
+            self._on_plane_indices = cached
+        return cached
 
     def find(self, co: Vector) -> int | None:
         """Return the index of the registered coord matching ``mirror(co)``.
@@ -185,6 +224,8 @@ class VertexMirrorLookup:
         best: tuple[float, int] | None = None
         for bin_key in _iter_quantized_neighborhood(expected, tolerance):
             for index, stored in self._bins.get(bin_key, ()):
+                # Acceptance is coordinates_match (Chebyshev <= tolerance);
+                # the same distance doubles as the nearest-first ranking key.
                 distance = _chebyshev_distance_3d(expected_coord, stored)
                 if distance > tolerance:
                     continue
@@ -196,6 +237,234 @@ class VertexMirrorLookup:
         """True when *co* lies on the mirror plane within *tolerance*."""
 
         return abs(co[self._axis_index]) <= self._tolerance
+
+    def find_all_mirrored(self, coords: Sequence[Vector]) -> tuple[int | None, ...]:
+        """Injective assignment of registered vertices to each coord's mirror image.
+
+        Unlike per-query :meth:`find`, no two queries can resolve to the same
+        registered vertex: assignments are solved per connected candidate
+        component for the minimum-total-distance complete cover, and ties or
+        incomplete covers reject the whole component (``None``) rather than
+        silently picking one interpretation.
+
+        Fixed rule: the plane partitions both sides of the assignment.
+        On-plane queries resolve by *direct* self-correspondence against
+        on-plane registered vertices only, and off-plane queries never match
+        an on-plane registered vertex — regardless of whether that vertex
+        also appears as a query in this batch.  (A per-batch reservation
+        would leak on partial batches: a history-only query list contains no
+        on-plane queries, so nothing would be reserved, and a near-plane
+        reflection could silently steal an on-plane vertex.)
+        """
+
+        results: list[int | None] = [None] * len(coords)
+        on_plane_entries = [(index, co) for index, co in enumerate(coords) if self.is_on_plane(co)]
+        if on_plane_entries:
+            resolved = self._resolve_injective(
+                [co for _index, co in on_plane_entries],
+                plane_side=True,
+            )
+            for (query_index, _co), target in zip(on_plane_entries, resolved, strict=True):
+                results[query_index] = target
+        off_entries = [
+            (index, mirror_coordinate(co, self._axis_index))
+            for index, co in enumerate(coords)
+            if not self.is_on_plane(co)
+        ]
+        if off_entries:
+            resolved = self._resolve_injective(
+                [position for _index, position in off_entries],
+                plane_side=False,
+            )
+            for (query_index, _position), target in zip(off_entries, resolved, strict=True):
+                results[query_index] = target
+        return tuple(results)
+
+    def find_all_direct(self, coords: Sequence[Vector]) -> tuple[int | None, ...]:
+        """Injective assignment of registered vertices to each coordinate itself.
+
+        No reflection is applied; this replaces the historical
+        ``find(mirror_coordinate(co))`` double-reflection idiom.
+        """
+
+        return tuple(self._resolve_injective(list(coords)))
+
+    def _candidates_for(self, position) -> list[tuple[float, int]]:
+        """Distance-ascending registered candidates within *tolerance*."""
+
+        position_coord = (float(position[0]), float(position[1]), float(position[2]))
+        tolerance = self._tolerance
+        found = []
+        for bin_key in _iter_quantized_neighborhood(position, tolerance):
+            for index, stored in self._bins.get(bin_key, ()):
+                distance = _chebyshev_distance_3d(position_coord, stored)
+                if distance > tolerance:
+                    continue
+                found.append((distance, index))
+        found.sort()
+        return found
+
+    def _resolve_injective(
+        self,
+        positions: Sequence,
+        plane_side: bool | None = None,
+    ) -> list[int | None]:
+        """Solve an injective nearest assignment for a list of query positions.
+
+        ``plane_side`` restricts the registered candidates: ``True`` keeps
+        only on-plane vertices, ``False`` only off-plane vertices, ``None``
+        allows all (the direct search).  Queries are grouped into connected
+        components of the bipartite query/candidate graph; components never
+        share candidates, so solving each component independently keeps the
+        whole result injective.
+        """
+
+        if plane_side is None:
+            candidate_lists = [list(self._candidates_for(position)) for position in positions]
+        else:
+            on_plane_targets = self._on_plane_registered()
+            candidate_lists = [
+                [
+                    (distance, index)
+                    for distance, index in self._candidates_for(position)
+                    if (index in on_plane_targets) == plane_side
+                ]
+                for position in positions
+            ]
+        queries_by_target: dict[int, list[int]] = defaultdict(list)
+        for query, candidates in enumerate(candidate_lists):
+            for _distance, target in candidates:
+                queries_by_target[target].append(query)
+
+        results: list[int | None] = [None] * len(positions)
+        visited = [False] * len(positions)
+        for start in range(len(positions)):
+            if visited[start]:
+                continue
+            visited[start] = True
+            if not candidate_lists[start]:
+                continue
+            component = []
+            component_targets: set[int] = set()
+            pending = [start]
+            while pending:
+                query = pending.pop()
+                component.append(query)
+                for _distance, target in candidate_lists[query]:
+                    if target in component_targets:
+                        continue
+                    component_targets.add(target)
+                    for other in queries_by_target[target]:
+                        if not visited[other]:
+                            visited[other] = True
+                            pending.append(other)
+            assignment = _solve_injective_component(component, candidate_lists)
+            if assignment is not None:
+                for query, target in assignment.items():
+                    results[query] = target
+        return results
+
+
+# One step is one trial assignment of a candidate to a query.  Only a
+# pathological mesh with many vertices packed inside one tolerance ball can
+# reach this; such a component is rejected as ambiguous rather than guessed.
+_INJECTIVE_STEP_LIMIT = 2_000
+
+
+def _solve_injective_component(
+    queries: Sequence[int],
+    candidate_lists: Sequence[Sequence[tuple[float, int]]],
+    step_limit: int = _INJECTIVE_STEP_LIMIT,
+) -> dict[int, int] | None:
+    """Minimum-total-Chebyshev complete assignment for one candidate component.
+
+    Mutual-nearest pre-fixing is deliberately not used: fixing an apparently
+    safe pair can destroy the only complete assignment (1-D counterexample
+    with tolerance 1.0 — candidates q1→{t1:0.4, t2:0.8}, q2→{t1:0.9, t3:0.6},
+    q3→{t3:0.5}: fixing mutual-nearest q1→t1 leaves q2 and q3 fighting over
+    t3, yet the complete injective solution q1→t2, q2→t1, q3→t3 exists).
+    The component is therefore always solved as a whole.
+
+    Returns ``None`` when no complete cover of the queries exists, when the
+    optimum is tied between two distinct assignments (ambiguous), or when the
+    search exceeds *step_limit*.
+    """
+
+    order = sorted(queries, key=lambda query: (len(candidate_lists[query]), query))
+    order_count = len(order)
+    if order_count == 0:
+        return {}
+    if order_count > step_limit:
+        return None
+
+    best_cost: float | None = None
+    best_assignment: dict[int, int] | None = None
+    tie = False
+    steps = 0
+    used: set[int] = set()
+    chosen_targets = [-1] * order_count
+    chosen_distances = [0.0] * order_count
+    candidate_positions = [0] * order_count
+    prefix_costs = [0.0] * (order_count + 1)
+    depth = 0
+    while depth >= 0:
+        if depth == order_count:
+            # Leaf costs are compared via fsum with a small relative margin:
+            # sequential float addition is order-dependent, so two genuinely
+            # tied assignments (e.g. distances [1, ε, ε] vs [ε, ε, 1]) would
+            # otherwise compare unequal and the tie would go undetected.
+            cost = math.fsum(chosen_distances)
+            margin = _injective_tie_margin(cost, best_cost)
+            if best_cost is None or cost < best_cost - margin:
+                best_cost = cost
+                best_assignment = {order[level]: chosen_targets[level] for level in range(order_count)}
+                tie = False
+            elif abs(cost - best_cost) <= margin:
+                tie = True
+            depth -= 1
+            continue
+        if chosen_targets[depth] >= 0:
+            used.discard(chosen_targets[depth])
+            chosen_targets[depth] = -1
+        candidates = candidate_lists[order[depth]]
+        advanced = False
+        while candidate_positions[depth] < len(candidates):
+            distance, target = candidates[candidate_positions[depth]]
+            candidate_positions[depth] += 1
+            if target in used:
+                continue
+            cost = prefix_costs[depth] + distance
+            # Candidates are distance-ascending, so once the accumulated cost
+            # exceeds the best one (beyond the tie margin) it stays that way;
+            # equal-within-margin cost continues so ties are still discovered.
+            if best_cost is not None and cost > best_cost + _injective_tie_margin(cost, best_cost):
+                break
+            steps += 1
+            if steps > step_limit:
+                return None
+            used.add(target)
+            chosen_targets[depth] = target
+            chosen_distances[depth] = distance
+            prefix_costs[depth + 1] = cost
+            if depth + 1 < order_count:
+                candidate_positions[depth + 1] = 0
+            depth += 1
+            advanced = True
+            break
+        if not advanced:
+            candidate_positions[depth] = 0
+            depth -= 1
+
+    if tie or best_assignment is None:
+        return None
+    return best_assignment
+
+
+def _injective_tie_margin(cost: float, best_cost: float | None) -> float:
+    """Float-noise margin for cost comparison, scaled to the magnitudes."""
+
+    reference = max(abs(cost), abs(best_cost) if best_cost is not None else 0.0, 1.0e-12)
+    return reference * 1.0e-9
 
 
 def build_vertex_mirror_lookup(
@@ -215,6 +484,64 @@ def build_vertex_mirror_lookup(
         primary = _quantized_coordinate(co, tolerance)
         bins[primary].append((index, (float(co[0]), float(co[1]), float(co[2]))))
     return VertexMirrorLookup(axis_index=axis_index, tolerance=tolerance, bins=bins)
+
+
+def build_vertex_pair_table(
+    coords: Sequence[Vector],
+    axis_index: int,
+    tolerance: float,
+) -> dict[int, int]:
+    """Involutive vertex pair table over *coords*: ``pairs[pairs[v]] == v``.
+
+    Built from the injective batch assignment.  Injectivity alone does not
+    imply ``mirror(mirror(v)) == v``, so one-way assignments (v→w without
+    w→v) are discarded and both vertices stay unpaired.  On-plane vertices
+    pair with themselves.
+    """
+
+    lookup = build_vertex_mirror_lookup(coords, axis_index, tolerance)
+    assigned = lookup.find_all_mirrored(coords)
+    pairs: dict[int, int] = {}
+    for source, target in enumerate(assigned):
+        if target is None:
+            continue
+        if target == source or assigned[target] == source:
+            pairs[source] = target
+    return pairs
+
+
+def classify_selection_overlap(
+    coords: Sequence[Vector],
+    selected_indices: Iterable[int],
+    *,
+    axis_index: int,
+    tolerance: float,
+) -> OverlapClassification:
+    """Classify how a selection relates to its own mirror image.
+
+    ``selection_crosses_mirror`` used to answer only "would replaying the
+    mirror double-apply?" (ρ(S) ∩ S ≠ ∅).  This keeps that boundary — a
+    both-sides selection whose mirror image does not intersect the selection
+    is still DISJOINT and replays correctly — and refines the intersecting
+    case into SELF_MIRRORED versus PARTIAL.
+    """
+
+    pairs = build_vertex_pair_table(coords, axis_index, tolerance)
+    selected = frozenset(selected_indices)
+    shared = frozenset(index for index in selected if abs(coords[index][axis_index]) <= tolerance)
+    off = selected - shared
+    complete = all(index in pairs for index in off)
+    mirrors = {pairs[index] for index in off if index in pairs}
+    crossing = mirrors & selected
+    if not crossing:
+        # An all-on-plane selection is trivially its own mirror image; ρ has
+        # degenerated to the identity, and one native run is already symmetric.
+        overlap = MirrorOverlap.SELF_MIRRORED if not off else MirrorOverlap.DISJOINT
+    elif complete and mirrors == off:
+        overlap = MirrorOverlap.SELF_MIRRORED
+    else:
+        overlap = MirrorOverlap.PARTIAL
+    return OverlapClassification(overlap=overlap, complete=complete, pairs=pairs)
 
 
 def _coords_match_chebyshev(
@@ -237,11 +564,7 @@ def _coords_match_chebyshev(
     adjacency: list[list[int]] = [[] for _ in range(count)]
     for left_index, left_coord in enumerate(first):
         for right_index, right_coord in enumerate(second):
-            if (
-                abs(left_coord[0] - right_coord[0]) <= tolerance
-                and abs(left_coord[1] - right_coord[1]) <= tolerance
-                and abs(left_coord[2] - right_coord[2]) <= tolerance
-            ):
+            if coordinates_match(left_coord, right_coord, tolerance):
                 adjacency[left_index].append(right_index)
 
     match_left = [-1] * count
@@ -312,6 +635,7 @@ def remove_temporary_layers(bm: bmesh.types.BMesh) -> bool:
         (bm.edges.layers.int, EDGE_HIDDEN_LAYER),
         (bm.verts.layers.int, VERT_BACKUP_ID_LAYER),
         (bm.verts.layers.int, VERT_RIP_ID_LAYER),
+        (bm.verts.layers.int, VERT_MERGE_GROUP_LAYER),
     )
     for layers, name in layer_groups:
         layer = layers.get(name)
@@ -370,9 +694,24 @@ def prepare_topology(
         if vertex_rip_id_layer is not None:
             vertex[vertex_rip_id_layer] = vertex_id
 
+    # Primary face correspondence derives from the involutive vertex pair
+    # table so it is symmetric (A→B implies B→A) and injective by
+    # construction; per-face independent candidate picking could map two
+    # sources onto one target.  Geometry matching remains the fallback for
+    # faces with unpaired vertices.
+    bm.verts.ensure_lookup_table()
+    bm.verts.index_update()
+    vertex_pairs = build_vertex_pair_table(
+        tuple(vertex.co.copy() for vertex in bm.verts),
+        axis_index,
+        tolerance,
+    )
+
     hidden_by_face_id: HiddenFaceMap = {}
     key_to_face_ids: dict[FaceKey, list[FaceId]] = defaultdict(list)
     face_records: dict[FaceId, FaceMatchRecord] = {}
+    face_vertex_ids: dict[FaceId, tuple[int, ...]] = {}
+    face_ids_by_vertex_set: dict[frozenset[int], list[FaceId]] = defaultdict(list)
     # Lazy fallback index (contract R2-3): only materialize on first exact miss.
     face_coords: dict[FaceId, tuple[tuple[float, float, float], ...]] = {}
     faces_by_count_centroid: dict[tuple[int, QuantizedCoordinate], list[FaceId]] = defaultdict(list)
@@ -394,6 +733,9 @@ def prepare_topology(
         )
         face_records[face_id] = record
         key_to_face_ids[record.key].append(face_id)
+        vertex_ids = tuple(vertex.index for vertex in face.verts)
+        face_vertex_ids[face_id] = vertex_ids
+        face_ids_by_vertex_set[frozenset(vertex_ids)].append(face_id)
 
     def _ensure_fallback_face_index() -> None:
         nonlocal fallback_index_ready
@@ -448,7 +790,29 @@ def prepare_topology(
         return found
 
     mirror_face_ids: MirrorFaceMap = {}
+    geometric_fallback: list[tuple[FaceId, FaceMatchRecord]] = []
     for face_id, record in face_records.items():
+        vertex_ids = face_vertex_ids[face_id]
+        mapped = []
+        for vertex_id in vertex_ids:
+            partner = vertex_pairs.get(vertex_id)
+            if partner is None:
+                break
+            mapped.append(partner)
+        if len(mapped) == len(vertex_ids):
+            # Both the source's own vertex set and the mapped set must be
+            # unique face keys.  With duplicate coincident faces (R1, R2 over
+            # one vertex set) the mapped-set lookup alone would send both to
+            # the same counterpart while their own ambiguity goes unnoticed.
+            own_faces = face_ids_by_vertex_set.get(frozenset(vertex_ids), ())
+            counterparts = face_ids_by_vertex_set.get(frozenset(mapped), ())
+            if len(own_faces) == 1 and len(counterparts) == 1:
+                mirror_face_ids[face_id] = counterparts[0]
+                continue
+        geometric_fallback.append((face_id, record))
+
+    fallback_assignments: dict[FaceId, FaceId] = {}
+    for face_id, record in geometric_fallback:
         candidates = _mirror_candidates(face_id, record)
         if not candidates:
             continue
@@ -462,7 +826,32 @@ def prepare_topology(
                 (candidate for candidate in candidates if candidate != face_id),
                 counterpart,
             )
+        fallback_assignments[face_id] = counterpart
+
+    # Injectivity check for the fallback layer: an entry whose target is
+    # already taken (or contested by another fallback entry) is demoted to
+    # unmatched instead of silently duplicating.
+    pair_table_targets = set(mirror_face_ids.values())
+    fallback_target_counts: dict[FaceId, int] = defaultdict(int)
+    for counterpart in fallback_assignments.values():
+        fallback_target_counts[counterpart] += 1
+    for face_id, counterpart in fallback_assignments.items():
+        if counterpart in pair_table_targets or fallback_target_counts[counterpart] > 1:
+            continue
         mirror_face_ids[face_id] = counterpart
+
+    # Defensive whole-map verification, origin-agnostic: if any target is
+    # still referenced twice, drop every colliding entry.  Demotions show up
+    # in matched_faces / total_faces.
+    final_target_counts: dict[FaceId, int] = defaultdict(int)
+    for counterpart in mirror_face_ids.values():
+        final_target_counts[counterpart] += 1
+    if any(count > 1 for count in final_target_counts.values()):
+        mirror_face_ids = {
+            face_id: counterpart
+            for face_id, counterpart in mirror_face_ids.items()
+            if final_target_counts[counterpart] == 1
+        }
 
     for face in bm.faces:
         face_id = FaceId(int(face[face_layer]))
@@ -600,6 +989,8 @@ def _point_segment_distance_and_factor(
     coordinate: Vector,
     edge: bmesh.types.BMEdge,
 ) -> tuple[float, float]:
+    # Intentionally Euclidean: this is a geometric point-to-segment distance,
+    # not a coordinate-identity test (which is coordinates_match / Chebyshev).
     a = edge.verts[0].co
     delta = edge.verts[1].co - a
     length_squared = delta.length_squared
@@ -703,12 +1094,14 @@ def _resolve_reflected_vertex_on_target(
     if not candidate_faces:
         return "missing", None, None, 0.0, "a mirrored target face was lost"
 
+    # Acceptance uses coordinates_match; the Euclidean length stays only as
+    # the tie-breaking rank so the nearest of several accepted vertices wins.
     candidate_vertices = {vertex for face in candidate_faces for vertex in face.verts}
     exact_vertices = sorted(
         (
             ((vertex.co - expected).length, vertex.index, vertex)
             for vertex in candidate_vertices
-            if (vertex.co - expected).length <= tolerance
+            if coordinates_match(vertex.co, expected, tolerance)
         ),
         key=lambda item: (item[0], item[1]),
     )
@@ -1152,6 +1545,8 @@ def collapsed_offset_target_edge_markers(
         if (reflected_a - reflected_b).length <= tolerance:
             # Endpoint-cap output can collapse to a point at factor zero.  The
             # target BMesh op will recreate it from the non-degenerate loop.
+            # (Intentionally Euclidean: an edge-length degeneracy test, not a
+            # coordinate-identity test.)
             continue
         if _edge_coordinate_key_matches(reflected_a, reflected_b, tolerance, new_edges_by_endpoint):
             return set(), "the target already contains native zero-offset topology"
@@ -1393,24 +1788,176 @@ def reserve_source_path_marker(bm: bmesh.types.BMesh) -> int:
     return count
 
 
+# One step is one trial assignment of a candidate to a destination vertex.
+# Assignments forced by propagation (a single remaining candidate) are free.
+_PROJECTION_STEP_LIMIT = 10_000
+
+
 def _assign_projection_candidates(
     candidates: list[tuple[float, int, int]],
-) -> tuple[dict[int, int], dict[int, float]]:
-    """Greedily assign the same sorted nearest pairs used by the legacy path."""
+    destination_count: int,
+    destination_pairs: list[tuple[int, int]],
+    expected_edge_set: set[tuple[int, int]],
+) -> tuple[dict[int, int], dict[int, float], str]:
+    """Adjacency-constrained matching of destination vertices to expected ones.
 
-    # Sort by distance only.  Python's stable sort then preserves the legacy
-    # destination/expected iteration order for exact-distance ties.
-    candidates.sort(key=lambda item: item[0])
-    assignment: dict[int, int] = {}
-    used_expected: set[int] = set()
-    distances: dict[int, float] = {}
+    Replaces the earlier distance-greedy assignment, which provably swapped
+    near-coincident vertices and then failed the global adjacency check even
+    though a valid solution existed.  The search combines unit propagation
+    (a destination with one remaining candidate is fixed and its target is
+    removed everywhere), adjacency propagation (the candidates of a fixed
+    destination's unassigned neighbors shrink to the expected-graph neighbors
+    of its target), and depth-first backtracking over the rest, trying
+    candidates in ascending distance order.
+
+    The returned solution is the deterministic first accepted one; total or
+    maximum distance optimality is not guaranteed.  Trying candidates
+    nearest-first biases the search toward short-distance solutions, which in
+    practice suppresses embedding twists via expected-graph automorphisms.
+    Extension point if strict optimality ever becomes necessary:
+    branch-and-bound over the same propagation core.
+
+    Returns ``(assignment, distances, failure_reason)``; a non-empty reason
+    means no assignment was produced.
+    """
+
+    allowed: list[dict[int, float]] = [{} for _ in range(destination_count)]
     for distance, destination_id, expected_id in candidates:
-        if destination_id in assignment or expected_id in used_expected:
+        previous = allowed[destination_id].get(expected_id)
+        if previous is None or distance < previous:
+            allowed[destination_id][expected_id] = distance
+    if any(not options for options in allowed):
+        return {}, {}, "could not match every projected graph vertex"
+    initial_allowed = [dict(options) for options in allowed]
+
+    destination_adjacency: list[set[int]] = [set() for _ in range(destination_count)]
+    for a, b in destination_pairs:
+        destination_adjacency[a].add(b)
+        destination_adjacency[b].add(a)
+    expected_adjacency: dict[int, set[int]] = defaultdict(set)
+    for a, b in expected_edge_set:
+        expected_adjacency[a].add(b)
+        expected_adjacency[b].add(a)
+
+    assignment: dict[int, int] = {}
+    used: set[int] = set()
+    steps = 0
+
+    def _sorted_options(destination_id: int) -> list[tuple[float, int]]:
+        return sorted(
+            (distance, expected_id)
+            for expected_id, distance in allowed[destination_id].items()
+            if expected_id not in used
+        )
+
+    def _assign_and_propagate(destination_id: int, expected_id: int, trail: list) -> bool:
+        """Fix one pair, then propagate; False on contradiction."""
+
+        queue = [(destination_id, expected_id)]
+        while queue:
+            current, target = queue.pop()
+            if current in assignment:
+                if assignment[current] != target:
+                    return False
+                continue
+            if target in used:
+                return False
+            for neighbor in destination_adjacency[current]:
+                fixed = assignment.get(neighbor)
+                if fixed is not None and fixed not in expected_adjacency[target]:
+                    return False
+            assignment[current] = target
+            used.add(target)
+            trail.append(current)
+            for neighbor in destination_adjacency[current]:
+                if neighbor in assignment:
+                    continue
+                options = allowed[neighbor]
+                restricted = {
+                    expected: distance
+                    for expected, distance in options.items()
+                    if expected in expected_adjacency[target]
+                }
+                if len(restricted) != len(options):
+                    trail.append((neighbor, options))
+                    allowed[neighbor] = restricted
+                available = [(distance, expected) for expected, distance in restricted.items() if expected not in used]
+                if not available:
+                    return False
+                if len(available) == 1:
+                    queue.append((neighbor, min(available)[1]))
+        return True
+
+    def _undo(trail: list) -> None:
+        while trail:
+            item = trail.pop()
+            if isinstance(item, tuple):
+                neighbor, previous_options = item
+                allowed[neighbor] = previous_options
+            else:
+                used.discard(assignment.pop(item))
+
+    # Root pass: destinations that are unique from the start.  A contradiction
+    # here means no adjacency-consistent complete assignment exists at all.
+    root_trail: list = []
+    for destination_id in range(destination_count):
+        if destination_id in assignment:
             continue
-        assignment[destination_id] = expected_id
-        used_expected.add(expected_id)
-        distances[destination_id] = distance
-    return assignment, distances
+        options = _sorted_options(destination_id)
+        if not options:
+            return {}, {}, "could not match every projected graph vertex"
+        if len(options) == 1 and not _assign_and_propagate(destination_id, options[0][1], root_trail):
+            return {}, {}, "graph adjacency mismatch"
+
+    def _choose_destination() -> tuple[int, list[tuple[float, int]]] | None:
+        best: tuple[int, list[tuple[float, int]]] | None = None
+        for destination_id in range(destination_count):
+            if destination_id in assignment:
+                continue
+            options = _sorted_options(destination_id)
+            if best is None or len(options) < len(best[1]):
+                best = (destination_id, options)
+                if len(options) <= 1:
+                    break
+        return best
+
+    frames: list[list] = []
+    advancing = len(assignment) < destination_count
+    while len(assignment) < destination_count:
+        if advancing:
+            chosen = _choose_destination()
+            assert chosen is not None
+            frames.append([chosen[0], chosen[1], 0, []])
+        if not frames:
+            return {}, {}, "graph adjacency mismatch"
+        frame = frames[-1]
+        destination_id, options, _index, trail = frame
+        _undo(trail)
+        placed = False
+        while frame[2] < len(options):
+            _distance, expected_id = options[frame[2]]
+            frame[2] += 1
+            if expected_id in used:
+                continue
+            if len(options) > 1:
+                steps += 1
+                if steps > _PROJECTION_STEP_LIMIT:
+                    return {}, {}, "ambiguous projection correspondence"
+            if _assign_and_propagate(destination_id, expected_id, trail):
+                placed = True
+                break
+            _undo(trail)
+        if placed:
+            advancing = True
+        else:
+            frames.pop()
+            advancing = False
+
+    distances = {
+        destination_id: initial_allowed[destination_id][expected_id]
+        for destination_id, expected_id in assignment.items()
+    }
+    return dict(assignment), distances, ""
 
 
 def _nearby_projection_candidates(
@@ -1443,28 +1990,16 @@ def _nearby_projection_candidates(
             continue
         limit = existing_limit if hash(vertex) in preexisting_vertex_keys else snap_limit
         # Include points on the numerical boundary of the accepted range.
+        # Intentionally Euclidean: the KDTree radius only collects candidates
+        # and decides nothing.  It shares the metric and the per-vertex limit
+        # with the final distance validation in snap_projected_graph, so the
+        # radius is a complete bound on the acceptable search space.
         search_radius = limit * (1.0 + 1.0e-12) + 1.0e-15
         for _coordinate, expected_id, distance in tree.find_range(
             vertex.co,
             search_radius,
         ):
             candidates.append((distance, destination_id, expected_id))
-    return candidates
-
-
-def _all_projection_candidates(
-    destination_vertices: list[bmesh.types.BMVert],
-    destination_degree: list[int],
-    expected_vertices: list[Vector],
-    expected_degree: list[int],
-) -> list[tuple[float, int, int]]:
-    """Build the legacy global candidate set used as an exact fallback."""
-
-    candidates = []
-    for destination_id, vertex in enumerate(destination_vertices):
-        for expected_id, coordinate in enumerate(expected_vertices):
-            if destination_degree[destination_id] == expected_degree[expected_id]:
-                candidates.append(((vertex.co - coordinate).length, destination_id, expected_id))
     return candidates
 
 
@@ -1553,9 +2088,13 @@ def snap_projected_graph(
 
     # Long Loop Cut graphs often contain thousands of same-degree vertices.
     # Searching only their local KDTree neighborhood keeps the normal path near
-    # O(n log n).  If greedy assignment or graph validation is ambiguous, fall
-    # back to the previous all-pairs algorithm so unusual topology retains the
-    # exact behavior that was already proven for Knife strokes.
+    # O(n log n).  The radius search is a *complete* candidate enumeration: it
+    # uses the same Euclidean metric and the same per-vertex limits as the
+    # final distance validation below, so an assignment using any vertex
+    # outside the radius would necessarily be rejected there.  No wider
+    # fallback can add an acceptable solution.  Degree compatibility is a
+    # necessary condition of the final graph isomorphism check and therefore
+    # never narrows the acceptable space either.
     candidates = _nearby_projection_candidates(
         destination_vertices,
         destination_degree,
@@ -1565,19 +2104,14 @@ def snap_projected_graph(
         existing_limit,
         preexisting_vertex_keys,
     )
-    assignment, distances = _assign_projection_candidates(candidates)
-    nearby_assignment_is_valid = (
-        len(assignment) == len(destination_vertices)
-        and _mapped_projection_edge_set(destination_pairs, assignment) == expected_edge_set
+    assignment, distances, assignment_reason = _assign_projection_candidates(
+        candidates,
+        len(destination_vertices),
+        destination_pairs,
+        expected_edge_set,
     )
-    if not nearby_assignment_is_valid:
-        candidates = _all_projection_candidates(
-            destination_vertices,
-            destination_degree,
-            expected_vertices,
-            expected_degree,
-        )
-        assignment, distances = _assign_projection_candidates(candidates)
+    if assignment_reason:
+        return False, 0.0, assignment_reason
 
     if len(assignment) != len(destination_vertices):
         return False, 0.0, "could not match every projected graph vertex"
@@ -1586,6 +2120,9 @@ def snap_projected_graph(
     if mapped_edge_set != expected_edge_set:
         return False, max(distances.values(), default=0.0), "graph adjacency mismatch"
 
+    # Intentionally Euclidean, and it must stay that way: sharing this metric
+    # and these limits with the KDTree radius search above is exactly what
+    # makes that search a complete candidate enumeration.
     maximum_distance = max(distances.values(), default=0.0)
     existing_error = max(
         (

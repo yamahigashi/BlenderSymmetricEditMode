@@ -69,7 +69,11 @@ def coordinate_signature(bm):
     return tuple(sorted(tuple(round(float(component), 7) for component in vertex.co) for vertex in bm.verts))
 
 
-def check_fast_path_matches_global_fallback():
+def check_radius_search_is_the_only_candidate_source():
+    """The KDTree radius search is a complete enumeration; there is no
+    all-pairs fallback anymore.  An empty candidate set must fail cleanly,
+    and the normal path must snap to the exact expected coordinates."""
+
     expected_vertices = [
         Vector((0.0, 0.0, 0.0)),
         Vector((1.0, 0.0, 0.0)),
@@ -85,7 +89,7 @@ def check_fast_path_matches_global_fallback():
     ]
 
     fast_bm = build_marked_graph(projected_vertices, expected_edges)
-    fallback_bm = build_marked_graph(projected_vertices, expected_edges)
+    starved_bm = build_marked_graph(projected_vertices, expected_edges)
     try:
         fast_result = core.snap_projected_graph(
             fast_bm,
@@ -93,13 +97,15 @@ def check_fast_path_matches_global_fallback():
             expected_edges,
             1.0e-5,
         )
+        assert fast_result[0]
+        assert fast_result[2] == ""
+        assert coordinate_signature(fast_bm) == tuple(sorted(tuple(coordinate) for coordinate in expected_vertices))
 
         nearby_candidates = core._nearby_projection_candidates
         try:
-            # Force the public function through its legacy all-pairs fallback.
             core._nearby_projection_candidates = lambda *_args: []
-            fallback_result = core.snap_projected_graph(
-                fallback_bm,
+            starved_result = core.snap_projected_graph(
+                starved_bm,
                 expected_vertices,
                 expected_edges,
                 1.0e-5,
@@ -107,14 +113,159 @@ def check_fast_path_matches_global_fallback():
         finally:
             core._nearby_projection_candidates = nearby_candidates
 
-        assert fast_result[0] and fallback_result[0]
-        assert fast_result[2] == fallback_result[2] == ""
-        assert abs(fast_result[1] - fallback_result[1]) < 1.0e-9
-        assert coordinate_signature(fast_bm) == coordinate_signature(fallback_bm)
-        assert coordinate_signature(fast_bm) == tuple(sorted(tuple(coordinate) for coordinate in expected_vertices))
+        assert not starved_result[0]
+        assert starved_result[2] == "could not match every projected graph vertex"
+        # The failed attempt must not have moved anything.
+        assert coordinate_signature(starved_bm) == tuple(sorted(tuple(coordinate) for coordinate in projected_vertices))
     finally:
         fast_bm.free()
-        fallback_bm.free()
+        starved_bm.free()
+
+
+def check_constrained_matching_resolves_near_coincident_vertices():
+    """The distance-greedy assignment provably swapped near-coincident
+    vertices and then rejected a solvable graph; the constrained matching
+    must construct the identity assignment instead."""
+
+    expected_vertices = [
+        Vector((-10.0, 0.0, 0.0)),
+        Vector((0.0, 0.0, 0.0)),
+        Vector((0.001, 0.0, 0.0)),
+        Vector((10.0, 0.0, 0.0)),
+    ]
+    expected_edges = [(0, 1), (1, 2), (2, 3)]
+    projected_vertices = [
+        (-10.0, 0.0, 0.0),
+        (0.0009, 0.0, 0.0),
+        (0.0001, 0.0, 0.0),
+        (10.0, 0.0, 0.0),
+    ]
+
+    bm = build_marked_graph(projected_vertices, expected_edges)
+    try:
+        snapped, _error, reason = core.snap_projected_graph(
+            bm,
+            expected_vertices,
+            expected_edges,
+            1.0e-4,
+        )
+        assert snapped, reason
+        assert reason == ""
+        assert coordinate_signature(bm) == tuple(
+            sorted(tuple(round(float(component), 7) for component in coordinate) for coordinate in expected_vertices)
+        )
+    finally:
+        bm.free()
+
+
+def check_injective_component_counterexample():
+    """The design's mutual-nearest counterexample must yield the complete
+    assignment q1->t2, q2->t1, q3->t3 (1-D, tolerance 1.0)."""
+
+    targets = [Vector((0.0, 0.0, 0.0)), Vector((1.2, 0.0, 0.0)), Vector((-1.5, 0.0, 0.0))]
+    queries = [Vector((0.4, 0.0, 0.0)), Vector((-0.9, 0.0, 0.0)), Vector((-2.0, 0.0, 0.0))]
+    lookup = core.build_vertex_mirror_lookup(targets, 0, 1.0)
+    assert lookup.find_all_direct(queries) == (1, 0, 2)
+
+
+def check_injective_tie_rejection_is_order_independent():
+    """Two complete assignments whose distance multisets are equal must be a
+    tie even when sequential float addition would compare them unequal
+    (distances [1, eps, eps] vs [eps, eps, 1])."""
+
+    eps = 2.0**-53
+    candidate_lists = [
+        [(eps, 11), (1.0, 10)],
+        [(eps, 11), (eps, 12)],
+        [(eps, 12), (1.0, 10)],
+    ]
+    result = core._solve_injective_component([0, 1, 2], candidate_lists)
+    assert result is None, result
+
+    # A strictly better unique optimum must still be found.
+    unique_lists = [
+        [(0.1, 10), (0.4, 11)],
+        [(0.1, 11), (0.4, 10)],
+    ]
+    result = core._solve_injective_component([0, 1], unique_lists)
+    assert result == {0: 10, 1: 11}, result
+
+
+def check_injective_step_limit_rejects_component():
+    # Costs 0.4 vs 0.5: a unique optimum, no tie.
+    candidate_lists = [
+        [(0.1, 10), (0.3, 11)],
+        [(0.2, 10), (0.3, 11)],
+    ]
+    # Exhausting the search takes 3 trial assignments; capping at 2 must
+    # reject the whole component even though the optimum was already seen.
+    assert core._solve_injective_component([0, 1], candidate_lists, step_limit=2) is None
+    assert core._solve_injective_component([0, 1], candidate_lists) == {0: 10, 1: 11}
+
+
+def check_on_plane_vertices_never_serve_off_plane_queries():
+    """Partial-batch regression: an off-plane query whose reflection lands
+    near an on-plane vertex must stay unresolved, even when no on-plane query
+    is present in the batch to reserve that vertex."""
+
+    tolerance = 0.001
+    registered = [Vector((-0.0002, 0.0, 0.0)), Vector((5.0, 0.0, 0.0))]
+    lookup = core.build_vertex_mirror_lookup(registered, 0, tolerance)
+    # Reflection of +0.0011 is -0.0011: Chebyshev 0.0009 from the on-plane
+    # vertex, i.e. inside tolerance — but the plane partition must reject it.
+    assert lookup.find_all_mirrored([Vector((0.0011, 0.0, 0.0))]) == (None,)
+    # The on-plane vertex still self-corresponds when queried directly.
+    assert lookup.find_all_mirrored([Vector((-0.0002, 0.0, 0.0))]) == (0,)
+
+
+def check_pair_table_involution_and_partial_pairs():
+    coords = [
+        Vector((-1.0, 0.0, 0.0)),
+        Vector((2.0, 0.0, 0.0)),
+        Vector((1.0, 0.0, 0.0)),
+        Vector((-2.0, 0.0, 0.0)),
+        Vector((0.0, 3.0, 0.0)),
+        Vector((7.0, 0.0, 0.0)),  # no counterpart
+    ]
+    pairs = core.build_vertex_pair_table(coords, 0, 0.001)
+    assert all(pairs[pairs[vertex]] == vertex for vertex in pairs)
+    assert pairs.get(0) == 2 and pairs.get(2) == 0
+    assert pairs.get(1) == 3 and pairs.get(3) == 1
+    assert pairs.get(4) == 4  # on-plane self-pair
+    assert 5 not in pairs
+
+
+def check_projection_backtracking_and_failure_reasons():
+    """The constrained matcher must survive a first-candidate contradiction
+    (undo + next candidate), report unsolvable adjacency, and report the step
+    limit as ambiguity instead of raising."""
+
+    # d0-d1 adjacent; e0/e1 isolated in the expected graph, e2-e3 adjacent.
+    # d0's nearest candidate e0 forces d1's options empty -> undo -> e2 wins.
+    candidates = [(0.1, 0, 0), (0.2, 0, 2), (0.1, 1, 1), (0.2, 1, 3)]
+    destination_pairs = [(0, 1)]
+    expected_edge_set = {(2, 3)}
+    assignment, _distances, reason = core._assign_projection_candidates(
+        candidates, 2, destination_pairs, expected_edge_set
+    )
+    assert reason == "", reason
+    assert assignment == {0: 2, 1: 3}, assignment
+
+    # Unsolvable: both destinations forced onto non-adjacent expected verts.
+    _assignment, _distances, reason = core._assign_projection_candidates([(0.0, 0, 0), (0.0, 1, 1)], 2, [(0, 1)], set())
+    assert reason == "graph adjacency mismatch", reason
+
+    # Step limit: with the limit forced to zero, the first real branching
+    # trial must fail as ambiguity, not raise.
+    original_limit = core._PROJECTION_STEP_LIMIT
+    try:
+        core._PROJECTION_STEP_LIMIT = 0
+        _assignment, _distances, reason = core._assign_projection_candidates(
+            candidates, 2, destination_pairs, expected_edge_set
+        )
+        assert reason == "ambiguous projection correspondence", reason
+    finally:
+        core._PROJECTION_STEP_LIMIT = original_limit
 
 
 def check_long_graph_fast_path():
@@ -604,7 +755,14 @@ def run():
     assert a.co == before[0] and b.co == before[1]
     guard.free()
 
-    check_fast_path_matches_global_fallback()
+    check_radius_search_is_the_only_candidate_source()
+    check_constrained_matching_resolves_near_coincident_vertices()
+    check_injective_component_counterexample()
+    check_injective_tie_rejection_is_order_independent()
+    check_injective_step_limit_rejects_component()
+    check_on_plane_vertices_never_serve_off_plane_queries()
+    check_pair_table_involution_and_partial_pairs()
+    check_projection_backtracking_and_failure_reasons()
     check_long_graph_fast_path()
     check_quantized_coordinate_bin_boundary()
     check_interior_edge_factor_uses_absolute_distance()

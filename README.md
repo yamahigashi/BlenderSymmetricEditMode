@@ -76,9 +76,13 @@ are mirrored after the native confirmation:
   native rip is kept, the mirror step is rolled back completely, and a
   warning is reported.
 
-Rip passes through to the native tool without mirroring — with a report —
-when the selection touches the symmetry plane, spans both sides, or when
-Proportional Editing or Auto Merge is enabled.
+A selection with vertices on both sides is still mirrored as long as it does
+not overlap its own mirror image. Rip passes through to the native tool
+without mirroring when the selection touches the symmetry plane, overlaps its
+own mirror image, or when Proportional Editing or Auto Merge is enabled. When
+the ripped seam itself lacks mirrored counterparts, the native rip is kept and
+the mirror step is declined with a warning; counterpart-less selected vertices
+that the native Rip left untouched do not block mirroring of the seam.
 
 **Adjust Last Operation (F9) is not supported for Rip.** This is a limitation
 of Blender itself: re-executing `Rip and Move` cannot repeat the rip, so the
@@ -100,11 +104,18 @@ plane are treated as shared by both sides: when a merge lands on the plane, the
 mirrored cluster is welded into the same surviving vertex, keeping the mesh
 connected.
 
-The mirror step is skipped — with a report, never silently — when it cannot
-apply cleanly:
+What happens depends on how the selection relates to its own mirror image —
+always with a report, never silently:
 
-- A selection that already spans both sides runs the native operation once
-  (the selection is symmetrized first for By Distance).
+- A selection whose mirror image does not intersect the selection itself is
+  mirrored normally, even when it has vertices on both sides of the plane.
+- A fully self-mirrored selection runs the native operation once; the result
+  is already symmetric. **At First** and **At Last** merge each side to its
+  own first/last vertex instead, so the two halves stay apart symmetrically.
+- A selection that partially overlaps its mirror image is completed with the
+  missing mirrored vertices first (reported as INFO) and then merged natively
+  once; Connect runs natively only, with a warning, because an overlapping
+  ordered path has no safe symmetric interpretation.
 - Vertices without a mirrored counterpart are merged natively; Connect requires
   the full path to have counterparts and otherwise connects the source side
   only.

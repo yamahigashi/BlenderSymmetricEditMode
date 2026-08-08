@@ -13,7 +13,9 @@ from mathutils import Vector
 PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
+from ydd_symmetric_edit import backup as yse_backup  # noqa: E402
 from ydd_symmetric_edit import replay  # noqa: E402
+from ydd_symmetric_edit._types import TopologyBackup  # noqa: E402
 
 
 def check_shared_off_classification_and_partial_mirror_set() -> None:
@@ -129,11 +131,27 @@ def check_connect_history_mapping_is_all_or_nothing() -> None:
     )
 
 
+def check_remove_backup_is_noexcept() -> None:
+    """remove_backup runs from `finally` blocks whose contract is "always
+    return the native result"; it must swallow even an invalidated-RNA-style
+    failure on attribute access (adversarial-review finding)."""
+
+    class _InvalidatedMesh:
+        @property
+        def name(self):
+            raise RuntimeError("injected invalidated datablock")
+
+    broken = TopologyBackup(mesh=_InvalidatedMesh(), shape_values={})  # type: ignore[arg-type]
+    yse_backup.remove_backup(broken)  # must not raise
+    yse_backup.remove_backup(None)  # must not raise either
+
+
 def run() -> None:
     check_shared_off_classification_and_partial_mirror_set()
     check_merge_cluster_partitioning()
     check_merge_target_precomputation()
     check_connect_history_mapping_is_all_or_nothing()
+    check_remove_backup_is_noexcept()
     print("YSE_REPLAY_UNITS_OK", flush=True)
 
 
