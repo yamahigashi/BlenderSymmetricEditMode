@@ -997,9 +997,10 @@ def collect_knife_path_edges_by_side(
 ) -> tuple[dict[str, list[bmesh.types.BMEdge]], int]:
     """Classify every new Knife path edge without choosing a source side.
 
-    Phase 1 (axis-crossing contract §4.1): both POSITIVE and NEGATIVE buckets
-    are mirrored toward each other. PLANE edges are shared. A non-empty
-    CROSSES bucket declines the whole mirror stage (p-stitch is Phase 2).
+    Phase 1/2 (axis-crossing contract §4.1): both POSITIVE and NEGATIVE
+    buckets are mirrored toward each other. PLANE edges are shared.
+    CROSSES edges are p-stitched (Phase 2) before the half-edges join the
+    POSITIVE/NEGATIVE mirror path.
 
     Returns ``(by_side, total_path_edge_count)``.
     """
@@ -1007,6 +1008,438 @@ def collect_knife_path_edges_by_side(
     all_path_edges = _discover_path_edges(bm, selected_only=False)
     by_side = classify_path_edges_by_side(all_path_edges, axis_index, tolerance)
     return by_side, len(all_path_edges)
+
+
+def is_self_mirrored_edge(
+    edge: bmesh.types.BMEdge,
+    axis_index: int,
+    tolerance: float,
+) -> bool:
+    """True when the edge endpoints are a mirror pair (ρ(s) = s, no X needed)."""
+
+    a = edge.verts[0].co
+    b = edge.verts[1].co
+    return coordinates_match(a, mirror_coordinate(b, axis_index), tolerance) and coordinates_match(
+        b,
+        mirror_coordinate(a, axis_index),
+        tolerance,
+    )
+
+
+def plane_intersection_of_edge(
+    edge: bmesh.types.BMEdge,
+    axis_index: int,
+) -> tuple[Vector, float] | None:
+    """Return ``(p, factor_from_vert0)`` where the edge meets the mirror plane.
+
+    *p* is snapped so ``p[axis_index] == 0``. Returns ``None`` when the edge is
+    parallel to the plane or the intersection is outside the segment.
+    """
+
+    a = edge.verts[0].co
+    b = edge.verts[1].co
+    ax = float(a[axis_index])
+    bx = float(b[axis_index])
+    denom = ax - bx
+    if abs(denom) <= 1.0e-30:
+        return None
+    # a + t*(b-a) has axis component 0 ⇒ t = ax / (ax - bx)
+    factor = ax / denom
+    if factor < 0.0 or factor > 1.0:
+        return None
+    point = a.lerp(b, factor)
+    point[axis_index] = 0.0
+    return point, factor
+
+
+def cluster_points_by_tolerance(
+    points: Sequence[Vector],
+    tolerance: float,
+) -> list[list[int]]:
+    """§1.1 clustering: lex-order scan, absorb within tol of the representative.
+
+    Returns clusters as lists of indices into *points*. The first index of each
+    cluster is the representative (lex-first member). Member-to-rep distance is
+    at most *tolerance*; diameter among members can reach 2·tol.
+    """
+
+    order = sorted(
+        range(len(points)),
+        key=lambda index: (
+            float(points[index][0]),
+            float(points[index][1]),
+            float(points[index][2]),
+        ),
+    )
+    clusters: list[list[int]] = []
+    for index in order:
+        placed = False
+        for cluster in clusters:
+            representative = points[cluster[0]]
+            if coordinates_match(points[index], representative, tolerance):
+                cluster.append(index)
+                placed = True
+                break
+        if not placed:
+            clusters.append([index])
+    return clusters
+
+
+def _region_allows_orphan_self_map(
+    faces: Sequence[bmesh.types.BMFace],
+    path_vertex_indices: set[int],
+    axis_index: int,
+    tolerance: float,
+) -> bool:
+    """True when non-path vertices of *faces* are geometrically self-mirrored.
+
+    Path endpoints may be asymmetric until the X stitch completes (native cut
+    on a ρ(F)=F carrier). Non-path vertices (carrier boundary / ears) must
+    still pair injectively under ρ within *tolerance*. An asymmetric ear on a
+    dissolved L∪R∪E union fails this guard.
+
+    Path vertices are identified by ``BMVert.index`` (stable within one resolve
+    call after ``ensure_lookup_table``). Python ``id()`` of BMesh proxies is
+    **not** stable across layer ops / re-wraps and must not be used.
+    """
+
+    seen: dict[int, bmesh.types.BMVert] = {}
+    for face in faces:
+        if not face.is_valid:
+            continue
+        for vertex in face.verts:
+            if vertex.is_valid:
+                seen[vertex.index] = vertex
+    verts = list(seen.values())
+    if not verts:
+        return False
+
+    available = list(verts)
+    for vertex in verts:
+        if vertex.index in path_vertex_indices:
+            # Path endpoints are exempt: the cut may break geometric symmetry
+            # until p-stitch + mirror finish the X.
+            continue
+        mirrored = mirror_coordinate(vertex.co, axis_index)
+        match_index = None
+        for index, candidate in enumerate(available):
+            if coordinates_match(candidate.co, mirrored, tolerance):
+                match_index = index
+                break
+        if match_index is None:
+            return False
+        available.pop(match_index)
+    return True
+
+
+def resolve_live_mirror_face_map(
+    bm: bmesh.types.BMesh,
+    mirror_face_ids: MirrorFaceMap,
+    axis_index: int,
+    tolerance: float,
+    path_edges: Sequence[bmesh.types.BMEdge] | None = None,
+) -> MirrorFaceMap:
+    """Remap mirror targets orphaned by post-native dissolves onto live faces.
+
+    Pre-native pair tables can leave a target FACE_ID with no surviving face
+    after a plane edge is dissolved (two mirrored quads → one spanning face).
+    Orphan self-map (source → source) is allowed only when the live region
+    (all faces sharing that FACE_ID in path scope) is geometrically
+    self-mirrored under ρ within *tolerance*, allowing path endpoints to be
+    asymmetric until the X is completed (contract §4.1-2 ρ(F)=F). Asymmetric
+    dissolved unions (e.g. L∪R∪ear) fail the guard and drop the pair so the
+    existing unmatched-face decline fires.
+
+    Scope is limited to carrier faces of *path_edges* (and their pre-native
+    counterparts). Unrelated faces are left untouched. When *path_edges* is
+    ``None``, no orphan remapping is applied.
+    """
+
+    face_layer = bm.faces.layers.int.get(FACE_ID_LAYER)
+    if face_layer is None:
+        return dict(mirror_face_ids)
+
+    remapped: MirrorFaceMap = dict(mirror_face_ids)
+    if path_edges is None:
+        return remapped
+
+    # index_update assigns stable 0..n-1 indices even on free-standing BMesh
+    # (ensure_lookup_table alone leaves index==-1 there). Edit-mesh BMesh also
+    # benefits after layer ops that may leave indices dirty.
+    bm.verts.index_update()
+    bm.faces.index_update()
+    bm.verts.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+
+    live_ids = {FaceId(int(face[face_layer])) for face in bm.faces}
+    path_vertex_indices: set[int] = set()
+    scope_ids: set[FaceId] = set()
+    for edge in path_edges:
+        if not edge.is_valid:
+            continue
+        for vertex in edge.verts:
+            if vertex.is_valid:
+                path_vertex_indices.add(vertex.index)
+        for face in edge.link_faces:
+            if face.is_valid:
+                scope_ids.add(FaceId(int(face[face_layer])))
+    for face_id in list(scope_ids):
+        target = remapped.get(face_id)
+        if target is not None:
+            scope_ids.add(target)
+
+    faces_by_id: dict[FaceId, list[bmesh.types.BMFace]] = defaultdict(list)
+    for face in bm.faces:
+        if not face.is_valid:
+            continue
+        face_id = FaceId(int(face[face_layer]))
+        if face_id in scope_ids:
+            faces_by_id[face_id].append(face)
+
+    for face_id, faces in faces_by_id.items():
+        target_id = remapped.get(face_id)
+        if target_id is None or target_id in live_ids:
+            continue
+        # Orphan target: self-map only when the live region is ρ-self-mirrored
+        # (path endpoints exempt — see _region_allows_orphan_self_map).
+        if _region_allows_orphan_self_map(faces, path_vertex_indices, axis_index, tolerance):
+            remapped[face_id] = face_id
+        else:
+            # Clear so target_face_ids_for_edges treats the carrier as unmatched.
+            del remapped[face_id]
+    return remapped
+
+
+def apply_crosses_p_stitch(
+    bm: bmesh.types.BMesh,
+    crosses_edges: Iterable[bmesh.types.BMEdge],
+    axis_index: int,
+    tolerance: float,
+) -> tuple[int, str]:
+    """Split non-self-mirrored CROSSES edges at their plane intersection *p*.
+
+    Contract §4.1-2: collect all *p* first, cluster (§1.1), then apply with
+    priority (existing vertex → existing edge split → new via edge_split).
+    Self-mirrored CROSSES (endpoints are a mirror pair) are left untouched.
+
+    Returns ``(stitched_edge_count, failure_reason)``. On failure the mesh may
+    already be partially mutated; callers must roll back the whole stage.
+    """
+
+    edges = [edge for edge in crosses_edges if edge.is_valid]
+    if not edges:
+        return 0, ""
+
+    # (i) Collect plane intersections before any mutation.
+    records: list[tuple[bmesh.types.BMEdge, Vector, float]] = []
+    for edge in edges:
+        if is_self_mirrored_edge(edge, axis_index, tolerance):
+            continue
+        intersection = plane_intersection_of_edge(edge, axis_index)
+        if intersection is None:
+            return 0, "a cross-plane cut segment has no plane intersection"
+        point, factor = intersection
+        # Degenerate: intersection already at an endpoint within tol → treat as
+        # already on-plane (no split); skip so POSITIVE/NEGATIVE reclassification
+        # after a previous stitch can re-bucket cleanly.
+        if any(coordinates_match(vertex.co, point, tolerance) for vertex in edge.verts):
+            continue
+        records.append((edge, point, factor))
+
+    if not records:
+        return 0, ""
+
+    points = [point for _edge, point, _factor in records]
+    clusters = cluster_points_by_tolerance(points, tolerance)
+
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+
+    stitched = 0
+    for cluster_indices in clusters:
+        representative = points[cluster_indices[0]]
+        member_edges = [records[index][0] for index in cluster_indices]
+
+        plan_vertex, host_split, reason = _plan_plane_stitch_vertex(
+            bm,
+            representative,
+            member_edges,
+            axis_index,
+            tolerance,
+        )
+        if reason:
+            return stitched, reason
+
+        vertex = plan_vertex
+        if host_split is not None:
+            host_edge, factor = host_split
+            try:
+                _new_edge, vertex = bmesh.utils.edge_split(host_edge, host_edge.verts[0], factor)
+            except (RuntimeError, ValueError) as exc:
+                return stitched, f"could not split a host edge at the knife stitch point: {exc}"
+        if vertex is None:
+            # Priority (3): create p by splitting the lex-first member edge.
+            seed = _lex_first_edge(member_edges, axis_index)
+            intersection = plane_intersection_of_edge(seed, axis_index)
+            if intersection is None:
+                return stitched, "a cross-plane cut segment has no plane intersection"
+            _point, factor = intersection
+            try:
+                _new_edge, vertex = bmesh.utils.edge_split(seed, seed.verts[0], factor)
+            except (RuntimeError, ValueError) as exc:
+                return stitched, f"could not split a cross-plane cut at the mirror plane: {exc}"
+            stitched += 1
+
+        assert vertex is not None
+        vertex.co = representative.copy()
+        vertex.co[axis_index] = 0.0
+        vertex.select = False
+
+        for edge in member_edges:
+            if not edge.is_valid:
+                return stitched, "a cross-plane cut edge was lost during p-stitch"
+            if any(endpoint == vertex for endpoint in edge.verts):
+                continue
+            if any(coordinates_match(endpoint.co, vertex.co, tolerance) for endpoint in edge.verts):
+                for endpoint in edge.verts:
+                    if coordinates_match(endpoint.co, vertex.co, tolerance) and endpoint != vertex:
+                        try:
+                            # pointmerge keeps verts[0] as the survivor
+                            # (bmo_pointmerge_exec); put the cluster representative first.
+                            bmesh.ops.pointmerge(bm, verts=[vertex, endpoint], merge_co=vertex.co)
+                        except (RuntimeError, ValueError) as exc:
+                            return stitched, f"could not merge plane-stitch vertices: {exc}"
+                        break
+                continue
+
+            recomputed = plane_intersection_of_edge(edge, axis_index)
+            if recomputed is None:
+                return stitched, "a cross-plane cut segment lost its plane intersection"
+            _point, factor = recomputed
+            try:
+                _new_edge, new_vertex = bmesh.utils.edge_split(edge, edge.verts[0], factor)
+            except (RuntimeError, ValueError) as exc:
+                return stitched, f"could not split a cross-plane cut at the mirror plane: {exc}"
+            new_vertex.co = vertex.co.copy()
+            new_vertex.select = False
+            if new_vertex != vertex:
+                try:
+                    # Survivor first: keeps *vertex* valid across ≥3 merges in
+                    # one cluster (contract §4.1-2 multi-segment X at p).
+                    bmesh.ops.pointmerge(bm, verts=[vertex, new_vertex], merge_co=vertex.co)
+                except (RuntimeError, ValueError) as exc:
+                    return stitched, f"could not unify plane-stitch vertices: {exc}"
+            stitched += 1
+
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.normal_update()
+    return stitched, ""
+
+
+def _mirror_invariant_endpoint_key(
+    co,
+    axis_index: int,
+) -> tuple[float, float, float]:
+    """Canonical endpoint key with |axis| so ρ-related seeds share the key.
+
+    Absolute value on the mirror axis makes (M,I) and (ρM,ρI) order-equivalent
+    for seed selection. Full orbit ties are allowed under contract §1.2
+    best-effort attribute inheritance (shape keys etc.).
+    """
+
+    components = [float(co[0]), float(co[1]), float(co[2])]
+    components[axis_index] = abs(components[axis_index])
+    return (components[0], components[1], components[2])
+
+
+def _lex_first_edge(
+    edges: Sequence[bmesh.types.BMEdge],
+    axis_index: int = 0,
+) -> bmesh.types.BMEdge:
+    """Deterministic edge pick by mirror-invariant endpoint keys (§1.2 best-effort).
+
+    Keys use |axis| on the mirror component so a seed and its mirror image
+    sort equivalently. Remaining complete-orbit ties are acceptable best-effort.
+    """
+
+    return min(
+        edges,
+        key=lambda edge: (
+            min(
+                _mirror_invariant_endpoint_key(edge.verts[0].co, axis_index),
+                _mirror_invariant_endpoint_key(edge.verts[1].co, axis_index),
+            ),
+            max(
+                _mirror_invariant_endpoint_key(edge.verts[0].co, axis_index),
+                _mirror_invariant_endpoint_key(edge.verts[1].co, axis_index),
+            ),
+        ),
+    )
+
+
+def _plan_plane_stitch_vertex(
+    bm: bmesh.types.BMesh,
+    representative: Vector,
+    member_edges: Sequence[bmesh.types.BMEdge],
+    axis_index: int,
+    tolerance: float,
+) -> tuple[
+    bmesh.types.BMVert | None,
+    tuple[bmesh.types.BMEdge, float] | None,
+    str,
+]:
+    """Priority plan: (1) existing vertex (2) host edge split (3) member seed.
+
+    Returns ``(existing_vertex, host_split_or_None, error)``. When both vertex
+    and host_split are None and error is empty, the caller creates *p* by
+    splitting a member CROSSES edge.
+    """
+
+    del axis_index  # reserved; host multi-candidate no longer uses mirror pairing
+
+    # (1) Existing vertex within tol of the representative.
+    exact_vertices = sorted(
+        (
+            ((vertex.co - representative).length, vertex.index, vertex)
+            for vertex in bm.verts
+            if vertex.is_valid and coordinates_match(vertex.co, representative, tolerance)
+        ),
+        key=lambda item: (item[0], item[1]),
+    )
+    if len(exact_vertices) > 1:
+        return None, None, "ambiguous on-plane vertices within tolerance at a knife stitch point"
+    if exact_vertices:
+        return exact_vertices[0][2], None, ""
+
+    # (2) Existing edges whose interior contains the representative.
+    # Contract §1.1: single threshold = Match Tolerance (no second edge_limit).
+    edge_limit = max(tolerance, 1.0e-9)
+    host_edges: list[tuple[float, int, bmesh.types.BMEdge, float]] = []
+    member_ids = {id(edge) for edge in member_edges}
+    for edge in bm.edges:
+        if not edge.is_valid or id(edge) in member_ids:
+            continue
+        distance, factor = _point_segment_distance_and_factor(representative, edge)
+        if not _is_interior_edge_factor(factor, edge.calc_length(), tolerance):
+            continue
+        if distance > edge_limit:
+            continue
+        host_edges.append((distance, edge.index, edge, factor))
+
+    if host_edges:
+        host_edges.sort(key=lambda item: (item[0], item[1]))
+        if len(host_edges) > 1:
+            # §4.1-2: multi-candidate host edges are ambiguous.
+            # - Nearest fallback is forbidden.
+            # - A mirror pair both within tol is equidistant from on-plane p
+            #   (degenerate); edge.index tie-break is also forbidden → decline.
+            return None, None, "ambiguous host edges for a knife plane-stitch point"
+        _distance, _index, host_edge, factor = host_edges[0]
+        return None, (host_edge, factor), ""
+
+    # (3) Caller creates via member edge_split.
+    return None, None, ""
 
 
 def collect_source_path_edges(

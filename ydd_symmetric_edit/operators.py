@@ -121,8 +121,8 @@ _HISTORY_SEQUENCE = 0
 # Operator.report is C-bound and not patchable). Instrumentation is intentional
 # and limited to the two call sites that tests assert on today: session-lost
 # ERROR at finish entry, and the post-native decline/fatal classification
-# (CROSSES early WARNING, mirror-failure WARNING/ERROR after rollback). Other
-# success INFO/WARNING paths still use Operator.report directly.
+# (mirror-failure WARNING/ERROR after rollback). Other success INFO/WARNING
+# paths still use Operator.report directly.
 _FINISH_REPORTS: list[tuple[str, str]] = []
 
 _PASSTHROUGH_POLL_INTERVAL = 0.01
@@ -676,6 +676,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
         side: str | None = None
         mirror_failure: str | None = None
         rollback_failed = False
+        backup_creation_failed = False
         mesh_select_mode = MeshSelectionMode(
             vertices=bool(context.tool_settings.mesh_select_mode[0]),
             edges=bool(context.tool_settings.mesh_select_mode[1]),
@@ -688,10 +689,20 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
             if edge_layer is None or face_layer is None:
                 raise SymmetricKnifeError("Temporary topology markers are missing")
 
+            def _create_backup(edit_bm):
+                """Create topology backup; classify create failure as fatal (§2.2-4)."""
+                nonlocal backup_creation_failed
+                try:
+                    return backup.create_topology_backup(edit_bm)
+                except Exception as exc:
+                    traceback.print_exc()
+                    backup_creation_failed = True
+                    raise SymmetricKnifeError(f"Could not create topology backup for rollback: {exc}") from exc
+
             if session.tool_kind == "KNIFE":
-                # Phase 1: both-sides mirror. CROSSES decline the whole stage
-                # (contract §4.1 / §2.1 all-or-nothing). Loop Cut / Offset keep
-                # one-side collect_source_path_edges below.
+                # Phase 1/2: both-sides mirror. CROSSES are p-stitched first
+                # (contract §4.1-2), then half-edges join the POSITIVE/NEGATIVE
+                # mirror path inside one backup transaction (§2.1).
                 by_side, total_path_edges = core.collect_knife_path_edges_by_side(
                     bm,
                     session.axis_index,
@@ -702,21 +713,77 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     self.report({"INFO"}, f"{tool_label} made no new cut")
                     return result
 
-                crossing_count = len(by_side["CROSSES"])
-                if crossing_count:
-                    # Legitimate decline: keep native cut (contract §2.2).
-                    result = {"FINISHED"}
-                    _finish_report(
-                        self,
-                        {"WARNING"},
-                        "cross-plane knife segments are not mirrored yet",
+                def _all_path_edges(sides: dict) -> list:
+                    return (
+                        list(sides.get("POSITIVE", ()))
+                        + list(sides.get("NEGATIVE", ()))
+                        + list(sides.get("CROSSES", ()))
+                        + list(sides.get("PLANE", ()))
                     )
-                    return result
+
+                crossing_count = len(by_side["CROSSES"])
+                side = "BOTH"
+                live_mirror_face_ids = core.resolve_live_mirror_face_map(
+                    bm,
+                    session.mirror_face_ids,
+                    session.axis_index,
+                    session.tolerance,
+                    path_edges=_all_path_edges(by_side),
+                )
+
+                if crossing_count:
+                    # Single backup covers p-stitch + mirror (contract §2.1).
+                    selection_state = core.add_selection_layers(bm)
+                    backup_mesh = _create_backup(bm)
+                    bm = bmesh.from_edit_mesh(obj.data)
+                    by_side, total_path_edges = core.collect_knife_path_edges_by_side(
+                        bm,
+                        session.axis_index,
+                        session.tolerance,
+                    )
+                    live_mirror_face_ids = core.resolve_live_mirror_face_map(
+                        bm,
+                        session.mirror_face_ids,
+                        session.axis_index,
+                        session.tolerance,
+                        path_edges=_all_path_edges(by_side),
+                    )
+                    stitched, stitch_reason = core.apply_crosses_p_stitch(
+                        bm,
+                        by_side["CROSSES"],
+                        session.axis_index,
+                        session.tolerance,
+                    )
+                    if stitch_reason:
+                        raise SymmetricKnifeError(stitch_reason)
+                    # Half-edges reclassify as POSITIVE/NEGATIVE after the split.
+                    by_side, total_path_edges = core.collect_knife_path_edges_by_side(
+                        bm,
+                        session.axis_index,
+                        session.tolerance,
+                    )
+                    live_mirror_face_ids = core.resolve_live_mirror_face_map(
+                        bm,
+                        session.mirror_face_ids,
+                        session.axis_index,
+                        session.tolerance,
+                        path_edges=_all_path_edges(by_side),
+                    )
+                    crossing_count = len(by_side["CROSSES"])
+                    # Remaining CROSSES are self-mirrored (skipped by stitch) or
+                    # still straddling after a failed reclassification — the
+                    # latter is a bug; treat as decline via unmatched mirror.
+                    if stitched:
+                        # Persist p-stitch into the edit mesh so subsequent
+                        # BMesh rebuilds (layer add / backup refresh) see it.
+                        bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=True)
 
                 source_edges = by_side["POSITIVE"] + by_side["NEGATIVE"]
-                side = "BOTH"
                 if not source_edges:
-                    # Only PLANE segments: already shared across sides.
+                    # Only PLANE and/or self-mirrored CROSSES: already symmetric.
+                    if backup_mesh is not None:
+                        # No further mutation; drop the unused backup cleanly.
+                        projection_committed = True
                     result = {"FINISHED"}
                     self.report(
                         {"INFO"},
@@ -727,7 +794,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                 target_face_ids, unmatched = core.target_face_ids_for_edges(
                     source_edges,
                     face_layer,
-                    session.mirror_face_ids,
+                    live_mirror_face_ids,
                 )
                 if not target_face_ids:
                     raise SymmetricKnifeError(
@@ -741,18 +808,26 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     source_edges,
                     session.axis_index,
                     session.tolerance,
-                    session.mirror_face_ids,
+                    live_mirror_face_ids,
                 )
                 if use_direct_topology:
-                    selection_state = core.add_selection_layers(bm)
-                    backup_mesh = backup.create_topology_backup(bm)
-                    bm = bmesh.from_edit_mesh(obj.data)
-                    by_side, total_path_edges = core.collect_knife_path_edges_by_side(
-                        bm,
-                        session.axis_index,
-                        session.tolerance,
-                    )
-                    source_edges = by_side["POSITIVE"] + by_side["NEGATIVE"]
+                    if backup_mesh is None:
+                        selection_state = core.add_selection_layers(bm)
+                        backup_mesh = _create_backup(bm)
+                        bm = bmesh.from_edit_mesh(obj.data)
+                        by_side, total_path_edges = core.collect_knife_path_edges_by_side(
+                            bm,
+                            session.axis_index,
+                            session.tolerance,
+                        )
+                        live_mirror_face_ids = core.resolve_live_mirror_face_map(
+                            bm,
+                            session.mirror_face_ids,
+                            session.axis_index,
+                            session.tolerance,
+                            path_edges=_all_path_edges(by_side),
+                        )
+                        source_edges = by_side["POSITIVE"] + by_side["NEGATIVE"]
                     if not source_edges:
                         raise SymmetricKnifeError("The native cut path was lost before mirroring")
                     created, already_present, direct_reason = core.apply_reflected_path_topology(
@@ -760,7 +835,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                         source_edges,
                         session.axis_index,
                         session.tolerance,
-                        session.mirror_face_ids,
+                        live_mirror_face_ids,
                     )
                     if direct_reason:
                         raise SymmetricKnifeError(f"Could not rebuild the mirrored {tool_label}: {direct_reason}")
@@ -793,14 +868,25 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     session.tolerance,
                 )
                 if not cutter_edges:
+                    if backup_mesh is not None:
+                        # p-stitch may have run; keep those splits if any (they
+                        # are part of the X scaffold). Commit when CROSSES were
+                        # stitched even if the mirror cutter is empty.
+                        projection_committed = True
                     result = {"FINISHED"}
                     self.report({"INFO"}, "The opposite side already contains this cut")
                     return result
 
                 core.reserve_source_path_marker(bm)
-                selection_state = core.add_selection_layers(bm)
-                backup_mesh = backup.create_topology_backup(bm)
-                preexisting_vertex_keys = {hash(vertex) for vertex in bm.verts}
+                if backup_mesh is None:
+                    selection_state = core.add_selection_layers(bm)
+                    backup_mesh = _create_backup(bm)
+                    preexisting_vertex_keys = {hash(vertex) for vertex in bm.verts}
+                else:
+                    # Backup already covers pre-p-stitch native; refresh the
+                    # vertex key set after the stitch so snap only moves new
+                    # projection geometry.
+                    preexisting_vertex_keys = {hash(vertex) for vertex in bm.verts}
                 _edge_layer, face_layer = core.get_required_layers(bm)
                 for face in bm.faces:
                     face.hide = FaceId(int(face[face_layer])) not in target_face_ids
@@ -899,7 +985,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     # impossible, so reproduce the same topology with BMesh.
                     core.reserve_source_path_marker(bm)
                     selection_state = core.add_selection_layers(bm)
-                    backup_mesh = backup.create_topology_backup(bm)
+                    backup_mesh = _create_backup(bm)
                     mirrored_segment_count, collapsed_reason = core.apply_collapsed_offset_topology(
                         bm,
                         collapsed_target_markers,
@@ -927,7 +1013,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     # self-occluding surfaces. Rebuild the native cut topology on
                     # paired target faces instead, using exact reflected points.
                     selection_state = core.add_selection_layers(bm)
-                    backup_mesh = backup.create_topology_backup(bm)
+                    backup_mesh = _create_backup(bm)
                     bm = bmesh.from_edit_mesh(obj.data)
                     source_edges, side, total_path_edges, crossing_count = core.collect_source_path_edges(
                         bm,
@@ -988,7 +1074,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
 
                 core.reserve_source_path_marker(bm)
                 selection_state = core.add_selection_layers(bm)
-                backup_mesh = backup.create_topology_backup(bm)
+                backup_mesh = _create_backup(bm)
                 preexisting_vertex_keys = {hash(vertex) for vertex in bm.verts}
                 # Layer creation invalidates held element wrappers; retrieve layers
                 # and iterate faces again before changing visibility.
@@ -1097,9 +1183,11 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
 
         # Contract §2.2: after native changes, always return FINISHED.
         # Successful rollback (or no backup / mirror not started) → WARNING
-        # decline that keeps the native result. Rollback exception → ERROR.
+        # decline that keeps the native result. Backup create failure or
+        # rollback exception → fatal ERROR (§2.2-4). Pre-mirror decline that
+        # never attempted backup stays WARNING.
         if mirror_failure is not None:
-            if rollback_failed:
+            if rollback_failed or backup_creation_failed:
                 _finish_report(
                     self,
                     {"ERROR"},
@@ -1113,7 +1201,10 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                 )
             result = {"FINISHED"}
 
-        if result == {"FINISHED"} and mirrored_segment_count:
+        # Success INFO only when the mirror stage completed (not after a
+        # WARNING decline that still returns FINISHED under §2.2). Routed
+        # through _finish_report so tests can observe dual-report suppression.
+        if result == {"FINISHED"} and mirrored_segment_count and mirror_failure is None:
             assert side is not None
             if side == "BOTH":
                 message = f"Mirrored {mirrored_segment_count} {tool_label} segment(s) to both sides{warning}"
@@ -1121,7 +1212,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                 message = (
                     f"Mirrored {mirrored_segment_count} {tool_label} segment(s) from the {side.lower()} side{warning}"
                 )
-            self.report({"WARNING"} if warning else {"INFO"}, message)
+            _finish_report(self, {"WARNING"} if warning else {"INFO"}, message)
         return result
 
 

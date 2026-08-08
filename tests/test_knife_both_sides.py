@@ -1,16 +1,24 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Phase 1: Knife both-sides mirror (axis-crossing contract §4.1).
+"""Phase 1/2: Knife both-sides mirror + p-stitch (axis-crossing contract §4.1).
 
 Cases:
   (a) Stroke straddling the mirror plane via an on-plane vertex (no CROSSES)
       → full X-symmetry after finish; fixed topology counts; face incidence.
-  (b) Stroke with a plane-crossing segment → native kept + WARNING, no mirror.
+  (b) Stroke with a plane-crossing segment → p-stitch + both-sides mirror (X).
   (c) One-sided stroke (regression) → opposite side still mirrored.
-  (d) CROSSES mixed with POSITIVE/NEGATIVE → whole-stage decline + WARNING.
+  (d) CROSSES mixed with POSITIVE/NEGATIVE → whole stroke symmetrized.
   (e) Knife Project fallback (bent polyline, non-boundary) → both-sides mirror.
-  (f) Partial mirror failure (monkeypatch) → full rollback + WARNING + FINISHED.
+  (f) Partial mirror failure (monkeypatch) → full rollback + WARNING only
+      (no success INFO) + FINISHED.
   (g) Near-self-mirrored stroke → already_present, no double cut.
+  (h) Simple 1-segment CROSSES → on-plane p, 4 edges share p, full symmetry.
+  (i) Three CROSSES through same p → single vertex, degree ≥ 6, full symmetry.
+  (j) Self-mirrored CROSSES segment → no p vertex, native topology kept.
+  (k) CROSSES + one-sided asymmetric half-segments (distinct from d).
+  (l) CROSSES on asymmetric carrier → whole-stage decline + WARNING + FINISHED.
+  (m) Backup creation failure → ERROR + FINISHED + native intact.
+  Headless units: orphan face remap, host-edge selection, non-transitive tol.
 
 Run::
 
@@ -35,11 +43,12 @@ sys.path.insert(0, str(PACKAGE_PARENT))
 
 import ydd_symmetric_edit as addon  # noqa: E402
 from ydd_symmetric_edit import core, operators  # noqa: E402
+from ydd_symmetric_edit._types import FaceId  # noqa: E402
 
 MARKER_OK = "YSE_KNIFE_BOTH_SIDES_OK"
 MARKER_FAILED = "YSE_KNIFE_BOTH_SIDES_FAILED"
 COORD_PRECISION = 5
-CROSS_PLANE_WARNING = "cross-plane knife segments are not mirrored yet"
+MIRROR_COUNTERPART_WARNING = "no exact mirrored counterpart"
 
 
 def fail(message: str = "") -> None:
@@ -222,6 +231,14 @@ def make_two_quads():
 
 def warning_messages() -> list[str]:
     return [message for kind, message in operators._FINISH_REPORTS if kind == "WARNING"]
+
+
+def error_messages() -> list[str]:
+    return [message for kind, message in operators._FINISH_REPORTS if kind == "ERROR"]
+
+
+def info_messages() -> list[str]:
+    return [message for kind, message in operators._FINISH_REPORTS if kind == "INFO"]
 
 
 def prepare_knife_session(context) -> None:
@@ -530,7 +547,7 @@ def case_b_crosses(window, area, region) -> None:
         bpy.ops.object.mode_set(mode="EDIT")
         bpy.context.tool_settings.mesh_select_mode = (True, False, False)
         prepare_knife_session(bpy.context)
-        native_counts = simulate_cross_plane_segment(obj)
+        simulate_cross_plane_segment(obj)
 
         bm = bmesh.from_edit_mesh(obj.data)
         by_side, total = core.collect_knife_path_edges_by_side(
@@ -545,17 +562,17 @@ def case_b_crosses(window, area, region) -> None:
         assert finished == {"FINISHED"}, finished
 
     bm = bmesh.from_edit_mesh(obj.data)
-    assert (len(bm.verts), len(bm.edges), len(bm.faces)) == native_counts, (
-        (len(bm.verts), len(bm.edges), len(bm.faces)),
-        native_counts,
-    )
-    assert has_exact_edge(bm, (-1.5, -1.0, 0.0), (1.5, 1.0, 0.0))
-    warnings = warning_messages()
-    assert any(CROSS_PLANE_WARNING in message for message in warnings), (
-        warnings,
-        operators._FINISH_REPORTS,
-    )
-    # Blender's Operator.report also emits "Warning: ..." on stdout for runners.
+    # Phase 2: p-stitch + mirror produces an X at the plane.
+    assert has_exact_edge(bm, (-1.5, -1.0, 0.0), (0.0, 0.0, 0.0))
+    assert has_exact_edge(bm, (0.0, 0.0, 0.0), (1.5, 1.0, 0.0))
+    assert has_exact_edge(bm, (1.5, -1.0, 0.0), (0.0, 0.0, 0.0))
+    assert has_exact_edge(bm, (0.0, 0.0, 0.0), (-1.5, 1.0, 0.0))
+    on_plane = [vertex for vertex in bm.verts if abs(vertex.co.x) <= 1.0e-4]
+    assert any(
+        abs(vertex.co.x) <= 1.0e-4 and abs(vertex.co.y) <= 1.0e-4 and abs(vertex.co.z) <= 1.0e-4 for vertex in on_plane
+    ), [tuple(vertex.co) for vertex in on_plane]
+    assert_no_duplicate_edges(bm)
+    assert_x_symmetric(bm)
     assert bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER) is None
     assert not operators._SESSIONS
     print("YSE_KNIFE_BOTH_SIDES_CASE_B=OK", flush=True)
@@ -591,7 +608,7 @@ def case_d_mixed_crosses(window, area, region) -> None:
         bpy.ops.object.mode_set(mode="EDIT")
         bpy.context.tool_settings.mesh_select_mode = (True, False, False)
         prepare_knife_session(bpy.context)
-        native_counts = simulate_mixed_crosses(obj)
+        simulate_mixed_crosses(obj)
 
         bm = bmesh.from_edit_mesh(obj.data)
         by_side, total = core.collect_knife_path_edges_by_side(
@@ -607,15 +624,11 @@ def case_d_mixed_crosses(window, area, region) -> None:
         assert finished == {"FINISHED"}, finished
 
     bm = bmesh.from_edit_mesh(obj.data)
-    assert (len(bm.verts), len(bm.edges), len(bm.faces)) == native_counts, (
-        (len(bm.verts), len(bm.edges), len(bm.faces)),
-        native_counts,
-    )
-    warnings = warning_messages()
-    assert any(CROSS_PLANE_WARNING in message for message in warnings), (
-        warnings,
-        operators._FINISH_REPORTS,
-    )
+    # Phase 2: mixed stroke is fully symmetrized (no whole-stage decline).
+    assert has_exact_edge(bm, (-1.5, -1.0, 0.0), (-0.5, 0.0, 0.0))
+    assert has_exact_edge(bm, (0.5, 0.0, 0.0), (1.5, 1.0, 0.0))
+    assert_no_duplicate_edges(bm)
+    assert_x_symmetric(bm)
     assert bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER) is None
     assert not operators._SESSIONS
     print("YSE_KNIFE_BOTH_SIDES_CASE_D=OK", flush=True)
@@ -709,6 +722,8 @@ def case_f_partial_failure_rollback(window, area, region) -> None:
         warnings,
         operators._FINISH_REPORTS,
     )
+    # Dual-report suppression: WARNING decline only — no success INFO.
+    assert not info_messages(), operators._FINISH_REPORTS
     assert not any(kind == "ERROR" for kind, _message in operators._FINISH_REPORTS)
     assert bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER) is None
     assert not operators._SESSIONS
@@ -742,10 +757,731 @@ def case_g_self_mirrored(window, area, region) -> None:
     print("YSE_KNIFE_BOTH_SIDES_CASE_G=OK", flush=True)
 
 
+def simulate_bowtie_crosses(obj) -> None:
+    """Three CROSSES diagonals that share the plane intersection p=(0,0).
+
+    On a spanning face after dissolving the plane edge:
+      (-1.5,-1)→(1.5,1), (-1.5,1)→(1.5,-1), (-2.0,-0.5)→(2.0,0.5).
+    Clustering must produce a single p; after stitch+mirror degree ≥ 6.
+    """
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    # Boundary split points for the three diagonals.
+    left_bottom = next(
+        edge
+        for edge in bm.edges
+        if all(vertex.co.x <= 1.0e-8 for vertex in edge.verts)
+        and all(abs(vertex.co.y + 1.0) <= 1.0e-8 for vertex in edge.verts)
+        and min(vertex.co.x for vertex in edge.verts) < -1.0e-8
+    )
+    right_bottom = next(
+        edge
+        for edge in bm.edges
+        if all(vertex.co.x >= -1.0e-8 for vertex in edge.verts)
+        and all(abs(vertex.co.y + 1.0) <= 1.0e-8 for vertex in edge.verts)
+        and max(vertex.co.x for vertex in edge.verts) > 1.0e-8
+    )
+    left_top = next(
+        edge
+        for edge in bm.edges
+        if all(vertex.co.x <= 1.0e-8 for vertex in edge.verts)
+        and all(abs(vertex.co.y - 1.0) <= 1.0e-8 for vertex in edge.verts)
+        and min(vertex.co.x for vertex in edge.verts) < -1.0e-8
+    )
+    right_top = next(
+        edge
+        for edge in bm.edges
+        if all(vertex.co.x >= -1.0e-8 for vertex in edge.verts)
+        and all(abs(vertex.co.y - 1.0) <= 1.0e-8 for vertex in edge.verts)
+        and max(vertex.co.x for vertex in edge.verts) > 1.0e-8
+    )
+    left_outer = next(
+        edge
+        for edge in bm.edges
+        if all(abs(vertex.co.x + 2.0) <= 1.0e-6 for vertex in edge.verts)
+        and {round(vertex.co.y, 6) for vertex in edge.verts} == {-1.0, 1.0}
+    )
+    right_outer = next(
+        edge
+        for edge in bm.edges
+        if all(abs(vertex.co.x - 2.0) <= 1.0e-6 for vertex in edge.verts)
+        and {round(vertex.co.y, 6) for vertex in edge.verts} == {-1.0, 1.0}
+    )
+
+    _edge, lb = bmesh.utils.edge_split(left_bottom, left_bottom.verts[0], 0.25)
+    lb.co = (-1.5, -1.0, 0.0)
+    _edge, rb = bmesh.utils.edge_split(right_bottom, right_bottom.verts[0], 0.25)
+    rb.co = (1.5, -1.0, 0.0)
+    _edge, lt = bmesh.utils.edge_split(left_top, left_top.verts[0], 0.25)
+    lt.co = (-1.5, 1.0, 0.0)
+    _edge, rt = bmesh.utils.edge_split(right_top, right_top.verts[0], 0.25)
+    rt.co = (1.5, 1.0, 0.0)
+    # Outer verticals: factor from verts[0]; place at y=±0.5 for third diagonal.
+    v0, v1 = left_outer.verts
+    factor_lm = (-0.5 - v0.co.y) / (v1.co.y - v0.co.y)
+    _edge, lm = bmesh.utils.edge_split(left_outer, v0, factor_lm)
+    lm.co = (-2.0, -0.5, 0.0)
+    v0, v1 = right_outer.verts
+    factor_rm = (0.5 - v0.co.y) / (v1.co.y - v0.co.y)
+    _edge, rm = bmesh.utils.edge_split(right_outer, v0, factor_rm)
+    rm.co = (2.0, 0.5, 0.0)
+
+    plane_edge = next(
+        edge
+        for edge in bm.edges
+        if all(abs(vertex.co.x) <= 1.0e-8 for vertex in edge.verts)
+        and {round(vertex.co.y, 6) for vertex in edge.verts} == {-1.0, 1.0}
+    )
+    bmesh.ops.dissolve_edges(bm, edges=[plane_edge], use_verts=False)
+
+    # Three independent diagonals through p=(0,0). connect_vert_pair cuts
+    # across the spanning face (and subsequent faces) without requiring both
+    # endpoints to already share a single face after prior splits.
+    bmesh.ops.connect_vert_pair(bm, verts=[lb, rt])
+    bmesh.ops.connect_vert_pair(bm, verts=[lt, rb])
+    bmesh.ops.connect_vert_pair(bm, verts=[lm, rm])
+    bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=True)
+
+
+def simulate_self_mirrored_crosses(obj) -> tuple[int, int, int]:
+    """One CROSSES segment whose endpoints are a mirror pair (ρ(s)=s)."""
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    left_bottom = next(
+        edge
+        for edge in bm.edges
+        if all(vertex.co.x <= 1.0e-8 for vertex in edge.verts)
+        and all(abs(vertex.co.y + 1.0) <= 1.0e-8 for vertex in edge.verts)
+        and min(vertex.co.x for vertex in edge.verts) < -1.0e-8
+    )
+    right_bottom = next(
+        edge
+        for edge in bm.edges
+        if all(vertex.co.x >= -1.0e-8 for vertex in edge.verts)
+        and all(abs(vertex.co.y + 1.0) <= 1.0e-8 for vertex in edge.verts)
+        and max(vertex.co.x for vertex in edge.verts) > 1.0e-8
+    )
+    _edge, left_pt = bmesh.utils.edge_split(left_bottom, left_bottom.verts[0], 0.25)
+    left_pt.co = (-1.5, -1.0, 0.0)
+    _edge, right_pt = bmesh.utils.edge_split(right_bottom, right_bottom.verts[0], 0.25)
+    right_pt.co = (1.5, -1.0, 0.0)
+
+    plane_edge = next(
+        edge
+        for edge in bm.edges
+        if all(abs(vertex.co.x) <= 1.0e-8 for vertex in edge.verts)
+        and {round(vertex.co.y, 6) for vertex in edge.verts} == {-1.0, 1.0}
+    )
+    bmesh.ops.dissolve_edges(bm, edges=[plane_edge], use_verts=False)
+    host = next(face for face in bm.faces if left_pt in face.verts and right_pt in face.verts)
+    # Horizontal self-mirrored segment at y=-1: endpoints are mirror pairs.
+    # Use an interior-y polyline so the segment truly crosses the plane body:
+    # (-1.0, 0.0) ↔ (1.0, 0.0).
+    bmesh.utils.face_split(host, left_pt, right_pt, coords=[(-1.0, 0.0, 0.0), (1.0, 0.0, 0.0)])
+    # The middle edge (-1,0)-(1,0) is the self-mirrored CROSSES segment.
+    counts = (len(bm.verts), len(bm.edges), len(bm.faces))
+    bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=True)
+    return counts
+
+
+def make_asymmetric_straddle():
+    """Matched side quads (prepare succeeds) + unmatched spanning face for the cut.
+
+    The lower face spans X=0 asymmetrically and has no ρ(F); CROSSES there must
+    decline the whole mirror stage while the matched pair keeps prepare alive.
+    """
+
+    mesh = bpy.data.meshes.new("YSE_AsymStraddleMesh")
+    vertices = [
+        # Matched left / right (y >= 0).
+        (-2.0, 0.0, 0.0),  # 0
+        (-1.0, 0.0, 0.0),  # 1
+        (-1.0, 1.0, 0.0),  # 2
+        (-2.0, 1.0, 0.0),  # 3
+        (1.0, 0.0, 0.0),  # 4
+        (2.0, 0.0, 0.0),  # 5
+        (2.0, 1.0, 0.0),  # 6
+        (1.0, 1.0, 0.0),  # 7
+        # Unmatched spanning face (y < 0), shares (0) and (4).
+        (-2.0, -1.0, 0.0),  # 8
+        (1.0, -1.0, 0.0),  # 9
+    ]
+    mesh.from_pydata(
+        vertices,
+        [],
+        [
+            (0, 1, 2, 3),
+            (4, 5, 6, 7),
+            (8, 9, 4, 0),
+        ],
+    )
+    mesh.update()
+    obj = bpy.data.objects.new("YSE_AsymStraddleObject", mesh)
+    bpy.context.scene.collection.objects.link(obj)
+    bpy.context.view_layer.objects.active = obj
+    obj.select_set(True)
+    obj.use_mesh_mirror_x = True
+    return obj
+
+
+def simulate_asymmetric_crosses(obj) -> tuple[int, int, int]:
+    """CROSSES diagonal on the unmatched spanning face (y < 0)."""
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    bottom = next(
+        edge
+        for edge in bm.edges
+        if all(abs(vertex.co.y + 1.0) <= 1.0e-8 for vertex in edge.verts)
+        and min(vertex.co.x for vertex in edge.verts) < -1.0
+    )
+    top = next(
+        edge
+        for edge in bm.edges
+        if all(abs(vertex.co.y) <= 1.0e-8 for vertex in edge.verts)
+        and min(vertex.co.x for vertex in edge.verts) < -1.0
+        and max(vertex.co.x for vertex in edge.verts) > 0.5
+    )
+    _edge, bottom_pt = bmesh.utils.edge_split(bottom, bottom.verts[0], 0.3)
+    bottom_pt.co = (-1.5, -1.0, 0.0)
+    _edge, top_pt = bmesh.utils.edge_split(top, top.verts[0], 0.7)
+    top_pt.co = (0.5, 0.0, 0.0)
+    host = next(face for face in bm.faces if bottom_pt in face.verts and top_pt in face.verts)
+    bmesh.utils.face_split(host, bottom_pt, top_pt)
+    counts = (len(bm.verts), len(bm.edges), len(bm.faces))
+    bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=True)
+    return counts
+
+
+def case_h_simple_crosses(window, area, region) -> None:
+    print("YSE_KNIFE_BOTH_SIDES_CASE=h_simple_crosses", flush=True)
+    clear_scene()
+    obj = make_straddling_grid()
+    with bpy.context.temp_override(window=window, area=area, region=region):
+        bpy.ops.object.mode_set(mode="EDIT")
+        bpy.context.tool_settings.mesh_select_mode = (True, False, False)
+        prepare_knife_session(bpy.context)
+        simulate_cross_plane_segment(obj)
+        finished = bpy.ops.mesh.ydd_symmetric_edit_finish("EXEC_DEFAULT")
+        assert finished == {"FINISHED"}, finished
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    p_verts = [
+        vertex
+        for vertex in bm.verts
+        if abs(vertex.co.x) <= 1.0e-4 and abs(vertex.co.y) <= 1.0e-4 and abs(vertex.co.z) <= 1.0e-4
+    ]
+    assert len(p_verts) == 1, [tuple(vertex.co) for vertex in p_verts]
+    p = p_verts[0]
+    assert len(p.link_edges) == 4, len(p.link_edges)
+    assert has_exact_edge(bm, (-1.5, -1.0, 0.0), (0.0, 0.0, 0.0))
+    assert has_exact_edge(bm, (0.0, 0.0, 0.0), (1.5, 1.0, 0.0))
+    assert has_exact_edge(bm, (1.5, -1.0, 0.0), (0.0, 0.0, 0.0))
+    assert has_exact_edge(bm, (0.0, 0.0, 0.0), (-1.5, 1.0, 0.0))
+    assert_no_duplicate_edges(bm)
+    assert_x_symmetric(bm)
+    assert bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER) is None
+    assert not operators._SESSIONS
+    print("YSE_KNIFE_BOTH_SIDES_CASE_H=OK", flush=True)
+
+
+def case_i_bowtie(window, area, region) -> None:
+    print("YSE_KNIFE_BOTH_SIDES_CASE=i_bowtie", flush=True)
+    clear_scene()
+    obj = make_straddling_grid()
+    with bpy.context.temp_override(window=window, area=area, region=region):
+        bpy.ops.object.mode_set(mode="EDIT")
+        bpy.context.tool_settings.mesh_select_mode = (True, False, False)
+        prepare_knife_session(bpy.context)
+        simulate_bowtie_crosses(obj)
+
+        bm = bmesh.from_edit_mesh(obj.data)
+        by_side, total = core.collect_knife_path_edges_by_side(
+            bm,
+            core.AXIS_INDEX["X"],
+            1.0e-4,
+        )
+        # connect_vert_pair may already place on-plane verts (CROSSES→half-edges);
+        # either raw CROSSES ≥ 3 or an existing p of degree ≥ 6 is acceptable.
+        crosses_n = len(by_side["CROSSES"])
+        p_before = [
+            vertex
+            for vertex in bm.verts
+            if abs(vertex.co.x) <= 1.0e-4 and abs(vertex.co.y) <= 1.0e-4 and abs(vertex.co.z) <= 1.0e-4
+        ]
+        degree_before = max((len(vertex.link_edges) for vertex in p_before), default=0)
+        assert crosses_n >= 3 or degree_before >= 6, (
+            {key: len(value) for key, value in by_side.items()},
+            degree_before,
+            total,
+        )
+
+        finished = bpy.ops.mesh.ydd_symmetric_edit_finish("EXEC_DEFAULT")
+        assert finished == {"FINISHED"}, finished
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    p_verts = [
+        vertex
+        for vertex in bm.verts
+        if abs(vertex.co.x) <= 1.0e-4 and abs(vertex.co.y) <= 1.0e-4 and abs(vertex.co.z) <= 1.0e-4
+    ]
+    assert len(p_verts) == 1, [tuple(vertex.co) for vertex in bm.verts]
+    # Three diagonals through p → degree ≥ 6; mirror must not invent a second p.
+    assert len(p_verts[0].link_edges) >= 6, len(p_verts[0].link_edges)
+    assert_no_duplicate_edges(bm)
+    assert_x_symmetric(bm)
+    assert bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER) is None
+    assert not operators._SESSIONS
+    print("YSE_KNIFE_BOTH_SIDES_CASE_I=OK", flush=True)
+
+
+def case_j_self_mirrored_crosses(window, area, region) -> None:
+    print("YSE_KNIFE_BOTH_SIDES_CASE=j_self_mirrored_crosses", flush=True)
+    clear_scene()
+    obj = make_straddling_grid()
+    with bpy.context.temp_override(window=window, area=area, region=region):
+        bpy.ops.object.mode_set(mode="EDIT")
+        bpy.context.tool_settings.mesh_select_mode = (True, False, False)
+        prepare_knife_session(bpy.context)
+        native_counts = simulate_self_mirrored_crosses(obj)
+
+        bm = bmesh.from_edit_mesh(obj.data)
+        by_side, _total = core.collect_knife_path_edges_by_side(
+            bm,
+            core.AXIS_INDEX["X"],
+            1.0e-4,
+        )
+        assert by_side["CROSSES"], {key: len(value) for key, value in by_side.items()}
+        assert any(core.is_self_mirrored_edge(edge, core.AXIS_INDEX["X"], 1.0e-4) for edge in by_side["CROSSES"])
+
+        finished = bpy.ops.mesh.ydd_symmetric_edit_finish("EXEC_DEFAULT")
+        assert finished == {"FINISHED"}, finished
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    # No new on-plane stitch vertex: topology count stays at the native result
+    # (mirror of the non-self-mirrored wings may still run — only the
+    # self-mirrored CROSSES middle is left unsplit; endpoint wings may mirror).
+    # Contract: p is not generated for the self-mirrored segment itself.
+    assert not any(
+        abs(vertex.co.x) <= 1.0e-4 and abs(vertex.co.y) <= 1.0e-4 and abs(vertex.co.z) <= 1.0e-4 for vertex in bm.verts
+    ), [tuple(vertex.co) for vertex in bm.verts]
+    # The self-mirrored middle edge remains.
+    assert has_exact_edge(bm, (-1.0, 0.0, 0.0), (1.0, 0.0, 0.0))
+    # Vertex count must not grow solely from a p insert on that middle edge.
+    # Wings may still be mirrored, so allow >= native; forbid an isolated p.
+    assert len(bm.verts) >= native_counts[0]
+    assert_no_duplicate_edges(bm)
+    assert bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER) is None
+    assert not operators._SESSIONS
+    print("YSE_KNIFE_BOTH_SIDES_CASE_J=OK", flush=True)
+
+
+def simulate_crosses_plus_asymmetric_half(obj) -> tuple[int, int, int]:
+    """CROSSES mixed with asymmetric half-segments (distinct from balanced case d).
+
+    Polyline (-1.5,-1) → (-0.3,-0.2) → (0.8,0.4) → (1.5,1): NEGATIVE + CROSSES
+    + POSITIVE with unequal lengths and y-offsets (not the d fixture).
+    """
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    left_bottom = next(
+        edge
+        for edge in bm.edges
+        if all(vertex.co.x <= 1.0e-8 for vertex in edge.verts)
+        and all(abs(vertex.co.y + 1.0) <= 1.0e-8 for vertex in edge.verts)
+        and min(vertex.co.x for vertex in edge.verts) < -1.0e-8
+    )
+    right_top = next(
+        edge
+        for edge in bm.edges
+        if all(vertex.co.x >= -1.0e-8 for vertex in edge.verts)
+        and all(abs(vertex.co.y - 1.0) <= 1.0e-8 for vertex in edge.verts)
+        and max(vertex.co.x for vertex in edge.verts) > 1.0e-8
+    )
+    _edge, left_pt = bmesh.utils.edge_split(left_bottom, left_bottom.verts[0], 0.25)
+    left_pt.co = (-1.5, -1.0, 0.0)
+    _edge, right_pt = bmesh.utils.edge_split(right_top, right_top.verts[0], 0.25)
+    right_pt.co = (1.5, 1.0, 0.0)
+
+    plane_edge = next(
+        edge
+        for edge in bm.edges
+        if all(abs(vertex.co.x) <= 1.0e-8 for vertex in edge.verts)
+        and {round(vertex.co.y, 6) for vertex in edge.verts} == {-1.0, 1.0}
+    )
+    bmesh.ops.dissolve_edges(bm, edges=[plane_edge], use_verts=False)
+    host = next(face for face in bm.faces if left_pt in face.verts and right_pt in face.verts)
+    bmesh.utils.face_split(
+        host,
+        left_pt,
+        right_pt,
+        coords=[(-0.3, -0.2, 0.0), (0.8, 0.4, 0.0)],
+    )
+    counts = (len(bm.verts), len(bm.edges), len(bm.faces))
+    bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=True)
+    return counts
+
+
+def case_k_mixed_symmetrized(window, area, region) -> None:
+    """CROSSES + asymmetric half-segments (not a re-run of case d)."""
+
+    print("YSE_KNIFE_BOTH_SIDES_CASE=k_asymmetric_half_mixed", flush=True)
+    clear_scene()
+    obj = make_straddling_grid()
+    with bpy.context.temp_override(window=window, area=area, region=region):
+        bpy.ops.object.mode_set(mode="EDIT")
+        bpy.context.tool_settings.mesh_select_mode = (True, False, False)
+        prepare_knife_session(bpy.context)
+        simulate_crosses_plus_asymmetric_half(obj)
+
+        bm = bmesh.from_edit_mesh(obj.data)
+        by_side, total = core.collect_knife_path_edges_by_side(
+            bm,
+            core.AXIS_INDEX["X"],
+            1.0e-4,
+        )
+        assert by_side["CROSSES"], {key: len(value) for key, value in by_side.items()}
+        assert by_side["POSITIVE"] and by_side["NEGATIVE"], {key: len(value) for key, value in by_side.items()}
+        # Distinct from d: waypoints are not the symmetric (±0.5, 0) pair.
+        assert not has_exact_edge(bm, (-0.5, 0.0, 0.0), (0.5, 0.0, 0.0))
+        assert total >= 3, total
+
+        finished = bpy.ops.mesh.ydd_symmetric_edit_finish("EXEC_DEFAULT")
+        assert finished == {"FINISHED"}, finished
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    # Native asymmetric polyline is present and fully X-symmetrized.
+    assert has_exact_edge(bm, (-1.5, -1.0, 0.0), (-0.3, -0.2, 0.0))
+    assert has_exact_edge(bm, (0.8, 0.4, 0.0), (1.5, 1.0, 0.0))
+    assert has_exact_edge(bm, (1.5, -1.0, 0.0), (0.3, -0.2, 0.0))
+    assert has_exact_edge(bm, (-0.8, 0.4, 0.0), (-1.5, 1.0, 0.0))
+    assert_no_duplicate_edges(bm)
+    assert_x_symmetric(bm)
+    assert bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER) is None
+    assert not operators._SESSIONS
+    print("YSE_KNIFE_BOTH_SIDES_CASE_K=OK", flush=True)
+
+
+def case_l_asymmetric_decline(window, area, region) -> None:
+    print("YSE_KNIFE_BOTH_SIDES_CASE=l_asymmetric_decline", flush=True)
+    clear_scene()
+    obj = make_asymmetric_straddle()
+    with bpy.context.temp_override(window=window, area=area, region=region):
+        bpy.ops.object.mode_set(mode="EDIT")
+        bpy.context.tool_settings.mesh_select_mode = (True, False, False)
+        prepare_knife_session(bpy.context)
+        native_counts = simulate_asymmetric_crosses(obj)
+
+        bm = bmesh.from_edit_mesh(obj.data)
+        by_side, total = core.collect_knife_path_edges_by_side(
+            bm,
+            core.AXIS_INDEX["X"],
+            1.0e-4,
+        )
+        assert total >= 1, total
+        assert by_side["CROSSES"], {key: len(value) for key, value in by_side.items()}
+
+        finished = bpy.ops.mesh.ydd_symmetric_edit_finish("EXEC_DEFAULT")
+        assert finished == {"FINISHED"}, finished
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    # Whole-stage decline: native topology preserved (rollback after p-stitch
+    # or mirror preflight failure).
+    assert (len(bm.verts), len(bm.edges), len(bm.faces)) == native_counts, (
+        (len(bm.verts), len(bm.edges), len(bm.faces)),
+        native_counts,
+    )
+    assert has_exact_edge(bm, (-1.5, -1.0, 0.0), (0.5, 0.0, 0.0))
+    warnings = warning_messages()
+    assert any(MIRROR_COUNTERPART_WARNING in message for message in warnings), (
+        warnings,
+        operators._FINISH_REPORTS,
+    )
+    assert not any(kind == "ERROR" for kind, _message in operators._FINISH_REPORTS)
+    assert bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER) is None
+    assert not operators._SESSIONS
+    print("YSE_KNIFE_BOTH_SIDES_CASE_L=OK", flush=True)
+
+
+def case_m_backup_creation_failure(window, area, region) -> None:
+    """Backup create failure = fatal ERROR + FINISHED + native intact (§2.2-4)."""
+
+    print("YSE_KNIFE_BOTH_SIDES_CASE=m_backup_create_failure", flush=True)
+    clear_scene()
+    obj = make_two_quads()
+    from ydd_symmetric_edit import backup as yse_backup
+
+    original_create = yse_backup.create_topology_backup
+
+    def broken_create(_bm):
+        raise RuntimeError("injected knife backup failure")
+
+    with bpy.context.temp_override(window=window, area=area, region=region):
+        bpy.ops.object.mode_set(mode="EDIT")
+        bpy.context.tool_settings.mesh_select_mode = (True, False, False)
+        prepare_knife_session(bpy.context)
+        simulate_one_side_cut(obj)
+        bm = bmesh.from_edit_mesh(obj.data)
+        native_counts = (len(bm.verts), len(bm.edges), len(bm.faces))
+
+        yse_backup.create_topology_backup = broken_create
+        ops_error = None
+        try:
+            finished = bpy.ops.mesh.ydd_symmetric_edit_finish("EXEC_DEFAULT")
+        except RuntimeError as exc:
+            # Blender surfaces operator.report({'ERROR'}) as RuntimeError from
+            # bpy.ops even when the operator returned FINISHED (§2.2-4 fatal).
+            ops_error = exc
+            finished = {"FINISHED"}
+        finally:
+            yse_backup.create_topology_backup = original_create
+        assert finished == {"FINISHED"}, finished
+        assert ops_error is not None and "backup" in str(ops_error).lower(), ops_error
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    assert (len(bm.verts), len(bm.edges), len(bm.faces)) == native_counts, (
+        (len(bm.verts), len(bm.edges), len(bm.faces)),
+        native_counts,
+    )
+    # Native left cut kept; mirror never ran.
+    assert has_exact_edge(bm, (-1.5, -1.0, 0.0), (-1.5, 1.0, 0.0))
+    assert not has_exact_edge(bm, (1.5, -1.0, 0.0), (1.5, 1.0, 0.0))
+    errors = error_messages()
+    assert any("backup" in message.lower() for message in errors), (
+        errors,
+        operators._FINISH_REPORTS,
+    )
+    assert not warning_messages(), operators._FINISH_REPORTS
+    assert not info_messages(), operators._FINISH_REPORTS
+    assert bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER) is None
+    assert not operators._SESSIONS
+    print("YSE_KNIFE_BOTH_SIDES_CASE_M=OK", flush=True)
+
+
+def unit_orphan_face_remap() -> None:
+    """resolve_live_mirror_face_map: self-mirror ok, asymmetric ear declines."""
+
+    print("YSE_KNIFE_BOTH_SIDES_UNIT=orphan_face_remap", flush=True)
+    axis = core.AXIS_INDEX["X"]
+    tol = 1.0e-4
+
+    # --- Self-mirrored dissolved L∪R (hex spanning face) ---
+    bm = bmesh.new()
+    verts = [
+        bm.verts.new(co)
+        for co in (
+            (-2.0, -1.0, 0.0),
+            (0.0, -1.0, 0.0),
+            (2.0, -1.0, 0.0),
+            (2.0, 1.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (-2.0, 1.0, 0.0),
+        )
+    ]
+    bm.faces.new(verts)
+    face_layer = bm.faces.layers.int.new(core.FACE_ID_LAYER)
+    # Layer creation invalidates face wrappers; re-acquire.
+    face = next(iter(bm.faces))
+    # Pre-native L=1, R=2; only L survives as the dissolved union FACE_ID.
+    face[face_layer] = 1
+    mirror_map = {FaceId(1): FaceId(2), FaceId(2): FaceId(1)}
+    # Path edge on the face (any edge).
+    path = [next(iter(face.edges))]
+    remapped = core.resolve_live_mirror_face_map(bm, mirror_map, axis, tol, path_edges=path)
+    assert remapped[FaceId(1)] == FaceId(1), remapped
+    bm.free()
+
+    # --- Asymmetric L∪R∪ear: ear breaks geometric self-mirror ---
+    bm = bmesh.new()
+    verts = [
+        bm.verts.new(co)
+        for co in (
+            (-2.0, -1.0, 0.0),
+            (0.0, -1.0, 0.0),
+            (2.0, -1.0, 0.0),
+            (3.0, -0.5, 0.0),  # asymmetric ear tip (non-path)
+            (2.0, 1.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (-2.0, 1.0, 0.0),
+        )
+    ]
+    bm.faces.new(verts)
+    face_layer = bm.faces.layers.int.new(core.FACE_ID_LAYER)
+    face = next(iter(bm.faces))
+    face[face_layer] = 1
+    mirror_map = {FaceId(1): FaceId(2), FaceId(2): FaceId(1)}
+    # Path edge on the left boundary — does not include the ear tip.
+    path = [next(edge for edge in face.edges if all(vertex.co.x <= -1.5 for vertex in edge.verts))]
+    remapped = core.resolve_live_mirror_face_map(bm, mirror_map, axis, tol, path_edges=path)
+    assert remapped.get(FaceId(1)) is None, remapped
+    bm.free()
+    print("YSE_KNIFE_BOTH_SIDES_UNIT_ORPHAN=OK", flush=True)
+
+
+def unit_host_edge_selection() -> None:
+    """Host edge plan: existing vertex prefer, tol-out reject, multi decline."""
+
+    print("YSE_KNIFE_BOTH_SIDES_UNIT=host_edge_selection", flush=True)
+    axis = core.AXIS_INDEX["X"]
+    tol = 0.1
+
+    # (1) Existing on-plane vertex within tol is preferred over host edges.
+    bm = bmesh.new()
+    a = bm.verts.new((-1.0, -1.0, 0.0))
+    b = bm.verts.new((1.0, 1.0, 0.0))
+    p = bm.verts.new((0.0, 0.0, 0.0))
+    member = bm.edges.new((a, b))
+    # Host edge through the same p area (horizontal).
+    h0 = bm.verts.new((-1.0, 0.0, 0.0))
+    h1 = bm.verts.new((1.0, 0.0, 0.0))
+    bm.edges.new((h0, h1))
+    rep = p.co.copy()
+    vertex, host_split, reason = core._plan_plane_stitch_vertex(bm, rep, [member], axis, tol)
+    assert reason == "", reason
+    assert vertex is p and host_split is None
+    bm.free()
+
+    # (2) Host edge farther than tol is not a candidate (no second threshold).
+    bm = bmesh.new()
+    a = bm.verts.new((-1.0, -1.0, 0.0))
+    b = bm.verts.new((1.0, 1.0, 0.0))
+    member = bm.edges.new((a, b))
+    # Horizontal host at y=0.25 > tol=0.1 from p=(0,0).
+    h0 = bm.verts.new((-1.0, 0.25, 0.0))
+    h1 = bm.verts.new((1.0, 0.25, 0.0))
+    bm.edges.new((h0, h1))
+    rep = type(a.co)((0.0, 0.0, 0.0))
+    from mathutils import Vector
+
+    rep = Vector((0.0, 0.0, 0.0))
+    vertex, host_split, reason = core._plan_plane_stitch_vertex(bm, rep, [member], axis, tol)
+    assert reason == "", reason
+    assert vertex is None and host_split is None  # fall through to member seed
+    bm.free()
+
+    # (3) Multiple host candidates within tol → decline (no nearest fallback).
+    bm = bmesh.new()
+    a = bm.verts.new((-1.0, -1.0, 0.0))
+    b = bm.verts.new((1.0, 1.0, 0.0))
+    member = bm.edges.new((a, b))
+    h0 = bm.verts.new((-1.0, 0.0, 0.0))
+    h1 = bm.verts.new((1.0, 0.0, 0.0))
+    bm.edges.new((h0, h1))
+    h2 = bm.verts.new((0.0, -1.0, 0.0))
+    h3 = bm.verts.new((0.0, 1.0, 0.0))
+    bm.edges.new((h2, h3))
+    rep = Vector((0.0, 0.0, 0.0))
+    vertex, host_split, reason = core._plan_plane_stitch_vertex(bm, rep, [member], axis, tol)
+    assert "ambiguous host edges" in reason, reason
+    assert vertex is None and host_split is None
+    bm.free()
+    print("YSE_KNIFE_BOTH_SIDES_UNIT_HOST=OK", flush=True)
+
+
+def unit_three_crosses_pointmerge_survivor() -> None:
+    """Three CROSSES converging on one p: survivor-first pointmerge keeps degree 6."""
+
+    print("YSE_KNIFE_BOTH_SIDES_UNIT=three_crosses_pointmerge", flush=True)
+    from mathutils import Vector
+
+    bm = bmesh.new()
+    pairs = (
+        (Vector((-1.0, -1.0, 0.0)), Vector((1.0, 1.0, 0.0))),
+        (Vector((-1.0, 1.0, 0.0)), Vector((1.0, -1.0, 0.0))),
+        (Vector((-1.0, -0.5, 0.0)), Vector((1.0, 0.5, 0.0))),
+    )
+    crosses = []
+    for a_co, b_co in pairs:
+        a = bm.verts.new(a_co)
+        b = bm.verts.new(b_co)
+        crosses.append(bm.edges.new((a, b)))
+    stitched, reason = core.apply_crosses_p_stitch(bm, crosses, core.AXIS_INDEX["X"], 1.0e-4)
+    assert reason == "", reason
+    assert stitched == 3, stitched
+    p_verts = [
+        vertex
+        for vertex in bm.verts
+        if vertex.is_valid and abs(vertex.co.x) <= 1.0e-6 and abs(vertex.co.y) <= 1.0e-6 and abs(vertex.co.z) <= 1.0e-6
+    ]
+    assert len(p_verts) == 1, [tuple(vertex.co) for vertex in bm.verts if vertex.is_valid]
+    assert len(p_verts[0].link_edges) >= 6, len(p_verts[0].link_edges)
+    bm.free()
+    print("YSE_KNIFE_BOTH_SIDES_UNIT_THREECROSSES=OK", flush=True)
+
+
+def unit_nontransitive_tol_clustering() -> None:
+    """Non-transitive tol chain: 0.09 spacing ×3, tol=0.1 → 2 clusters."""
+
+    print("YSE_KNIFE_BOTH_SIDES_UNIT=nontransitive_tol", flush=True)
+    from mathutils import Vector
+
+    tol = 0.1
+    # Points along Y on the plane; lex order is by (x,y,z) so y order applies.
+    points = [
+        Vector((0.0, 0.0, 0.0)),
+        Vector((0.0, 0.09, 0.0)),
+        Vector((0.0, 0.18, 0.0)),
+        Vector((0.0, 0.27, 0.0)),
+    ]
+    # p0 absorbs p1 (0.09≤0.1); p2 is 0.18 from p0 → new cluster, absorbs p3.
+    clusters = core.cluster_points_by_tolerance(points, tol)
+    assert len(clusters) == 2, clusters
+    assert sorted(len(cluster) for cluster in clusters) == [2, 2], clusters
+
+    # Headless stitch: three CROSSES with p at those y values should form
+    # two on-plane stitch vertices (not one big cluster).
+    bm = bmesh.new()
+    # Spanning quad.
+    corners = [
+        bm.verts.new(co)
+        for co in (
+            (-2.0, -1.0, 0.0),
+            (2.0, -1.0, 0.0),
+            (2.0, 2.0, 0.0),
+            (-2.0, 2.0, 0.0),
+        )
+    ]
+    face = bm.faces.new(corners)
+    # Three crossing edges with intersections at y=0, 0.09, 0.18 (and a 4th at 0.27
+    # would need another edge; three points spanning two clusters suffice).
+    endpoints = []
+    for y in (0.0, 0.09, 0.18):
+        left = bm.verts.new((-1.0, y - 0.5, 0.0))
+        right = bm.verts.new((1.0, y + 0.5, 0.0))
+        # Ensure the line crosses x=0 at (0, y): parametric from left to right
+        # x: -1→1, y: y-0.5 → y+0.5; at t=0.5: x=0, y=y. Good.
+        endpoints.append((left, right))
+    # Build edges as path edges (tag 0) on the face via face_split where possible.
+    # Direct edges that are not face-boundary still work for apply_crosses_p_stitch
+    # as long as they exist as BMEdge.
+    crosses = []
+    for left, right in endpoints:
+        # Connect through face by splitting if both verts are on the face...
+        # Simpler: create free-standing edges for the stitch unit (no face needed).
+        crosses.append(bm.edges.new((left, right)))
+    del face  # face unused after construction
+    stitched, reason = core.apply_crosses_p_stitch(bm, crosses, core.AXIS_INDEX["X"], tol)
+    assert reason == "", reason
+    assert stitched >= 2, stitched
+    on_plane = [vertex for vertex in bm.verts if abs(vertex.co.x) <= 1.0e-6 and vertex.is_valid]
+    # Two cluster representatives near y=0 and y=0.18 (p1 absorbed into first,
+    # no fourth point so second cluster has the 0.18 rep alone after stitch).
+    ys = sorted({round(vertex.co.y, 5) for vertex in on_plane if abs(vertex.co.y) < 1.0})
+    # At least two distinct on-plane stitch y values from the two clusters.
+    assert len(ys) >= 2, ys
+    bm.free()
+    print("YSE_KNIFE_BOTH_SIDES_UNIT_TOL=OK", flush=True)
+
+
 def run_test() -> None:
     addon.register()
     window, area, region = viewport_context()
     configure_view(area)
+
+    # Headless-style units first (no session / viewport dependency).
+    unit_orphan_face_remap()
+    unit_host_edge_selection()
+    unit_three_crosses_pointmerge_survivor()
+    unit_nontransitive_tol_clustering()
 
     case_a_straddle(window, area, region)
     case_b_crosses(window, area, region)
@@ -754,6 +1490,12 @@ def run_test() -> None:
     case_e_knife_project_fallback(window, area, region)
     case_f_partial_failure_rollback(window, area, region)
     case_g_self_mirrored(window, area, region)
+    case_h_simple_crosses(window, area, region)
+    case_i_bowtie(window, area, region)
+    case_j_self_mirrored_crosses(window, area, region)
+    case_k_mixed_symmetrized(window, area, region)
+    case_l_asymmetric_decline(window, area, region)
+    case_m_backup_creation_failure(window, area, region)
 
     print(MARKER_OK, flush=True)
     addon.unregister()
