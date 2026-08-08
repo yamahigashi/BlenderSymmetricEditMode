@@ -101,14 +101,17 @@ def run():
 
         core.apply_reflected_path_topology = forced_apply
         try:
-            try:
-                result = bpy.ops.mesh.ydd_symmetric_edit_finish("EXEC_DEFAULT")
-            except RuntimeError as exc:
-                assert "forced rollback test" in str(exc)
-                result = {"CANCELLED"}
+            result = bpy.ops.mesh.ydd_symmetric_edit_finish("EXEC_DEFAULT")
         finally:
             core.apply_reflected_path_topology = original_apply
-        assert result == {"CANCELLED"}, result
+        # Contract §2.2: successful rollback after mirror failure is a
+        # legitimate decline → WARNING + FINISHED (native result kept).
+        assert result == {"FINISHED"}, result
+        warnings = [message for kind, message in operators._FINISH_REPORTS if kind == "WARNING"]
+        assert any("forced rollback test" in message for message in warnings), (
+            warnings,
+            operators._FINISH_REPORTS,
+        )
 
     bm = bmesh.from_edit_mesh(obj.data)
     assert len(bm.verts) == 10, len(bm.verts)

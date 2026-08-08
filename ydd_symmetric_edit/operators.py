@@ -117,6 +117,13 @@ _HISTORY_REPAIR_QUEUED = False
 _HISTORY_REPAIR_BUSY = False
 _MAX_HISTORY_RECORDS = 256
 _HISTORY_SEQUENCE = 0
+# Last WARNING/INFO/ERROR messages recorded via _finish_report (tests inspect;
+# Operator.report is C-bound and not patchable). Instrumentation is intentional
+# and limited to the two call sites that tests assert on today: session-lost
+# ERROR at finish entry, and the post-native decline/fatal classification
+# (CROSSES early WARNING, mirror-failure WARNING/ERROR after rollback). Other
+# success INFO/WARNING paths still use Operator.report directly.
+_FINISH_REPORTS: list[tuple[str, str]] = []
 
 _PASSTHROUGH_POLL_INTERVAL = 0.01
 _PASSTHROUGH_START_GRACE = 0.75
@@ -547,10 +554,20 @@ def _create_cutter_object(context, target, coordinates, edges):
 
 
 def _remove_cutter(cutter, mesh) -> None:
-    if cutter is not None and cutter.name in bpy.data.objects:
-        bpy.data.objects.remove(cutter, do_unlink=True)
-    if mesh is not None and mesh.name in bpy.data.meshes and mesh.users == 0:
-        bpy.data.meshes.remove(mesh)
+    """Best-effort temporary cutter teardown.
+
+    Called from finish ``finally`` blocks: must not raise. Any exception is
+    logged and swallowed so later stages (backup rollback, selection restore,
+    layer removal, result return) still run (contract §2.2 undo preservation).
+    """
+
+    try:
+        if cutter is not None and cutter.name in bpy.data.objects:
+            bpy.data.objects.remove(cutter, do_unlink=True)
+        if mesh is not None and mesh.name in bpy.data.meshes and mesh.users == 0:
+            bpy.data.meshes.remove(mesh)
+    except Exception:
+        traceback.print_exc()
 
 
 def _finish_rip_session(
@@ -610,6 +627,14 @@ def _finish_rip_session(
     return {"FINISHED"}
 
 
+def _finish_report(operator, level: set[str], message: str) -> None:
+    """Report and record for tests (``Operator.report`` itself is not patchable)."""
+
+    kind = "WARNING" if "WARNING" in level else "ERROR" if "ERROR" in level else "INFO"
+    _FINISH_REPORTS.append((kind, message))
+    operator.report(level, message)
+
+
 class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
     bl_idname = "mesh.ydd_symmetric_edit_finish"
     bl_label = "Apply Mirrored ydd Symmetric Edit Cut"
@@ -620,10 +645,11 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
         return _single_edit_mesh_poll(context)
 
     def execute(self, context):
+        _FINISH_REPORTS.clear()
         window_pointer = _window_key(context)
         session = _SESSIONS.get(window_pointer)
         if session is None:
-            self.report({"ERROR"}, "ydd Symmetric Edit session data was lost")
+            _finish_report(self, {"ERROR"}, "ydd Symmetric Edit session data was lost")
             return {"CANCELLED"}
 
         tool_label = TOOL_LABELS.get(session.tool_kind, "Cut Tool")
@@ -647,6 +673,9 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
         crossing_count = 0
         warning = ""
         selection_state = None
+        side: str | None = None
+        mirror_failure: str | None = None
+        rollback_failed = False
         mesh_select_mode = MeshSelectionMode(
             vertices=bool(context.tool_settings.mesh_select_mode[0]),
             edges=bool(context.tool_settings.mesh_select_mode[1]),
@@ -659,90 +688,170 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
             if edge_layer is None or face_layer is None:
                 raise SymmetricKnifeError("Temporary topology markers are missing")
 
-            source_edges, side, total_path_edges, crossing_count = core.collect_source_path_edges(
-                bm,
-                session.axis_index,
-                session.tolerance,
-                session.source_side,
-                selected_only=session.tool_kind
-                in {
-                    "LOOP_CUT",
-                    "OFFSET_LOOP_CUT",
-                },
-            )
-            if total_path_edges == 0:
-                result = {"FINISHED"}
-                self.report({"INFO"}, f"{tool_label} made no new cut")
-                return result
-            if side is None or not source_edges:
-                raise SymmetricKnifeError(
-                    "Could not determine the source side; keep the new topology on one side of the mirror plane"
-                )
-
-            target_face_ids, unmatched = core.target_face_ids_for_edges(
-                source_edges,
-                face_layer,
-                session.mirror_face_ids,
-            )
-            if not target_face_ids:
-                raise SymmetricKnifeError("The cut faces have no exact mirrored counterpart; adjust axis or tolerance")
-            if unmatched:
-                raise SymmetricKnifeError(f"{len(unmatched)} cut face(s) have no exact mirrored counterpart")
-
-            collapsed_target_markers = set()
-            profile = TOOL_PROFILES.get(session.tool_kind)
-            if profile is not None and profile.supports_nested_offset:
-                collapsed_target_markers, _collapsed_reason = core.collapsed_offset_target_edge_markers(
+            if session.tool_kind == "KNIFE":
+                # Phase 1: both-sides mirror. CROSSES decline the whole stage
+                # (contract §4.1 / §2.1 all-or-nothing). Loop Cut / Offset keep
+                # one-side collect_source_path_edges below.
+                by_side, total_path_edges = core.collect_knife_path_edges_by_side(
                     bm,
-                    source_edges,
                     session.axis_index,
                     session.tolerance,
                 )
-            if collapsed_target_markers:
-                # Esc cancels only Offset's Edge Slide child; Blender keeps the
-                # two new loops at factor zero. A coincident Knife Project is
-                # impossible, so reproduce the same topology with BMesh.
-                core.reserve_source_path_marker(bm)
-                selection_state = core.add_selection_layers(bm)
-                backup_mesh = backup.create_topology_backup(bm)
-                mirrored_segment_count, collapsed_reason = core.apply_collapsed_offset_topology(
-                    bm,
-                    collapsed_target_markers,
-                    use_cap_endpoint=session.offset_use_cap_endpoint,
-                )
-                if not mirrored_segment_count:
-                    raise SymmetricKnifeError(collapsed_reason)
-                if mirrored_segment_count != len(source_edges):
-                    raise SymmetricKnifeError("The mirrored zero-offset topology did not match the source")
-                projection_committed = True
-                result = {"FINISHED"}
-                self.report(
-                    {"INFO"},
-                    f"Mirrored {mirrored_segment_count} zero-factor Offset "
-                    f"Edge Loop Cut segment(s) from the {side.lower()} side",
-                )
-                return result
+                if total_path_edges == 0:
+                    result = {"FINISHED"}
+                    self.report({"INFO"}, f"{tool_label} made no new cut")
+                    return result
 
-            use_direct_topology = session.tool_kind in {
-                "LOOP_CUT",
-                "OFFSET_LOOP_CUT",
-            } or (
-                session.tool_kind == "KNIFE"
-                and core.reflected_path_uses_only_target_boundaries(
+                crossing_count = len(by_side["CROSSES"])
+                if crossing_count:
+                    # Legitimate decline: keep native cut (contract §2.2).
+                    result = {"FINISHED"}
+                    _finish_report(
+                        self,
+                        {"WARNING"},
+                        "cross-plane knife segments are not mirrored yet",
+                    )
+                    return result
+
+                source_edges = by_side["POSITIVE"] + by_side["NEGATIVE"]
+                side = "BOTH"
+                if not source_edges:
+                    # Only PLANE segments: already shared across sides.
+                    result = {"FINISHED"}
+                    self.report(
+                        {"INFO"},
+                        f"{tool_label} cut lies on the mirror plane",
+                    )
+                    return result
+
+                target_face_ids, unmatched = core.target_face_ids_for_edges(
+                    source_edges,
+                    face_layer,
+                    session.mirror_face_ids,
+                )
+                if not target_face_ids:
+                    raise SymmetricKnifeError(
+                        "The cut faces have no exact mirrored counterpart; adjust axis or tolerance"
+                    )
+                if unmatched:
+                    raise SymmetricKnifeError(f"{len(unmatched)} cut face(s) have no exact mirrored counterpart")
+
+                use_direct_topology = core.reflected_path_uses_only_target_boundaries(
                     bm,
                     source_edges,
                     session.axis_index,
                     session.tolerance,
                     session.mirror_face_ids,
                 )
-            )
-            if use_direct_topology:
-                # A viewport projection is not one-to-one on curved or
-                # self-occluding surfaces. Rebuild the native cut topology on
-                # paired target faces instead, using exact reflected points.
+                if use_direct_topology:
+                    selection_state = core.add_selection_layers(bm)
+                    backup_mesh = backup.create_topology_backup(bm)
+                    bm = bmesh.from_edit_mesh(obj.data)
+                    by_side, total_path_edges = core.collect_knife_path_edges_by_side(
+                        bm,
+                        session.axis_index,
+                        session.tolerance,
+                    )
+                    source_edges = by_side["POSITIVE"] + by_side["NEGATIVE"]
+                    if not source_edges:
+                        raise SymmetricKnifeError("The native cut path was lost before mirroring")
+                    created, already_present, direct_reason = core.apply_reflected_path_topology(
+                        bm,
+                        source_edges,
+                        session.axis_index,
+                        session.tolerance,
+                        session.mirror_face_ids,
+                    )
+                    if direct_reason:
+                        raise SymmetricKnifeError(f"Could not rebuild the mirrored {tool_label}: {direct_reason}")
+                    if created + already_present != len(source_edges):
+                        raise SymmetricKnifeError(f"The mirrored {tool_label} topology did not match the source")
+
+                    projection_committed = True
+                    result = {"FINISHED"}
+                    if not created:
+                        self.report(
+                            {"INFO"},
+                            f"The opposite side already contains this {tool_label}",
+                        )
+                        return result
+
+                    warning_parts = []
+                    if already_present:
+                        warning_parts.append(f"{already_present} segment(s) already existed")
+                    suffix = f"; {'; '.join(warning_parts)}" if warning_parts else ""
+                    self.report(
+                        {"WARNING"} if warning_parts else {"INFO"},
+                        f"Mirrored {created} {tool_label} segment(s) to both sides{suffix}",
+                    )
+                    return result
+
+                coordinates, cutter_edges, already_present = core.build_reflected_cutter(
+                    bm,
+                    source_edges,
+                    session.axis_index,
+                    session.tolerance,
+                )
+                if not cutter_edges:
+                    result = {"FINISHED"}
+                    self.report({"INFO"}, "The opposite side already contains this cut")
+                    return result
+
+                core.reserve_source_path_marker(bm)
                 selection_state = core.add_selection_layers(bm)
                 backup_mesh = backup.create_topology_backup(bm)
+                preexisting_vertex_keys = {hash(vertex) for vertex in bm.verts}
+                _edge_layer, face_layer = core.get_required_layers(bm)
+                for face in bm.faces:
+                    face.hide = FaceId(int(face[face_layer])) not in target_face_ids
+                bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+
+                cutter, cutter_mesh = _create_cutter_object(context, obj, coordinates, cutter_edges)
+
+                window, area, region = _find_saved_view(session)
+                if window is None or area is None or region is None:
+                    raise SymmetricKnifeError("The original 3D Viewport is no longer available")
+
+                current_view = _capture_view_state(area)
+                try:
+                    if session.projection_view is not None:
+                        _apply_view_state(area, session.projection_view)
+                    with context.temp_override(
+                        window=window,
+                        area=area,
+                        region=region,
+                        selected_objects=[cutter],
+                    ):
+                        knife_project = getattr(bpy.ops.mesh, "knife_project")
+                        if not cast(bool, knife_project.poll()):
+                            raise SymmetricKnifeError("Knife Project has no valid 3D View context")
+                        knife_result = cast(
+                            set[str],
+                            knife_project(cut_through=True),
+                        )
+                finally:
+                    if current_view is not None:
+                        _apply_view_state(area, current_view)
+                if "FINISHED" not in knife_result:
+                    raise SymmetricKnifeError("Blender's Knife Project did not finish")
+
+                mirrored_segment_count = len(cutter_edges)
                 bm = bmesh.from_edit_mesh(obj.data)
+                snapped, _projection_error, snap_reason = core.snap_projected_graph(
+                    bm,
+                    coordinates,
+                    cutter_edges,
+                    session.tolerance,
+                    preexisting_vertex_keys,
+                )
+                if not snapped:
+                    raise SymmetricKnifeError(f"Projected cut could not be snapped to exact symmetry: {snap_reason}")
+                projection_committed = True
+                if already_present:
+                    warning += f"; {already_present} segment(s) already existed"
+                result = {"FINISHED"}
+            else:
+                # Loop Cut / Offset: keep one-side source selection (contract §4.2).
                 source_edges, side, total_path_edges, crossing_count = core.collect_source_path_edges(
                     bm,
                     session.axis_index,
@@ -754,117 +863,196 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                         "OFFSET_LOOP_CUT",
                     },
                 )
+                if total_path_edges == 0:
+                    result = {"FINISHED"}
+                    self.report({"INFO"}, f"{tool_label} made no new cut")
+                    return result
                 if side is None or not source_edges:
-                    raise SymmetricKnifeError("The native cut path was lost before mirroring")
-                created, already_present, direct_reason = core.apply_reflected_path_topology(
+                    raise SymmetricKnifeError(
+                        "Could not determine the source side; keep the new topology on one side of the mirror plane"
+                    )
+
+                target_face_ids, unmatched = core.target_face_ids_for_edges(
+                    source_edges,
+                    face_layer,
+                    session.mirror_face_ids,
+                )
+                if not target_face_ids:
+                    raise SymmetricKnifeError(
+                        "The cut faces have no exact mirrored counterpart; adjust axis or tolerance"
+                    )
+                if unmatched:
+                    raise SymmetricKnifeError(f"{len(unmatched)} cut face(s) have no exact mirrored counterpart")
+
+                collapsed_target_markers = set()
+                profile = TOOL_PROFILES.get(session.tool_kind)
+                if profile is not None and profile.supports_nested_offset:
+                    collapsed_target_markers, _collapsed_reason = core.collapsed_offset_target_edge_markers(
+                        bm,
+                        source_edges,
+                        session.axis_index,
+                        session.tolerance,
+                    )
+                if collapsed_target_markers:
+                    # Esc cancels only Offset's Edge Slide child; Blender keeps the
+                    # two new loops at factor zero. A coincident Knife Project is
+                    # impossible, so reproduce the same topology with BMesh.
+                    core.reserve_source_path_marker(bm)
+                    selection_state = core.add_selection_layers(bm)
+                    backup_mesh = backup.create_topology_backup(bm)
+                    mirrored_segment_count, collapsed_reason = core.apply_collapsed_offset_topology(
+                        bm,
+                        collapsed_target_markers,
+                        use_cap_endpoint=session.offset_use_cap_endpoint,
+                    )
+                    if not mirrored_segment_count:
+                        raise SymmetricKnifeError(collapsed_reason)
+                    if mirrored_segment_count != len(source_edges):
+                        raise SymmetricKnifeError("The mirrored zero-offset topology did not match the source")
+                    projection_committed = True
+                    result = {"FINISHED"}
+                    self.report(
+                        {"INFO"},
+                        f"Mirrored {mirrored_segment_count} zero-factor Offset "
+                        f"Edge Loop Cut segment(s) from the {side.lower()} side",
+                    )
+                    return result
+
+                use_direct_topology = session.tool_kind in {
+                    "LOOP_CUT",
+                    "OFFSET_LOOP_CUT",
+                }
+                if use_direct_topology:
+                    # A viewport projection is not one-to-one on curved or
+                    # self-occluding surfaces. Rebuild the native cut topology on
+                    # paired target faces instead, using exact reflected points.
+                    selection_state = core.add_selection_layers(bm)
+                    backup_mesh = backup.create_topology_backup(bm)
+                    bm = bmesh.from_edit_mesh(obj.data)
+                    source_edges, side, total_path_edges, crossing_count = core.collect_source_path_edges(
+                        bm,
+                        session.axis_index,
+                        session.tolerance,
+                        session.source_side,
+                        selected_only=session.tool_kind
+                        in {
+                            "LOOP_CUT",
+                            "OFFSET_LOOP_CUT",
+                        },
+                    )
+                    if side is None or not source_edges:
+                        raise SymmetricKnifeError("The native cut path was lost before mirroring")
+                    created, already_present, direct_reason = core.apply_reflected_path_topology(
+                        bm,
+                        source_edges,
+                        session.axis_index,
+                        session.tolerance,
+                        session.mirror_face_ids,
+                    )
+                    if direct_reason:
+                        raise SymmetricKnifeError(f"Could not rebuild the mirrored {tool_label}: {direct_reason}")
+                    if created + already_present != len(source_edges):
+                        raise SymmetricKnifeError(f"The mirrored {tool_label} topology did not match the source")
+
+                    projection_committed = True
+                    result = {"FINISHED"}
+                    if not created:
+                        self.report(
+                            {"INFO"},
+                            f"The opposite side already contains this {tool_label}",
+                        )
+                        return result
+
+                    warning_parts = []
+                    if crossing_count:
+                        warning_parts.append(f"skipped {crossing_count} segment(s) crossing the mirror plane")
+                    if already_present:
+                        warning_parts.append(f"{already_present} segment(s) already existed")
+                    suffix = f"; {'; '.join(warning_parts)}" if warning_parts else ""
+                    self.report(
+                        {"WARNING"} if warning_parts else {"INFO"},
+                        f"Mirrored {created} {tool_label} segment(s) from the {side.lower()} side{suffix}",
+                    )
+                    return result
+
+                coordinates, cutter_edges, already_present = core.build_reflected_cutter(
                     bm,
                     source_edges,
                     session.axis_index,
                     session.tolerance,
-                    session.mirror_face_ids,
                 )
-                if direct_reason:
-                    raise SymmetricKnifeError(f"Could not rebuild the mirrored {tool_label}: {direct_reason}")
-                if created + already_present != len(source_edges):
-                    raise SymmetricKnifeError(f"The mirrored {tool_label} topology did not match the source")
-
-                projection_committed = True
-                result = {"FINISHED"}
-                if not created:
-                    self.report(
-                        {"INFO"},
-                        f"The opposite side already contains this {tool_label}",
-                    )
+                if not cutter_edges:
+                    result = {"FINISHED"}
+                    self.report({"INFO"}, "The opposite side already contains this cut")
                     return result
 
-                warning_parts = []
-                if crossing_count:
-                    warning_parts.append(f"skipped {crossing_count} segment(s) crossing the mirror plane")
-                if already_present:
-                    warning_parts.append(f"{already_present} segment(s) already existed")
-                suffix = f"; {'; '.join(warning_parts)}" if warning_parts else ""
-                self.report(
-                    {"WARNING"} if warning_parts else {"INFO"},
-                    f"Mirrored {created} {tool_label} segment(s) from the {side.lower()} side{suffix}",
+                core.reserve_source_path_marker(bm)
+                selection_state = core.add_selection_layers(bm)
+                backup_mesh = backup.create_topology_backup(bm)
+                preexisting_vertex_keys = {hash(vertex) for vertex in bm.verts}
+                # Layer creation invalidates held element wrappers; retrieve layers
+                # and iterate faces again before changing visibility.
+                _edge_layer, face_layer = core.get_required_layers(bm)
+                for face in bm.faces:
+                    face.hide = FaceId(int(face[face_layer])) not in target_face_ids
+                bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+
+                cutter, cutter_mesh = _create_cutter_object(context, obj, coordinates, cutter_edges)
+
+                window, area, region = _find_saved_view(session)
+                if window is None or area is None or region is None:
+                    raise SymmetricKnifeError("The original 3D Viewport is no longer available")
+
+                current_view = _capture_view_state(area)
+                try:
+                    if session.projection_view is not None:
+                        _apply_view_state(area, session.projection_view)
+                    with context.temp_override(
+                        window=window,
+                        area=area,
+                        region=region,
+                        selected_objects=[cutter],
+                    ):
+                        knife_project = getattr(bpy.ops.mesh, "knife_project")
+                        if not cast(bool, knife_project.poll()):
+                            raise SymmetricKnifeError("Knife Project has no valid 3D View context")
+                        knife_result = cast(
+                            set[str],
+                            knife_project(cut_through=True),
+                        )
+                finally:
+                    if current_view is not None:
+                        _apply_view_state(area, current_view)
+                if "FINISHED" not in knife_result:
+                    raise SymmetricKnifeError("Blender's Knife Project did not finish")
+
+                mirrored_segment_count = len(cutter_edges)
+                bm = bmesh.from_edit_mesh(obj.data)
+                snapped, _projection_error, snap_reason = core.snap_projected_graph(
+                    bm,
+                    coordinates,
+                    cutter_edges,
+                    session.tolerance,
+                    preexisting_vertex_keys,
                 )
-                return result
-
-            coordinates, cutter_edges, already_present = core.build_reflected_cutter(
-                bm,
-                source_edges,
-                session.axis_index,
-                session.tolerance,
-            )
-            if not cutter_edges:
+                if not snapped:
+                    raise SymmetricKnifeError(f"Projected cut could not be snapped to exact symmetry: {snap_reason}")
+                projection_committed = True
+                if crossing_count:
+                    warning += f"; skipped {crossing_count} segment(s) crossing the mirror plane"
+                if already_present:
+                    warning += f"; {already_present} segment(s) already existed"
                 result = {"FINISHED"}
-                self.report({"INFO"}, "The opposite side already contains this cut")
-                return result
-
-            core.reserve_source_path_marker(bm)
-            selection_state = core.add_selection_layers(bm)
-            backup_mesh = backup.create_topology_backup(bm)
-            preexisting_vertex_keys = {hash(vertex) for vertex in bm.verts}
-            # Layer creation invalidates held element wrappers; retrieve layers
-            # and iterate faces again before changing visibility.
-            _edge_layer, face_layer = core.get_required_layers(bm)
-            for face in bm.faces:
-                face.hide = FaceId(int(face[face_layer])) not in target_face_ids
-            bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
-
-            cutter, cutter_mesh = _create_cutter_object(context, obj, coordinates, cutter_edges)
-
-            window, area, region = _find_saved_view(session)
-            if window is None or area is None or region is None:
-                raise SymmetricKnifeError("The original 3D Viewport is no longer available")
-
-            current_view = _capture_view_state(area)
-            try:
-                if session.projection_view is not None:
-                    _apply_view_state(area, session.projection_view)
-                with context.temp_override(
-                    window=window,
-                    area=area,
-                    region=region,
-                    selected_objects=[cutter],
-                ):
-                    knife_project = getattr(bpy.ops.mesh, "knife_project")
-                    if not cast(bool, knife_project.poll()):
-                        raise SymmetricKnifeError("Knife Project has no valid 3D View context")
-                    knife_result = cast(
-                        set[str],
-                        knife_project(cut_through=True),
-                    )
-            finally:
-                if current_view is not None:
-                    _apply_view_state(area, current_view)
-            if "FINISHED" not in knife_result:
-                raise SymmetricKnifeError("Blender's Knife Project did not finish")
-
-            mirrored_segment_count = len(cutter_edges)
-            bm = bmesh.from_edit_mesh(obj.data)
-            snapped, _projection_error, snap_reason = core.snap_projected_graph(
-                bm,
-                coordinates,
-                cutter_edges,
-                session.tolerance,
-                preexisting_vertex_keys,
-            )
-            if not snapped:
-                raise SymmetricKnifeError(f"Projected cut could not be snapped to exact symmetry: {snap_reason}")
-            projection_committed = True
-            if crossing_count:
-                warning += f"; skipped {crossing_count} segment(s) crossing the mirror plane"
-            if already_present:
-                warning += f"; {already_present} segment(s) already existed"
-            result = {"FINISHED"}
         except SymmetricKnifeError as exc:
-            self.report({"ERROR"}, f"ydd Symmetric Edit: {exc}")
-            result = {"CANCELLED"}
+            # Defer report until after finally so rollback success/failure can
+            # classify the outcome (contract §2.2).
+            mirror_failure = str(exc)
         except Exception as exc:
             traceback.print_exc()
-            self.report({"ERROR"}, f"ydd Symmetric Edit: {exc}")
-            result = {"CANCELLED"}
+            mirror_failure = str(exc)
         finally:
+            # Each stage is isolated: a failure here must not skip later stages
+            # or prevent returning a post-native result (contract §2.2).
             _remove_cutter(cutter, cutter_mesh)
 
             if backup_mesh is not None and not projection_committed:
@@ -872,6 +1060,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     backup.restore_topology_backup(obj.data, backup_mesh)
                 except Exception:
                     traceback.print_exc()
+                    rollback_failed = True
 
             # Knife Project replaces selection and temporary hiding even when a
             # later step fails. Best-effort restoration keeps the native source
@@ -894,15 +1083,44 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                                 face.hide = bool(session.hidden_by_face_id.get(face_id, False))
                     core.remove_temporary_layers(bm)
                     bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=True)
-                except (ReferenceError, RuntimeError):
-                    pass
+                except Exception:
+                    traceback.print_exc()
 
-            backup.remove_backup(backup_mesh)
-            cleanup_session(window_pointer, keep_history_record=True)
+            try:
+                backup.remove_backup(backup_mesh)
+            except Exception:
+                traceback.print_exc()
+            try:
+                cleanup_session(window_pointer, keep_history_record=True)
+            except Exception:
+                traceback.print_exc()
+
+        # Contract §2.2: after native changes, always return FINISHED.
+        # Successful rollback (or no backup / mirror not started) → WARNING
+        # decline that keeps the native result. Rollback exception → ERROR.
+        if mirror_failure is not None:
+            if rollback_failed:
+                _finish_report(
+                    self,
+                    {"ERROR"},
+                    f"ydd Symmetric Edit: {mirror_failure}",
+                )
+            else:
+                _finish_report(
+                    self,
+                    {"WARNING"},
+                    f"ydd Symmetric Edit: {mirror_failure}",
+                )
+            result = {"FINISHED"}
 
         if result == {"FINISHED"} and mirrored_segment_count:
             assert side is not None
-            message = f"Mirrored {mirrored_segment_count} {tool_label} segment(s) from the {side.lower()} side{warning}"
+            if side == "BOTH":
+                message = f"Mirrored {mirrored_segment_count} {tool_label} segment(s) to both sides{warning}"
+            else:
+                message = (
+                    f"Mirrored {mirrored_segment_count} {tool_label} segment(s) from the {side.lower()} side{warning}"
+                )
             self.report({"WARNING"} if warning else {"INFO"}, message)
         return result
 

@@ -577,6 +577,57 @@ def check_vertex_mirror_lookup_nearest_among_candidates():
     assert lookup.find(Vector((1.0, 0.0, 0.0))) == 1
 
 
+def check_edge_side_tol_boundary_classification():
+    """_edge_side boundary cases: ±tol endpoints, one-end-in-tol, tol±ε.
+
+    Tolerance and sample coords use binary-exact floats so BMesh's float32
+    storage does not nudge endpoints across the comparison boundary.
+    """
+
+    tolerance = 0.125  # exact in float32
+    axis = core.AXIS_INDEX["X"]
+    bm = bmesh.new()
+    try:
+
+        def classify(a_x: float, b_x: float) -> str:
+            a = bm.verts.new((a_x, 0.0, 0.0))
+            b = bm.verts.new((b_x, 1.0, 0.0))
+            edge = bm.edges.new((a, b))
+            return core._edge_side(edge, axis, tolerance)
+
+        # Both endpoints exactly at +tol / beyond → POSITIVE (max > tol).
+        assert classify(tolerance, 1.0) == "POSITIVE"
+        # Both endpoints exactly at -tol / beyond → NEGATIVE (min < -tol).
+        assert classify(-tolerance, -1.0) == "NEGATIVE"
+        # Both exactly on plane bounds → PLANE.
+        assert classify(tolerance, -tolerance) == "PLANE"
+        assert classify(0.0, 0.0) == "PLANE"
+        assert classify(tolerance, tolerance) == "PLANE"
+        assert classify(-tolerance, -tolerance) == "PLANE"
+        # One endpoint in the tol band, other outside same side → that side.
+        assert classify(0.0, 1.0) == "POSITIVE"
+        assert classify(0.0, -1.0) == "NEGATIVE"
+        assert classify(-0.5 * tolerance, 1.0) == "POSITIVE"
+        assert classify(0.5 * tolerance, -1.0) == "NEGATIVE"
+        # Straddling with both ends outside the band → CROSSES.
+        assert classify(-1.0, 1.0) == "CROSSES"
+        # tol±ε: just outside the PLANE slab on opposite sides → CROSSES.
+        eps = 0.001  # still exact as float32 relative to 0.125
+        assert classify(-(tolerance + eps), tolerance + eps) == "CROSSES"
+        # Just inside: both within ±tol → PLANE.
+        assert classify(-(tolerance - eps), tolerance - eps) == "PLANE"
+        # One end at +tol, other at -tol-ε → still NEGATIVE (both ≤ tol, min < -tol).
+        assert classify(tolerance, -(tolerance + eps)) == "NEGATIVE"
+        # Both ends strictly outside opposite sides → CROSSES.
+        assert classify(tolerance + eps, -(tolerance + eps)) == "CROSSES"
+        # One end only in tol: other deep positive → POSITIVE.
+        assert classify(0.0, 2.0) == "POSITIVE"
+        # One end only in tol: other deep negative → NEGATIVE.
+        assert classify(0.0, -2.0) == "NEGATIVE"
+    finally:
+        bm.free()
+
+
 def run():
     bm = build_two_symmetric_quads()
     topology = core.prepare_topology(bm, core.AXIS_INDEX["X"], 1.0e-5)
@@ -773,6 +824,7 @@ def run():
     check_vertex_mirror_lookup_is_on_plane_boundary()
     check_vertex_mirror_lookup_asymmetric_returns_none()
     check_vertex_mirror_lookup_nearest_among_candidates()
+    check_edge_side_tol_boundary_classification()
     print("YSE_CORE_TEST_OK", flush=True)
 
 

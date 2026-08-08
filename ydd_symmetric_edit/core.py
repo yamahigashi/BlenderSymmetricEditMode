@@ -877,7 +877,12 @@ def _edge_side(
     edge: bmesh.types.BMEdge,
     axis_index: int,
     tolerance: float,
-) -> str | None:
+) -> str:
+    """Classify an edge relative to the mirror plane.
+
+    Always returns one of POSITIVE / NEGATIVE / PLANE / CROSSES.
+    """
+
     a = edge.verts[0].co[axis_index]
     b = edge.verts[1].co[axis_index]
     if a >= -tolerance and b >= -tolerance and max(a, b) > tolerance:
@@ -895,7 +900,11 @@ def choose_source_side(
     tolerance: float,
     requested: str,
 ) -> tuple[str | None, int]:
-    """Resolve AUTO and return ``(side, crossing_edge_count)``."""
+    """Resolve AUTO and return ``(side, crossing_edge_count)``.
+
+    Used by Loop Cut / Offset Edge Loop Cut (one-side selection). Knife no
+    longer chooses a source side; see :func:`collect_knife_path_edges_by_side`.
+    """
 
     positive_length = 0.0
     negative_length = 0.0
@@ -918,6 +927,88 @@ def choose_source_side(
     return "NEGATIVE", crossing
 
 
+def _is_path_edge_by_markers(edge: bmesh.types.BMEdge, edge_layer, face_layer) -> bool:
+    """True when *edge* is a native cut fragment (contract §2.0 novelty).
+
+    Tag==0 is the primary signal. Existing-edge splits inherit a non-zero parent
+    tag, so also accept internal edges whose link faces all share one original
+    FACE_ID (FACE_ID complement). Selection is intentionally not consulted.
+    """
+
+    if edge[edge_layer] == 0:
+        return True
+    return (
+        face_layer is not None
+        and len(edge.link_faces) >= 2
+        and len({FaceId(int(face[face_layer])) for face in edge.link_faces}) == 1
+    )
+
+
+def _discover_path_edges(
+    bm: bmesh.types.BMesh,
+    *,
+    selected_only: bool = False,
+) -> list[bmesh.types.BMEdge]:
+    """Discover native path edges created by the last cut tool.
+
+    Loop Cut and Offset Edge Loop Cut expose their complete native result as
+    the current edge selection. This is more authoritative for those tools
+    than CustomData inheritance on complex rings. Knife strokes can honor
+    "Select Result" being disabled, so their marker-based path stays intact.
+
+    Both branches use the same novelty test (tag==0 or FACE_ID complement;
+    contract §2.0). *selected_only* only adds the selection filter for Loop
+    Cut / Offset; Knife (selected_only=False) must still recover inherited-tag
+    CROSSES fragments so the whole-stage decline cannot be skipped.
+    """
+
+    edge_layer = bm.edges.layers.int.get(EDGE_ORIGINAL_LAYER)
+    if edge_layer is None:
+        return []
+
+    face_layer = bm.faces.layers.int.get(FACE_ID_LAYER)
+    if selected_only:
+        return [edge for edge in bm.edges if edge.select and _is_path_edge_by_markers(edge, edge_layer, face_layer)]
+    return [edge for edge in bm.edges if _is_path_edge_by_markers(edge, edge_layer, face_layer)]
+
+
+def classify_path_edges_by_side(
+    path_edges: Iterable[bmesh.types.BMEdge],
+    axis_index: int,
+    tolerance: float,
+) -> dict[str, list[bmesh.types.BMEdge]]:
+    """Bucket path edges into POSITIVE / NEGATIVE / PLANE / CROSSES."""
+
+    by_side: dict[str, list[bmesh.types.BMEdge]] = {
+        "POSITIVE": [],
+        "NEGATIVE": [],
+        "PLANE": [],
+        "CROSSES": [],
+    }
+    for edge in path_edges:
+        by_side[_edge_side(edge, axis_index, tolerance)].append(edge)
+    return by_side
+
+
+def collect_knife_path_edges_by_side(
+    bm: bmesh.types.BMesh,
+    axis_index: int,
+    tolerance: float,
+) -> tuple[dict[str, list[bmesh.types.BMEdge]], int]:
+    """Classify every new Knife path edge without choosing a source side.
+
+    Phase 1 (axis-crossing contract §4.1): both POSITIVE and NEGATIVE buckets
+    are mirrored toward each other. PLANE edges are shared. A non-empty
+    CROSSES bucket declines the whole mirror stage (p-stitch is Phase 2).
+
+    Returns ``(by_side, total_path_edge_count)``.
+    """
+
+    all_path_edges = _discover_path_edges(bm, selected_only=False)
+    by_side = classify_path_edges_by_side(all_path_edges, axis_index, tolerance)
+    return by_side, len(all_path_edges)
+
+
 def collect_source_path_edges(
     bm: bmesh.types.BMesh,
     axis_index: int,
@@ -926,37 +1017,17 @@ def collect_source_path_edges(
     *,
     selected_only: bool = False,
 ) -> tuple[list[bmesh.types.BMEdge], str | None, int, int]:
-    """Return native Knife path edges on the selected source half.
+    """Return path edges on one source half (Loop Cut / Offset; one-side).
 
-    The two final integers are the total number of new path edges and the
-    number that cross the mirror plane (cross-plane segments are not mirrored).
+    Knife uses :func:`collect_knife_path_edges_by_side` instead. The two final
+    integers are the total number of new path edges and the number that cross
+    the mirror plane.
     """
 
-    edge_layer = bm.edges.layers.int.get(EDGE_ORIGINAL_LAYER)
-    if edge_layer is None:
+    all_path_edges = _discover_path_edges(bm, selected_only=selected_only)
+    if not all_path_edges and bm.edges.layers.int.get(EDGE_ORIGINAL_LAYER) is None:
         return [], None, 0, 0
 
-    # Loop Cut and Offset Edge Loop Cut expose their complete native result as
-    # the current edge selection. This is more authoritative for those tools
-    # than CustomData inheritance on complex rings. Knife strokes can honor
-    # "Select Result" being disabled, so their marker-based path stays intact.
-    if selected_only:
-        face_layer = bm.faces.layers.int.get(FACE_ID_LAYER)
-        all_path_edges = [
-            edge
-            for edge in bm.edges
-            if edge.select
-            and (
-                edge[edge_layer] == 0
-                or (
-                    face_layer is not None
-                    and len(edge.link_faces) >= 2
-                    and len({FaceId(int(face[face_layer])) for face in edge.link_faces}) == 1
-                )
-            )
-        ]
-    else:
-        all_path_edges = [edge for edge in bm.edges if edge[edge_layer] == 0]
     side, crossing = choose_source_side(all_path_edges, axis_index, tolerance, requested_side)
     if side is None:
         return [], None, len(all_path_edges), crossing
@@ -1079,7 +1150,7 @@ def _resolve_reflected_vertex_on_target(
     candidate_faces: set[bmesh.types.BMFace],
     tolerance: float,
 ) -> tuple[
-    Literal["exact", "boundary", "missing"],
+    Literal["exact", "boundary", "missing", "ambiguous"],
     bmesh.types.BMVert | None,
     bmesh.types.BMEdge | None,
     float,
@@ -1089,13 +1160,17 @@ def _resolve_reflected_vertex_on_target(
 
     Shared by preflight (dry-run) and apply so both use identical E/F semantics.
     Returns ``(kind, exact_vertex, split_edge, factor, error_reason)``.
+
+    Multiple distinct vertices within *tolerance* of *expected* are ambiguous
+    (contract §1.1 / direct-topology safety): callers must decline rather than
+    pick an arbitrary vertex that could invent a duplicate edge.
     """
 
     if not candidate_faces:
         return "missing", None, None, 0.0, "a mirrored target face was lost"
 
-    # Acceptance uses coordinates_match; the Euclidean length stays only as
-    # the tie-breaking rank so the nearest of several accepted vertices wins.
+    # Acceptance uses coordinates_match; the Euclidean length ranks candidates
+    # only to detect a unique nearest match when exactly one is accepted.
     candidate_vertices = {vertex for face in candidate_faces for vertex in face.verts}
     exact_vertices = sorted(
         (
@@ -1105,6 +1180,14 @@ def _resolve_reflected_vertex_on_target(
         ),
         key=lambda item: (item[0], item[1]),
     )
+    if len(exact_vertices) > 1:
+        return (
+            "ambiguous",
+            None,
+            None,
+            0.0,
+            "ambiguous mirrored target vertices within tolerance",
+        )
     if exact_vertices:
         return "exact", exact_vertices[0][2], None, 0.0, ""
 
@@ -1184,7 +1267,7 @@ def reflected_path_uses_only_target_boundaries(
             candidate_faces,
             tolerance,
         )
-        if kind == "missing":
+        if kind in {"missing", "ambiguous"}:
             return False
 
     return True
@@ -1204,6 +1287,11 @@ def apply_reflected_path_topology(
     The native source path supplies exact endpoint coordinates and inherited
     original-face IDs. Target boundary edges are split at the reflected points,
     then the corresponding target faces are split between those vertices.
+
+    Existing segments are detected by BMVert identity *and* by endpoint
+    coordinate tolerance (same store as :func:`build_reflected_cutter`) so a
+    near-self-mirrored stroke does not invent a geometric duplicate. Multiple
+    tol-local vertex candidates decline the whole apply (all-or-nothing).
 
     Returns ``(created_edges, already_present_edges, failure_reason)``. Callers
     must provide rollback because a late validation error can occur after an
@@ -1264,7 +1352,7 @@ def apply_reflected_path_topology(
             assert exact_vertex is not None
             target_vertex_by_source_key[source_key] = exact_vertex
             continue
-        if kind == "missing":
+        if kind in {"missing", "ambiguous"}:
             return 0, 0, reason
 
         assert target_edge is not None
@@ -1279,6 +1367,18 @@ def apply_reflected_path_topology(
         target_vertex.co = expected
         target_vertex.select = False
         target_vertex_by_source_key[source_key] = target_vertex
+
+    # Endpoint-tol store matches build_reflected_cutter so geometric duplicates
+    # (different BMVert pairs within tol) count as already_present.
+    existing_edges: _EdgeEndpointStore = {}
+    for edge in bm.edges:
+        if edge.is_valid:
+            _register_edge_endpoint_pair(
+                existing_edges,
+                edge.verts[0].co,
+                edge.verts[1].co,
+                tolerance,
+            )
 
     created_edges = 0
     already_present = 0
@@ -1298,6 +1398,11 @@ def apply_reflected_path_topology(
                         already_present,
                         "an existing mirrored edge is outside its target face",
                     )
+                already_present += 1
+                progress = True
+                continue
+
+            if _edge_coordinate_key_matches(target_a.co, target_b.co, tolerance, existing_edges):
                 already_present += 1
                 progress = True
                 continue
@@ -1329,6 +1434,12 @@ def apply_reflected_path_topology(
             new_edge.select = False
             for face in new_edge.link_faces:
                 face.select = False
+            _register_edge_endpoint_pair(
+                existing_edges,
+                new_edge.verts[0].co,
+                new_edge.verts[1].co,
+                tolerance,
+            )
             created_edges += 1
             progress = True
 
