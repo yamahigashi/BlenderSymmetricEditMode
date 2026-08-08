@@ -15,14 +15,16 @@ from .operators import TOOL_PROFILES
 
 INTERCEPT_OPERATOR = "mesh.ydd_symmetric_edit_intercept"
 CONNECT_OPERATOR = "mesh.ydd_symmetric_edit_connect"
+DISSOLVE_MODE_OPERATOR = "mesh.ydd_symmetric_edit_dissolve_mode"
 MERGE_MENU = "YSE_MT_merge"
 DELETE_MENU = "YSE_MT_delete"
 NATIVE_DELETE_MENU = "VIEW3D_MT_edit_mesh_delete"
+NATIVE_DISSOLVE_MODE = "mesh.dissolve_mode"
 TOOL_KEYMAP_NAME = TOOL_PROFILES["KNIFE"].tool_idnames[0]
 TOOL_KEYMAP_NAMES = frozenset(tool_idname for profile in TOOL_PROFILES.values() for tool_idname in profile.tool_idnames)
 OPERATOR_TOOL_KINDS = {profile.keymap_operator: profile.kind for profile in TOOL_PROFILES.values()}
 
-_OWN_OPERATOR_IDS = frozenset({INTERCEPT_OPERATOR, CONNECT_OPERATOR})
+_OWN_OPERATOR_IDS = frozenset({INTERCEPT_OPERATOR, CONNECT_OPERATOR, DISSOLVE_MODE_OPERATOR})
 _WATCH_INTERVAL = 1.0
 _RETRY_INTERVAL = 0.25
 
@@ -31,6 +33,7 @@ _REGISTERED_ITEMS: list[tuple[object, KeymapEventLike]] = []
 _ROUTES_BY_KEY: dict[str, NativeRoute] = {}
 _FINGERPRINT: KeymapFingerprint | None = None
 _DELETE_FINGERPRINT: tuple[tuple[str, str, str, KeymapEvent], ...] | None = None
+_DISSOLVE_FINGERPRINT: tuple[tuple[str, str, str, KeymapEvent], ...] | None = None
 _HAS_DELETE_ROUTES = False
 _ENABLED = False
 _RUNNING = False
@@ -227,6 +230,43 @@ def _delete_menu_routes(
     return routes, fingerprint
 
 
+def _dissolve_mode_routes(
+    window_manager,
+) -> tuple[list[DeleteMenuRoute], tuple[tuple[str, str, str, KeymapEvent], ...]]:
+    """Scan user keymaps for active mesh.dissolve_mode bindings (Ctrl+X / IC)."""
+
+    key_config = window_manager.keyconfigs.user
+    if key_config is None:
+        return [], ()
+
+    routes: list[DeleteMenuRoute] = []
+    seen: set[tuple[str, str, str, KeymapEvent]] = set()
+    for keymap in key_config.keymaps:
+        if keymap.is_modal:
+            continue
+        for item in keymap.keymap_items:
+            if not item.active:
+                continue
+            if item.idname != NATIVE_DISSOLVE_MODE:
+                continue
+            event = _event_signature(item)
+            identity = (keymap.name, keymap.space_type, keymap.region_type, event)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            routes.append(
+                DeleteMenuRoute(
+                    keymap_name=keymap.name,
+                    space_type=keymap.space_type,
+                    region_type=keymap.region_type,
+                    event=event,
+                )
+            )
+
+    fingerprint = tuple((route.keymap_name, route.space_type, route.region_type, route.event) for route in routes)
+    return routes, fingerprint
+
+
 def _is_owned_item(item) -> bool:
     if item.idname in _OWN_OPERATOR_IDS:
         return True
@@ -348,10 +388,39 @@ def _register_delete_menu_keymaps(window_manager, routes: list[DeleteMenuRoute])
         _REGISTERED_ITEMS.append((keymap, item))
 
 
+def _register_dissolve_mode_keymaps(window_manager, routes: list[DeleteMenuRoute]) -> None:
+    """Register head=True dissolve_mode replacement for every scanned native event."""
+
+    addon_config = window_manager.keyconfigs.addon
+    if addon_config is None:
+        raise RuntimeError("Blender's add-on key configuration is unavailable")
+
+    addon_keymaps = {}
+    for route in routes:
+        keymap = addon_keymaps.get(route.keymap_identity)
+        if keymap is None:
+            keymap = addon_config.keymaps.new(
+                name=route.keymap_name,
+                space_type=route.space_type,
+                region_type=route.region_type,
+                modal=False,
+            )
+            addon_keymaps[route.keymap_identity] = keymap
+
+        item = keymap.keymap_items.new(
+            DISSOLVE_MODE_OPERATOR,
+            head=True,
+            **_event_arguments(route.event),
+        )
+        item.active = _ENABLED
+        _REGISTERED_ITEMS.append((keymap, item))
+
+
 def _rebuild(
     window_manager,
     routes: list[NativeRoute],
     delete_routes: list[DeleteMenuRoute],
+    dissolve_routes: list[DeleteMenuRoute],
 ) -> None:
     global _HAS_DELETE_ROUTES
 
@@ -368,6 +437,7 @@ def _rebuild(
         _register_routes(window_manager, routes)
         _register_replay_keymaps(window_manager)
         _register_delete_menu_keymaps(window_manager, delete_routes)
+        _register_dissolve_mode_keymaps(window_manager, dissolve_routes)
     except Exception:
         _remove_owned_items(addon_config)
         _REGISTERED_ITEMS.clear()
@@ -381,7 +451,7 @@ def _rebuild(
 
 
 def _refresh(*, force: bool = False) -> bool:
-    global _FINGERPRINT, _DELETE_FINGERPRINT
+    global _FINGERPRINT, _DELETE_FINGERPRINT, _DISSOLVE_FINGERPRINT
 
     window_manager = _window_manager()
     if window_manager is None:
@@ -396,10 +466,17 @@ def _refresh(*, force: bool = False) -> bool:
     window_manager.keyconfigs.update()
     routes, fingerprint = _native_routes(window_manager)
     delete_routes, delete_fingerprint = _delete_menu_routes(window_manager)
-    if force or fingerprint != _FINGERPRINT or delete_fingerprint != _DELETE_FINGERPRINT:
-        _rebuild(window_manager, routes, delete_routes)
+    dissolve_routes, dissolve_fingerprint = _dissolve_mode_routes(window_manager)
+    if (
+        force
+        or fingerprint != _FINGERPRINT
+        or delete_fingerprint != _DELETE_FINGERPRINT
+        or dissolve_fingerprint != _DISSOLVE_FINGERPRINT
+    ):
+        _rebuild(window_manager, routes, delete_routes, dissolve_routes)
         _FINGERPRINT = fingerprint
         _DELETE_FINGERPRINT = delete_fingerprint
+        _DISSOLVE_FINGERPRINT = dissolve_fingerprint
     return True
 
 
@@ -490,12 +567,13 @@ def sync(enabled: bool) -> None:
 
 
 def register(*, enabled: bool = False) -> None:
-    global _ENABLED, _FINGERPRINT, _DELETE_FINGERPRINT, _HAS_DELETE_ROUTES, _RUNNING
+    global _ENABLED, _FINGERPRINT, _DELETE_FINGERPRINT, _DISSOLVE_FINGERPRINT, _HAS_DELETE_ROUTES, _RUNNING
 
     _RUNNING = True
     _ENABLED = bool(enabled)
     _FINGERPRINT = None
     _DELETE_FINGERPRINT = None
+    _DISSOLVE_FINGERPRINT = None
     _HAS_DELETE_ROUTES = False
     _REGISTERED_ITEMS.clear()
     _ROUTES_BY_KEY.clear()
@@ -517,7 +595,7 @@ def register(*, enabled: bool = False) -> None:
 
 
 def unregister() -> None:
-    global _ENABLED, _FINGERPRINT, _DELETE_FINGERPRINT, _HAS_DELETE_ROUTES, _RUNNING
+    global _ENABLED, _FINGERPRINT, _DELETE_FINGERPRINT, _DISSOLVE_FINGERPRINT, _HAS_DELETE_ROUTES, _RUNNING
 
     _RUNNING = False
     _ENABLED = False
@@ -536,4 +614,5 @@ def unregister() -> None:
     _ROUTES_BY_KEY.clear()
     _FINGERPRINT = None
     _DELETE_FINGERPRINT = None
+    _DISSOLVE_FINGERPRINT = None
     _HAS_DELETE_ROUTES = False
