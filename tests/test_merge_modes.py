@@ -18,12 +18,17 @@ Serial cases in one process (no undo assertions; topology only):
   6. Center self-mirrored — one native run, already symmetric.
   7. Center partial — selection completed with its missing mirrors first,
      then one native run onto the plane.
-  8. First with an on-plane vertex mixed in — native only (no mirror pass).
-  9. Partial + on-plane First — the on-plane guard must fire BEFORE the
-     selection is symmetrized; the unselected mirror vertex must survive.
- 10. Fault injection: pointmerge failure — rollback to the native-only state.
- 11. Fault injection: backup-creation failure in the side split — native side
+  8. First + on-plane mixed — side-split with on-plane shared by both
+     clusters; X-symmetric survivors, no decline WARNING (contract §4.5 D7).
+  9. Last + on-plane mixed — same sharing rule with a -X LAST target.
+ 10. Partial + on-plane First — side-split after PARTIAL symmetrization;
+     on-plane shared, result X-symmetric (D7; replaces the old pre-symmetrize
+     decline guard).
+ 11. Fault injection: pointmerge failure — rollback to the native-only state.
+ 12. Fault injection: backup-creation failure in the side split — native side
      merged, mirror side kept and reselected per the post-state contract.
+ 13. D4 regression: native no-op leave-cluster-untouched → silent skip;
+     forced partial in-cluster merge → WARNING (contract §2.1 / §4.5 D4).
 (Backup-removal failure is covered headlessly in test_replay_units:
 ``remove_backup`` itself is contractually noexcept.)
 """
@@ -46,10 +51,16 @@ sys.path.insert(0, str(PACKAGE_PARENT))
 import ydd_symmetric_edit as addon  # noqa: E402
 from ydd_symmetric_edit import backup as yse_backup  # noqa: E402
 from ydd_symmetric_edit import core as yse_core  # noqa: E402
+from ydd_symmetric_edit import replay as yse_replay  # noqa: E402
 
 MARKER_OK = "YSE_MERGE_MODES_TEST_OK"
 MARKER_FAILED = "YSE_MERGE_MODES_TEST_FAILED"
 COORD_PRECISION = 5
+PARTIAL_MERGE_WARNING = "native merged this cluster only partially; its mirror was skipped"
+
+
+def merge_warnings() -> list[str]:
+    return [message for kind, message in yse_replay._MERGE_REPORTS if kind == "WARNING"]
 
 
 def fail(message: str = "") -> None:
@@ -580,7 +591,12 @@ def run_center_partial_symmetrize_case(window, area, region) -> None:
 
 
 def run_first_onplane_mixed_case(window, area, region) -> None:
-    """FIRST with an on-plane vertex mixed in: native only, no mirror pass."""
+    """FIRST + on-plane mixed (S5 D7 fixture): side-split with S shared.
+
+    Select {A, A', S}, history first = A.  Each side merges only its off-plane
+    member (singleton no-op); S stays as the shared link.  Result is
+    X-symmetric with both side survivors and no decline WARNING.
+    """
 
     clear_scene()
     obj = make_side_split_strip("YSE_MergeFirstOnPlane")
@@ -596,17 +612,107 @@ def run_first_onplane_mixed_case(window, area, region) -> None:
     assert result == {"FINISHED"}, result
 
     bm = bmesh.from_edit_mesh(obj.data)
-    # Native only: A, A', S all merge into A; no mirror pass runs.
-    assert len(bm.verts) == baseline_count - 2, (len(bm.verts), baseline_count)
+    # Singleton off-plane per side → no collapse; S remains as shared link.
+    assert len(bm.verts) == baseline_count, (len(bm.verts), baseline_count)
     present = vertex_coord_multiset(bm)
     assert present[coordinate_key((1.0, 0.0, 0.0))] == 1, present
-    assert present[coordinate_key((-1.0, 0.0, 0.0))] == 0, present
-    assert present[coordinate_key((0.0, 0.0, 0.0))] == 0, present
-    # The asymmetric result proves the mirror pass was skipped.
-    assert vertex_coord_multiset(bm) != mirrored_vertex_multiset(bm)
+    assert present[coordinate_key((-1.0, 0.0, 0.0))] == 1, present
+    assert present[coordinate_key((0.0, 0.0, 0.0))] == 1, present
+    assert_manifold_faces(bm, label="first on-plane result")
+    assert_x_symmetric(bm, label="first on-plane result")
+    assert_side_split_post_state(bm, source_x=1.0)
+    assert not merge_warnings(), f"D7 side-split must not WARNING-decline: {merge_warnings()}"
 
     leave_edit(window, area, region)
     print("YSE_MERGE_MODES_FIRST_ONPLANE_OK", flush=True)
+
+
+def run_first_onplane_tolerance_band_case(window, area, region) -> None:
+    """FIRST + near-plane vertex inside the tolerance band (0 < |x| <= tol).
+
+    §1.1 classifies such a vertex as on-plane, so it must be shared — not
+    leaked into a side merge by its nonzero sign (adversarial-review
+    boundary counterexample: a raw sign test absorbed it into the source
+    side and broke edge symmetry).
+    """
+
+    clear_scene()
+    obj = make_side_split_strip("YSE_MergeFirstOnPlaneBand")
+    bm = enter_edit(window, area, region, obj)
+    baseline_count = len(bm.verts)
+
+    # Nudge S off exact zero but inside the default Match Tolerance (1e-5).
+    nudge_x = 5.0e-6
+    band_vertex = None
+    for vertex in bm.verts:
+        if abs(vertex.co.x) <= 1.0e-8 and abs(vertex.co.y) <= 1.0e-8 and abs(vertex.co.z) <= 1.0e-8:
+            vertex.co.x = nudge_x
+            band_vertex = vertex
+            break
+    assert band_vertex is not None, "fixture is missing the on-plane vertex S"
+    # find_vertex rounds at 5 decimals, which straddles the nudge; select the
+    # band vertex by direct reference instead.  History first stays A.
+    select_vertices(bm, ((1.0, 0.0, 0.0), (-1.0, 0.0, 0.0)))
+    band_vertex.select = True
+    bm.select_history.add(band_vertex)
+    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+
+    with bpy.context.temp_override(window=window, area=area, region=region):
+        result = bpy.ops.mesh.ydd_symmetric_edit_merge(mode="FIRST")
+    assert result == {"FINISHED"}, result
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    # The band vertex is on-plane by §1.1: it must survive unmerged, and both
+    # side survivors must still exist (the old raw-sign partition absorbed it
+    # into the source side and dropped this invariant).
+    assert len(bm.verts) == baseline_count, (len(bm.verts), baseline_count)
+    near_plane = [
+        vertex
+        for vertex in bm.verts
+        if abs(vertex.co.x) <= 1.0e-5 and abs(vertex.co.y) <= 1.0e-8 and abs(vertex.co.z) <= 1.0e-8
+    ]
+    assert len(near_plane) == 1, [tuple(v.co) for v in near_plane]
+    present = vertex_coord_multiset(bm)
+    assert present[coordinate_key((1.0, 0.0, 0.0))] == 1, present
+    assert present[coordinate_key((-1.0, 0.0, 0.0))] == 1, present
+    assert_manifold_faces(bm, label="first on-plane band result")
+    assert not merge_warnings(), f"in-guarantee fixture must not WARNING: {merge_warnings()}"
+    assert_no_temp_layers(bm)
+    assert_no_backup_datablock()
+
+    leave_edit(window, area, region)
+    print("YSE_MERGE_MODES_FIRST_ONPLANE_BAND_OK", flush=True)
+
+
+def run_last_onplane_mixed_case(window, area, region) -> None:
+    """LAST + on-plane mixed: same shared-cluster rule, -X LAST target."""
+
+    clear_scene()
+    obj = make_side_split_strip("YSE_MergeLastOnPlane")
+    bm = enter_edit(window, area, region, obj)
+    baseline_count = len(bm.verts)
+
+    # History A, S, A' — LAST targets A' at (-1, 0, 0); S is shared on-plane.
+    select_vertices(bm, ((1.0, 0.0, 0.0), (0.0, 0.0, 0.0), (-1.0, 0.0, 0.0)))
+    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+
+    with bpy.context.temp_override(window=window, area=area, region=region):
+        result = bpy.ops.mesh.ydd_symmetric_edit_merge(mode="LAST")
+    assert result == {"FINISHED"}, result
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    assert len(bm.verts) == baseline_count, (len(bm.verts), baseline_count)
+    present = vertex_coord_multiset(bm)
+    assert present[coordinate_key((1.0, 0.0, 0.0))] == 1, present
+    assert present[coordinate_key((-1.0, 0.0, 0.0))] == 1, present
+    assert present[coordinate_key((0.0, 0.0, 0.0))] == 1, present
+    assert_manifold_faces(bm, label="last on-plane result")
+    assert_x_symmetric(bm, label="last on-plane result")
+    assert_side_split_post_state(bm, source_x=-1.0)
+    assert not merge_warnings(), f"D7 side-split must not WARNING-decline: {merge_warnings()}"
+
+    leave_edit(window, area, region)
+    print("YSE_MERGE_MODES_LAST_ONPLANE_OK", flush=True)
 
 
 def assert_no_temp_layers(bm) -> None:
@@ -622,17 +728,16 @@ def assert_no_backup_datablock() -> None:
 
 
 def run_partial_onplane_first_case(window, area, region) -> None:
-    """PARTIAL + on-plane vertex: the guard must fire BEFORE symmetrization,
-    so the unselected mirror vertex is never dragged into the native merge
-    (adversarial-review counterexample)."""
+    """PARTIAL + on-plane First: side-split with S shared after PARTIAL
+    symmetrization (D7).  B' is added by design and merges with A'."""
 
     clear_scene()
     obj = make_side_split_strip("YSE_MergePartialOnPlane")
     bm = enter_edit(window, area, region, obj)
     baseline_count = len(bm.verts)
 
-    # A, A', B and the on-plane S; history first = A.  B' stays unselected;
-    # the pair A/A' crosses while B's mirror B' is unselected -> PARTIAL.
+    # A, A', B and the on-plane S; history first = A.  B' starts unselected
+    # (PARTIAL); the side-split path symmetrizes then shares S on both sides.
     select_vertices(
         bm,
         (
@@ -649,15 +754,19 @@ def run_partial_onplane_first_case(window, area, region) -> None:
     assert result == {"FINISHED"}, result
 
     bm = bmesh.from_edit_mesh(obj.data)
-    # Native only, on the ORIGINAL selection: A, A', B, S merge into A.
-    assert len(bm.verts) == baseline_count - 3, (len(bm.verts), baseline_count)
+    # Source {A, B} → A; mirror {A', B'} → A'; S stays as shared link. Net −2.
+    assert len(bm.verts) == baseline_count - 2, (len(bm.verts), baseline_count)
     present = vertex_coord_multiset(bm)
     assert present[coordinate_key((1.0, 0.0, 0.0))] == 1, present
-    # B' was never selected and must survive at its place, unmerged.
-    assert present[coordinate_key((-1.0, 1.0, 0.0))] == 1, present
-    assert present[coordinate_key((-1.0, 0.0, 0.0))] == 0, present
-    b_mirror = find_vertex(bm, (-1.0, 1.0, 0.0))
-    assert not b_mirror.select, "B' must not have been added to the selection"
+    assert present[coordinate_key((-1.0, 0.0, 0.0))] == 1, present
+    assert present[coordinate_key((1.0, 1.0, 0.0))] == 0, present
+    assert present[coordinate_key((-1.0, 1.0, 0.0))] == 0, present
+    assert present[coordinate_key((0.0, 0.0, 0.0))] == 1, present
+    assert_manifold_faces(bm, label="partial on-plane result")
+    assert_x_symmetric(bm, label="partial on-plane result")
+    assert_side_split_post_state(bm, source_x=1.0)
+    # Contract §7-6: any WARNING at all fails an in-guarantee fixture.
+    assert not merge_warnings(), merge_warnings()
     assert_no_temp_layers(bm)
     assert_no_backup_datablock()
 
@@ -778,6 +887,137 @@ def run_backup_failure_side_split_case(window, area, region) -> None:
     print("YSE_MERGE_MODES_INJECT_BACKUP_OK", flush=True)
 
 
+def run_d4_partial_and_untouched_case(window, area, region) -> None:
+    """D4: untouched multi-survivor cluster is a silent skip; forced partial
+    in-cluster merge must WARNING and skip the mirror (contract §2.1)."""
+
+    # --- (c1) Native no-op: survivors == cluster size → no partial WARNING. ---
+    clear_scene()
+    vertices = (
+        (1.0, 0.0, 0.0),
+        (1.0, 1.0, 0.0),
+        (-1.0, 0.0, 0.0),
+        (-1.0, 1.0, 0.0),
+        (0.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+    )
+    faces = ((4, 0, 1, 5), (4, 5, 3, 2))
+    obj = make_object("YSE_MergeD4Untouched", vertices, faces)
+    bm = enter_edit(window, area, region, obj)
+    baseline_count = len(bm.verts)
+
+    # DISJOINT one-side selection {A, B}; mirrors exist but stay unselected.
+    select_vertices(bm, ((1.0, 0.0, 0.0), (1.0, 1.0, 0.0)))
+    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+
+    # Force a native no-op so all cluster members survive (survivors == size).
+    merge_cls = yse_replay.MESH_OT_ydd_symmetric_edit_merge
+    original_native = merge_cls._native
+
+    def noop_native(self):
+        del self
+        return {"FINISHED"}
+
+    merge_cls._native = noop_native  # type: ignore[method-assign]
+    try:
+        with bpy.context.temp_override(window=window, area=area, region=region):
+            result = bpy.ops.mesh.ydd_symmetric_edit_merge(mode="CENTER")
+    finally:
+        merge_cls._native = original_native  # type: ignore[method-assign]
+    assert result == {"FINISHED"}, result
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    # No-op native left the mesh untouched; mirror was skipped silently.
+    assert len(bm.verts) == baseline_count, (len(bm.verts), baseline_count)
+    assert PARTIAL_MERGE_WARNING not in merge_warnings(), merge_warnings()
+    assert_x_symmetric(bm, label="d4 untouched baseline still symmetric")
+    leave_edit(window, area, region)
+    print("YSE_MERGE_MODES_D4_UNTOUCHED_OK", flush=True)
+
+    # --- (c2) Forced partial native: 3 → 2 survivors → partial WARNING. ---
+    clear_scene()
+    vertices = (
+        (1.0, -1.0, 0.0),  # A
+        (1.0, 0.0, 0.0),  # B
+        (1.0, 1.0, 0.0),  # C
+        (-1.0, -1.0, 0.0),
+        (-1.0, 0.0, 0.0),
+        (-1.0, 1.0, 0.0),
+        (0.0, -1.0, 0.0),
+        (0.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+    )
+    faces = (
+        (6, 0, 1, 7),
+        (7, 1, 2, 8),
+        (6, 7, 4, 3),
+        (7, 8, 5, 4),
+    )
+    obj = make_object("YSE_MergeD4Partial", vertices, faces)
+    bm = enter_edit(window, area, region, obj)
+    baseline_count = len(bm.verts)
+
+    select_vertices(
+        bm,
+        (
+            (1.0, -1.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (1.0, 1.0, 0.0),
+        ),
+    )
+    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+
+    merge_cls = yse_replay.MESH_OT_ydd_symmetric_edit_merge
+    original_native = merge_cls._native
+
+    def partial_native(self):
+        """Merge only two of the three marked members so survivors stay at 2."""
+
+        del self
+        obj_local = bpy.context.edit_object
+        assert obj_local is not None
+        mesh_local = obj_local.data
+        bm_local = bmesh.from_edit_mesh(mesh_local)
+        group_layer = bm_local.verts.layers.int.get(yse_core.VERT_MERGE_GROUP_LAYER)
+        assert group_layer is not None, "group markers must exist before native"
+        marked = [vertex for vertex in bm_local.verts if int(vertex[group_layer]) > 0]
+        assert len(marked) >= 3, [coordinate_key(v.co) for v in marked]
+        # Pointmerge the first two only; the third keeps its marker.
+        bmesh.ops.pointmerge(
+            bm_local,
+            verts=marked[:2],
+            merge_co=marked[0].co.copy(),
+        )
+        bmesh.update_edit_mesh(mesh_local, loop_triangles=True, destructive=True)
+        return {"FINISHED"}
+
+    merge_cls._native = partial_native  # type: ignore[method-assign]
+    try:
+        with bpy.context.temp_override(window=window, area=area, region=region):
+            result = bpy.ops.mesh.ydd_symmetric_edit_merge(mode="CENTER")
+    finally:
+        merge_cls._native = original_native  # type: ignore[method-assign]
+    assert result == {"FINISHED"}, result
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    # One native pair merged (net −1); mirror skipped after partial WARNING.
+    assert len(bm.verts) == baseline_count - 1, (len(bm.verts), baseline_count)
+    assert PARTIAL_MERGE_WARNING in merge_warnings(), merge_warnings()
+    # Mirror pair on -X must remain unmerged (three verts still present).
+    mirror_keys = {
+        coordinate_key((-1.0, -1.0, 0.0)),
+        coordinate_key((-1.0, 0.0, 0.0)),
+        coordinate_key((-1.0, 1.0, 0.0)),
+    }
+    present = set(vertex_coord_multiset(bm))
+    assert mirror_keys <= present, (mirror_keys - present, present)
+    assert_no_temp_layers(bm)
+    assert_no_backup_datablock()
+
+    leave_edit(window, area, region)
+    print("YSE_MERGE_MODES_D4_PARTIAL_OK", flush=True)
+
+
 def run() -> None:
     addon.register()
     window, area, region = viewport_context()
@@ -791,9 +1031,12 @@ def run() -> None:
     run_center_self_mirrored_case(window, area, region)
     run_center_partial_symmetrize_case(window, area, region)
     run_first_onplane_mixed_case(window, area, region)
+    run_first_onplane_tolerance_band_case(window, area, region)
+    run_last_onplane_mixed_case(window, area, region)
     run_partial_onplane_first_case(window, area, region)
     run_pointmerge_failure_rollback_case(window, area, region)
     run_backup_failure_side_split_case(window, area, region)
+    run_d4_partial_and_untouched_case(window, area, region)
 
     print(MARKER_OK, flush=True)
     addon.unregister()

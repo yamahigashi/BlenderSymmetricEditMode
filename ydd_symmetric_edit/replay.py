@@ -263,6 +263,8 @@ def _set_vertex_path(
 # Test-visible Connect reports (Operator.report is not patchable; same pattern
 # as operators._FINISH_REPORTS).
 _CONNECT_REPORTS: list[tuple[str, str]] = []
+# Test-visible Merge reports (same constraint as Operator.report above).
+_MERGE_REPORTS: list[tuple[str, str]] = []
 # Last extracted R edge endpoint pairs (coords only) for intermediate asserts.
 _CONNECT_LAST_R: tuple[tuple[Vector, Vector], ...] = ()
 
@@ -275,11 +277,21 @@ def _connect_report(operator, level: set[str], message: str) -> None:
     operator.report(level, message)
 
 
+def _merge_report(operator, level: set[str], message: str) -> None:
+    """Report and record for Merge tests."""
+
+    kind = "WARNING" if "WARNING" in level else "ERROR" if "ERROR" in level else "INFO"
+    _MERGE_REPORTS.append((kind, message))
+    operator.report(level, message)
+
+
 def _report_missing(operator, count: int, *, partial: bool) -> None:
     if not count:
         return
     if partial:
-        operator.report(
+        # Merge-side report (the partial form is only used by Merge paths).
+        _merge_report(
+            operator,
             {"WARNING"},
             f"{count} vertices have no mirror counterpart; mirrored partially",
         )
@@ -291,8 +303,8 @@ def _report_missing(operator, count: int, *, partial: bool) -> None:
         )
 
 
-def _report_self_mirrored(operator) -> None:
-    _connect_report(
+def _report_self_mirrored(operator, recorder=None) -> None:
+    (recorder or _connect_report)(
         operator,
         {"INFO"},
         "Selection is symmetric; the native result is already symmetric",
@@ -300,7 +312,10 @@ def _report_self_mirrored(operator) -> None:
 
 
 def _report_partial_overlap(operator, action: str) -> None:
-    operator.report(
+    # Only Merge paths reach this helper since the Connect PARTIAL branch
+    # was replaced by the lift semantics.
+    _merge_report(
+        operator,
         {"WARNING"},
         f"Selection partially overlaps its mirror image; ran the native {action} only",
     )
@@ -1042,6 +1057,7 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
         return cast(set[str], bpy.ops.mesh.merge(type="LAST"))
 
     def execute(self, context):
+        _MERGE_REPORTS.clear()
         symmetry = _symmetry_parameters(context)
         if symmetry is None:
             return self._native()
@@ -1094,12 +1110,13 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
             if snapshot.overlap is MirrorOverlap.SELF_MIRRORED:
                 # CENTER's centroid lies on the plane; COLLAPSE's islands come
                 # in symmetric pairs.  One native run is already symmetric.
-                _report_self_mirrored(self)
+                _report_self_mirrored(self, _merge_report)
                 return self._native()
             # PARTIAL (complete): symmetrize the selection to reduce it to the
             # self-mirrored case, then run the native merge once.
             added = self._symmetrize_selection(bm, mesh, snapshot)
-            self.report(
+            _merge_report(
+                self,
                 {"INFO"},
                 f"Added {added} mirrored vertex(es) to the selection to keep the merge symmetric",
             )
@@ -1177,6 +1194,10 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
         expected_mirror_counts = tuple(
             sum(1 for index in cluster if index in snapshot.mirror_by_source) for cluster in clusters
         )
+        # Pre-native cluster sizes: used after native to distinguish a full
+        # no-op (survivors == size) from a partial in-cluster merge
+        # (1 < survivors < size).  Contract §2.1 / §4.5 D4.
+        cluster_sizes = {number: len(cluster) for number, cluster in enumerate(clusters, start=1)}
 
         # Mark members (+k) and their mirrors (-k) in a temporary layer so the
         # post-native re-identification is exact: a coordinate lookup would
@@ -1237,13 +1258,23 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
                     # selection island on a fully detached component); all its
                     # marked members then still exist.  Mirroring such a
                     # cluster would merge geometry the native operator never
-                    # merged.
+                    # merged.  A partial in-cluster merge (some but not all
+                    # members consumed) is a cluster-level decline under
+                    # §2.1 and must be visible (contract §4.5 D4).
                     if len(survivors) > 1:
+                        original_size = cluster_sizes.get(cluster_number, 0)
+                        if original_size and len(survivors) < original_size:
+                            _merge_report(
+                                self,
+                                {"WARNING"},
+                                "native merged this cluster only partially; its mirror was skipped",
+                            )
                         continue
                     mirrors = [vertex for vertex in mirror_verts_by_cluster.get(cluster_number, ()) if vertex.is_valid]
                     if not mirrors:
                         if expected_mirrors:
-                            self.report(
+                            _merge_report(
+                                self,
                                 {"WARNING"},
                                 "Mirror merge skipped for one cluster: its mirrored vertices could not be re-identified",
                             )
@@ -1254,7 +1285,8 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
                         # stays connected.
                         survivor = survivors[0] if survivors and survivors[0].is_valid else None
                         if survivor is None:
-                            self.report(
+                            _merge_report(
+                                self,
                                 {"WARNING"},
                                 "Mirror merge skipped for one cluster: the on-plane survivor could not be identified",
                             )
@@ -1286,7 +1318,7 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
             backup.remove_backup(backup_mesh)
         try:
             if mirror_warning:
-                self.report({"WARNING"}, mirror_warning)
+                _merge_report(self, {"WARNING"}, mirror_warning)
         except Exception:
             traceback.print_exc()
         return result
@@ -1302,7 +1334,16 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
         history_indices: tuple[int, ...],
     ) -> set[str]:
         """FIRST/LAST on a self-mirrored selection: merge each side to its own
-        endpoint (5-2).  One native run would drag both sides to one point."""
+        endpoint (5-2).  One native run would drag both sides to one point.
+
+        On-plane vertices in the extended selection are shared by both side
+        clusters (contract §4.5 D7) but are **not** collapsed into either
+        side's target: each side merges only its off-plane members, and the
+        on-plane verts stay put so both survivors remain linked through them
+        (sequential stand-in for "each cluster = off-plane ∪ on-plane").
+        Feeding on-plane verts into the source-only native merge would absorb
+        them asymmetrically and break edge X-symmetry.
+        """
 
         # Step 1: fix the merge target from the ORIGINAL history, before any
         # selection changes; it must not move for the rest of the procedure.
@@ -1323,34 +1364,51 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
             # first — by design — so its native result is symmetric too.
             if snapshot.overlap is MirrorOverlap.PARTIAL:
                 added = self._symmetrize_selection(bm, mesh, snapshot)
-                self.report(
+                _merge_report(
+                    self,
                     {"INFO"},
                     f"Added {added} mirrored vertex(es) to the selection to keep the merge symmetric",
                 )
-            _report_self_mirrored(self)
-            return self._native()
-        if any(abs(coords[index][axis_index]) <= tolerance for index in extended_selection):
-            # An on-plane vertex belongs to both sides at once; the merge runs
-            # natively on the ORIGINAL selection only.
-            self.report(
-                {"WARNING"},
-                "Selection includes on-plane vertices; ran the native merge only",
-            )
+            _report_self_mirrored(self, _merge_report)
             return self._native()
 
-        # Step 2: the side containing the target is the source side.
+        # Step 2: side partition.  Off-plane verts go to the half-space of
+        # their X sign; on-plane verts are shared (kept, not side-merged).
         source_sign = 1.0 if target_co[axis_index] > 0.0 else -1.0
-        source_side = {index for index in extended_selection if coords[index][axis_index] * source_sign > 0.0}
-        mirror_side = extended_selection - source_side
+        on_plane = {index for index in extended_selection if abs(coords[index][axis_index]) <= tolerance}
+        # Off-plane only — on_plane is excluded from both merge sets so it
+        # survives as the shared link between the two side survivors (§4.5 D7).
+        # The exclusion must be explicit: a vertex with 0 < |x| <= tolerance is
+        # on-plane by §1.1 yet has a nonzero sign, so a raw sign test alone
+        # would leak it into a side merge (adversarial-review finding).
+        source_side = {
+            index
+            for index in extended_selection
+            if index not in on_plane and coords[index][axis_index] * source_sign > 0.0
+        }
+        mirror_side = {
+            index
+            for index in extended_selection
+            if index not in on_plane and coords[index][axis_index] * source_sign < 0.0
+        }
 
-        # Step 3 verification, still before any mutation: the rebuilt history
-        # must keep the original endpoint.
+        # Step 3: rebuild per-side history.  target_index is always the FIRST
+        # or LAST entry of history_indices and, being the off-plane merge
+        # target, always sits in source_side.  Therefore the rebuilt endpoint
+        # equals target_index structurally (contract §4.5 D8: the old
+        # "rebuild failed → native only" branch was unreachable).
         source_history = [index for index in history_indices if index in source_side]
         rebuilt_endpoint = None
         if source_history:
             rebuilt_endpoint = source_history[0] if self.mode == "FIRST" else source_history[-1]
         if rebuilt_endpoint != target_index:
-            self.report(
+            # Unreachable under Blender's own invariant (select_history is a
+            # subset of the selection, so the off-plane target stays in
+            # source_side).  Externally mutated histories can break that
+            # invariant, so degrade gracefully instead of crashing: the
+            # native merge runs on the original selection, nothing mutated.
+            _merge_report(
+                self,
                 {"WARNING"},
                 "Could not rebuild a per-side merge history; ran the native merge only",
             )
@@ -1360,14 +1418,16 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
         # reported), then group markers, then the source-side rebuild.
         if snapshot.overlap is MirrorOverlap.PARTIAL:
             added = self._symmetrize_selection(bm, mesh, snapshot)
-            self.report(
+            _merge_report(
+                self,
                 {"INFO"},
                 f"Added {added} mirrored vertex(es) to the selection to keep the merge symmetric",
             )
 
         # Group markers (source=1, mirror=2) make the post-native
         # re-identification exact; a coordinate lookup could confuse
-        # coincident vertices (review finding).  Layer creation invalidates
+        # coincident vertices (review finding).  On-plane verts stay unmarked
+        # (not part of either side merge).  Layer creation invalidates
         # wrappers, hence the fresh lookup table.
         group_layer = bm.verts.layers.int.get(core.VERT_MERGE_GROUP_LAYER)
         if group_layer is not None:
@@ -1380,8 +1440,9 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
             bm.verts[index][group_layer] = 2
 
         # Deselecting alone does not remove a vertex from the history, so the
-        # history is always rebuilt explicitly.
-        for index in sorted(mirror_side):
+        # history is always rebuilt explicitly.  Mirror off-plane and on-plane
+        # verts are deselected so native only sees the source off-plane set.
+        for index in sorted(mirror_side | on_plane):
             bm.verts[index].select = False
         for index in sorted(source_side):
             bm.verts[index].select = True
@@ -1474,10 +1535,14 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
             backup.remove_backup(backup_mesh)
         try:
             if mirror_warning:
-                self.report({"WARNING"}, mirror_warning)
+                _merge_report(self, {"WARNING"}, mirror_warning)
             else:
                 side_label = "first" if self.mode == "FIRST" else "last"
-                self.report({"INFO"}, f"Merged each side to its own {side_label} vertex")
+                _merge_report(
+                    self,
+                    {"INFO"},
+                    f"Merged each side to its own {side_label} vertex",
+                )
         except Exception:
             traceback.print_exc()
         return result
