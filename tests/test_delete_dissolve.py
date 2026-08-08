@@ -16,9 +16,16 @@ Cases (serial, timer-driven):
   (d) dissolve_faces: two adjacent +X faces → both sides merge, X-symmetric.
   (e) dissolve_mode dispatch: vert select mode → VERTS-equivalent result.
   (f) hidden mirror vertex → CANCELLED + WARNING, mesh unchanged.
-  (g) fault-injected asymmetric native → WARNING rolled back, topology restored.
+  (g) fault-injected asymmetric native → WARNING rolled back, topology restored
+      + pre-expansion one-sided selection (T5 / F4).
   (h) after (d), one undo restores pre-dissolve topology counts.
   (i) symmetry axes off → native passthrough (one side only).
+  (t1) native exception fault → WARNING + full topology restore + FINISHED.
+  (t2) backup creation fault → ERROR + CANCELLED + mesh/selection unchanged.
+  (t3) census multiset cancel: equal unmatched count, different signatures →
+      rollback (F5).
+  (t4) dissolve_mode EDGES use_verts default True (2-valence verts melt) +
+      FACES dispatch.
 """
 
 from __future__ import annotations
@@ -160,6 +167,14 @@ def set_addon_enabled(value: bool) -> None:
 
 def dissolve_warnings() -> list[str]:
     return [message for kind, message in yse_delete._DELETE_REPORTS if kind == "WARNING"]
+
+
+def dissolve_errors() -> list[str]:
+    return [message for kind, message in yse_delete._DELETE_REPORTS if kind == "ERROR"]
+
+
+def selected_vertex_keys(bm) -> list[tuple]:
+    return sorted(coordinate_key(vertex.co) for vertex in bm.verts if vertex.select)
 
 
 def dissolve_mode_addon_routes() -> list[tuple[str, str, int, bool]]:
@@ -461,8 +476,12 @@ def case_g_fault_injection(window, area, region) -> None:
     before_verts = vertex_coord_multiset(bm)
     clear_selection(bm)
     target = find_internal_plus_x_vertex(bm)
+    target_key = coordinate_key(target.co)
+    mirror_key_val = coordinate_key((-float(target.co.x), float(target.co.y), float(target.co.z)))
     target.select = True
     bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+    pre_selection = selected_vertex_keys(bm)
+    assert pre_selection == [target_key], pre_selection
 
     original = yse_delete._native_dissolve_call
 
@@ -498,10 +517,243 @@ def case_g_fault_injection(window, area, region) -> None:
         after = topology_counts(bm)
         assert after == before, f"rollback did not restore topology: {after} != {before}"
         assert vertex_coord_multiset(bm) == before_verts
+        # T5 / F4: backup taken before expansion → one-sided selection restored.
+        post_selection = selected_vertex_keys(bm)
+        assert post_selection == [target_key], f"expected pre-expansion selection {target_key}, got {post_selection}"
+        assert mirror_key_val not in post_selection
         print(f"YSE_DELETE_DISSOLVE_G_WARNINGS={warnings}", flush=True)
+        print(f"YSE_DELETE_DISSOLVE_G_SELECTION={post_selection}", flush=True)
         print("YSE_DELETE_DISSOLVE_G_OK", flush=True)
     finally:
         yse_delete._native_dissolve_call = original
+
+
+def case_t1_native_exception(window, area, region) -> None:
+    """T1: _native_dissolve_call raises → WARNING + topology restored + FINISHED."""
+
+    obj, before = replace_with_symmetric_grid(window, area, region)
+    bm = ensure_edit(window, area, region, obj)
+    before_verts = vertex_coord_multiset(bm)
+    clear_selection(bm)
+    target = find_internal_plus_x_vertex(bm)
+    target_key = coordinate_key(target.co)
+    target.select = True
+    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+
+    original = yse_delete._native_dissolve_call
+
+    def _raise(_mode, _options):
+        raise RuntimeError("injected native dissolve failure")
+
+    yse_delete._native_dissolve_call = _raise
+    try:
+        yse_delete._DELETE_REPORTS.clear()
+        with bpy.context.temp_override(window=window, area=area, region=region):
+            result = bpy.ops.mesh.ydd_symmetric_edit_dissolve(mode="VERTS")
+        assert result == {"FINISHED"}, result
+        warnings = dissolve_warnings()
+        assert any("native dissolve failed; rolled back" in message for message in warnings), warnings
+        bm = bmesh.from_edit_mesh(obj.data)
+        assert topology_counts(bm) == before, topology_counts(bm)
+        assert vertex_coord_multiset(bm) == before_verts
+        assert selected_vertex_keys(bm) == [target_key]
+        print(f"YSE_DELETE_DISSOLVE_T1_WARNINGS={warnings}", flush=True)
+        print("YSE_DELETE_DISSOLVE_T1_OK", flush=True)
+    finally:
+        yse_delete._native_dissolve_call = original
+
+
+def case_t2_backup_failure(window, area, region) -> None:
+    """T2: create_topology_backup raises → ERROR + CANCELLED + no mesh change."""
+
+    from ydd_symmetric_edit import backup as yse_backup
+
+    obj, before = replace_with_symmetric_grid(window, area, region)
+    bm = ensure_edit(window, area, region, obj)
+    before_verts = vertex_coord_multiset(bm)
+    clear_selection(bm)
+    target = find_internal_plus_x_vertex(bm)
+    target_key = coordinate_key(target.co)
+    target.select = True
+    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+
+    original = yse_backup.create_topology_backup
+
+    def _broken(_bm):
+        raise RuntimeError("injected backup failure")
+
+    yse_backup.create_topology_backup = _broken
+    try:
+        yse_delete._DELETE_REPORTS.clear()
+        ops_error = None
+        with bpy.context.temp_override(window=window, area=area, region=region):
+            try:
+                result = bpy.ops.mesh.ydd_symmetric_edit_dissolve(mode="VERTS")
+            except RuntimeError as exc:
+                # Blender surfaces operator.report({ERROR}) as a Python
+                # RuntimeError even when the operator returned CANCELLED.
+                ops_error = exc
+                result = {"CANCELLED"}
+        assert result == {"CANCELLED"}, (result, ops_error)
+        errors = dissolve_errors()
+        assert any("backup creation failed" in message for message in errors), errors
+        if ops_error is not None:
+            assert "backup" in str(ops_error).lower(), ops_error
+        bm = bmesh.from_edit_mesh(obj.data)
+        assert topology_counts(bm) == before, topology_counts(bm)
+        assert vertex_coord_multiset(bm) == before_verts
+        assert selected_vertex_keys(bm) == [target_key]
+        print(f"YSE_DELETE_DISSOLVE_T2_ERRORS={errors}", flush=True)
+        print("YSE_DELETE_DISSOLVE_T2_OK", flush=True)
+    finally:
+        yse_backup.create_topology_backup = original
+
+
+def case_t3_census_multiset(window, area, region) -> None:
+    """T3: equal unmatched *count* at different positions still rolls back (F5)."""
+
+    obj, before = replace_with_symmetric_grid(window, area, region)
+    bm = ensure_edit(window, area, region, obj)
+    # One pre-existing unmatched vertex so census is non-empty.
+    outlier = bm.verts.new((3.5, 0.25, 0.0))
+    outlier_key = coordinate_key(outlier.co)
+    bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=True)
+    bm = bmesh.from_edit_mesh(obj.data)
+    before = topology_counts(bm)
+    before_verts = vertex_coord_multiset(bm)
+    assert outlier_key in before_verts
+
+    clear_selection(bm)
+    target = find_internal_plus_x_vertex(bm)
+    target.select = True
+    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+
+    original = yse_delete._native_dissolve_call
+
+    def _cancel_preserving_count(mode, options):
+        result = original(mode, options)
+        edit_obj = bpy.context.edit_object
+        if edit_obj is None:
+            return result
+        mesh = edit_obj.data
+        live = bmesh.from_edit_mesh(mesh)
+        # Remove the original outlier and plant a different asymmetric vertex.
+        doomed = None
+        for vertex in live.verts:
+            if coordinate_key(vertex.co) == outlier_key:
+                doomed = vertex
+                break
+        if doomed is not None:
+            bmesh.ops.delete(live, geom=[doomed], context="VERTS")
+        live.verts.new((3.7, -0.4, 0.0))
+        bmesh.update_edit_mesh(mesh, loop_triangles=True, destructive=True)
+        return result
+
+    yse_delete._native_dissolve_call = _cancel_preserving_count
+    try:
+        yse_delete._DELETE_REPORTS.clear()
+        with bpy.context.temp_override(window=window, area=area, region=region):
+            result = bpy.ops.mesh.ydd_symmetric_edit_dissolve(mode="VERTS")
+        assert result == {"FINISHED"}, result
+        warnings = dissolve_warnings()
+        assert any("rolled back" in message for message in warnings), warnings
+        bm = bmesh.from_edit_mesh(obj.data)
+        assert topology_counts(bm) == before, (topology_counts(bm), before)
+        assert vertex_coord_multiset(bm) == before_verts
+        print(f"YSE_DELETE_DISSOLVE_T3_WARNINGS={warnings}", flush=True)
+        print("YSE_DELETE_DISSOLVE_T3_OK", flush=True)
+    finally:
+        yse_delete._native_dissolve_call = original
+
+
+def _build_symmetric_edge_strip(window, area, region):
+    """X-symmetric 1×4 face strip (5×2 verts) for EDGES use_verts tests."""
+
+    with bpy.context.temp_override(window=window, area=area, region=region):
+        if bpy.context.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+
+    for old in tuple(bpy.data.objects):
+        if old.type == "MESH":
+            bpy.data.objects.remove(old, do_unlink=True)
+
+    with bpy.context.temp_override(window=window, area=area, region=region):
+        bpy.ops.mesh.primitive_plane_add(location=(0.0, 0.0, 0.0))
+    obj = bpy.context.view_layer.objects.active
+    assert obj is not None
+    set_cube_symmetry(obj, x=True)
+
+    bm = ensure_edit(window, area, region, obj)
+    bmesh.ops.delete(bm, geom=list(bm.verts), context="VERTS")
+    # Columns at x = -2,-1,0,1,2 ; rows y = 0,1 → self-mirrored about X=0.
+    verts = {}
+    for j in (0, 1):
+        for i in range(-2, 3):
+            verts[(i, j)] = bm.verts.new((float(i), float(j), 0.0))
+    for i in range(-2, 2):
+        bm.faces.new((verts[(i, 0)], verts[(i + 1, 0)], verts[(i + 1, 1)], verts[(i, 1)]))
+    bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=True)
+    bm = bmesh.from_edit_mesh(obj.data)
+    assert_x_symmetric(bm, label="edge strip baseline")
+    return obj, topology_counts(bm)
+
+
+def case_t4_dissolve_mode_edges_faces(window, area, region) -> None:
+    """T4: EDGES dispatch melts 2-valence verts (use_verts default True); FACES."""
+
+    obj, before = _build_symmetric_edge_strip(window, area, region)
+    bm = ensure_edit(window, area, region, obj)
+    clear_selection(bm)
+    # Select +X interior vertical edge at x=1 (mirror at x=-1 is expanded).
+    edge = None
+    for candidate in bm.edges:
+        a, b = candidate.verts
+        if abs(float(a.co.x) - float(b.co.x)) > 1e-6:
+            continue
+        if abs(float(a.co.x) - 1.0) > 1e-6:
+            continue
+        edge = candidate
+        break
+    assert edge is not None, "vertical edge at x=1 missing"
+    edge.select = True
+    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+
+    with bpy.context.temp_override(window=window, area=area, region=region):
+        bpy.context.tool_settings.mesh_select_mode = (False, True, False)
+        result = bpy.ops.mesh.ydd_symmetric_edit_dissolve_mode()
+    assert result == {"FINISHED"}, result
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    after = topology_counts(bm)
+    # With use_verts=True, dissolving mirrored interior vertical edges melts
+    # the 2-valence verts at |x|=1 → net verts drop by more than edges alone.
+    # use_verts=False would keep those verts (probe: 10 verts stay vs melt).
+    assert after[0] < before[0], (before, after)
+    # Columns -2,0,2 remain (6 verts) if both ±1 columns melt fully.
+    assert after[0] <= before[0] - 2, (before, after)
+    assert_x_symmetric(bm, label="t4 after dissolve_mode edges")
+    print(f"YSE_DELETE_DISSOLVE_T4_EDGES={before}->{after}", flush=True)
+
+    # FACES dispatch: adjacent +X faces via dissolve_mode.
+    obj, before_f = replace_with_symmetric_grid(window, area, region)
+    bm = ensure_edit(window, area, region, obj)
+    clear_selection(bm)
+    face_a, face_b = find_adjacent_plus_x_faces(bm)
+    face_a.select = True
+    face_b.select = True
+    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+
+    with bpy.context.temp_override(window=window, area=area, region=region):
+        bpy.context.tool_settings.mesh_select_mode = (False, False, True)
+        result = bpy.ops.mesh.ydd_symmetric_edit_dissolve_mode()
+    assert result == {"FINISHED"}, result
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    after_f = topology_counts(bm)
+    assert after_f[2] < before_f[2], (before_f, after_f)
+    assert_x_symmetric(bm, label="t4 after dissolve_mode faces")
+    print(f"YSE_DELETE_DISSOLVE_T4_FACES={before_f}->{after_f}", flush=True)
+    print("YSE_DELETE_DISSOLVE_T4_OK", flush=True)
 
 
 def case_i_passthrough(window, area, region) -> None:
@@ -542,6 +794,10 @@ def run_all() -> None:
     case_e_dissolve_mode(window, area, region)
     case_f_hidden(window, area, region)
     case_g_fault_injection(window, area, region)
+    case_t1_native_exception(window, area, region)
+    case_t2_backup_failure(window, area, region)
+    case_t3_census_multiset(window, area, region)
+    case_t4_dissolve_mode_edges_faces(window, area, region)
     case_i_passthrough(window, area, region)
 
 

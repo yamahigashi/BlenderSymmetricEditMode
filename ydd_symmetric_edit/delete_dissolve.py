@@ -4,14 +4,15 @@
 
 from __future__ import annotations
 
+import math
 import traceback
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, cast
 
 import bmesh
 import bpy
-from bpy.props import BoolProperty, EnumProperty
+from bpy.props import BoolProperty, EnumProperty, FloatProperty
 
 from . import backup, core
 from .replay import _symmetry_parameters
@@ -165,10 +166,11 @@ def plan_leading_domain_expansion(
             if partner == vertex.index:
                 continue
             counterpart = bm.verts[partner]
-            if counterpart.select:
-                continue
+            # Hidden first: a hidden+selected counterpart must still decline.
             if counterpart.hide:
                 hidden_counterpart_count += 1
+                continue
+            if counterpart.select:
                 continue
             add_verts.append(partner)
 
@@ -183,10 +185,10 @@ def plan_leading_domain_expansion(
             if partner == edge.index:
                 continue
             counterpart = bm.edges[partner]
-            if counterpart.select:
-                continue
             if counterpart.hide:
                 hidden_counterpart_count += 1
+                continue
+            if counterpart.select:
                 continue
             add_edges.append(partner)
 
@@ -201,10 +203,10 @@ def plan_leading_domain_expansion(
             if partner == face.index:
                 continue
             counterpart = bm.faces[partner]
-            if counterpart.select:
-                continue
             if counterpart.hide:
                 hidden_counterpart_count += 1
+                continue
+            if counterpart.select:
                 continue
             add_faces.append(partner)
 
@@ -304,6 +306,32 @@ _DISSOLVE_DOMAINS: dict[str, tuple[str, ...]] = {
 }
 
 
+def _quantize_co_key(co, tolerance: float) -> tuple[float, float, float]:
+    """Round-bin coordinate key used by the unmatched multiset census."""
+
+    scale = max(float(tolerance), 1.0e-12)
+    return (
+        round(round(float(co[0]) / scale) * scale, 12),
+        round(round(float(co[1]) / scale) * scale, 12),
+        round(round(float(co[2]) / scale) * scale, 12),
+    )
+
+
+def _native_op_kwargs(op, options: dict) -> dict:
+    """Keep only kwargs that the native operator RNA actually exposes.
+
+    5.2-only dissolve_edges properties (angle_threshold / use_preserve_quads)
+    must not be forwarded on 4.2, where the RNA lacks them.
+    """
+
+    try:
+        rna = op.get_rna_type()
+        allowed = {prop.identifier for prop in rna.properties if not prop.is_readonly and prop.identifier != "rna_type"}
+    except Exception:
+        return dict(options)
+    return {key: value for key, value in options.items() if key in allowed}
+
+
 def _native_dissolve_call(mode: str, options: dict) -> set[str]:
     """Invoke the matching native dissolve operator once.
 
@@ -312,43 +340,47 @@ def _native_dissolve_call(mode: str, options: dict) -> set[str]:
     """
 
     if mode == "VERTS":
-        return cast(
-            set[str],
-            bpy.ops.mesh.dissolve_verts(
-                use_face_split=bool(options.get("use_face_split", False)),
-                use_boundary_tear=bool(options.get("use_boundary_tear", False)),
-            ),
-        )
+        op = bpy.ops.mesh.dissolve_verts
+        return cast(set[str], op(**_native_op_kwargs(op, options)))
     if mode == "EDGES":
-        return cast(
-            set[str],
-            bpy.ops.mesh.dissolve_edges(
-                use_verts=bool(options.get("use_verts", True)),
-                use_face_split=bool(options.get("use_face_split", False)),
-            ),
-        )
+        op = bpy.ops.mesh.dissolve_edges
+        return cast(set[str], op(**_native_op_kwargs(op, options)))
     if mode == "FACES":
-        return cast(
-            set[str],
-            bpy.ops.mesh.dissolve_faces(
-                use_verts=bool(options.get("use_verts", False)),
-            ),
-        )
+        op = bpy.ops.mesh.dissolve_faces
+        return cast(set[str], op(**_native_op_kwargs(op, options)))
     raise ValueError(f"unknown dissolve mode: {mode!r}")
 
 
 def _symmetry_census(
     pair_maps: ElementPairMaps,
     bm: bmesh.types.BMesh,
-) -> tuple[int, int, int]:
-    """Count unmatched verts / edges / faces for post-dissolve verification.
+    tolerance: float,
+) -> tuple[Counter, Counter, Counter]:
+    """Multiset of unmatched element signatures for post-dissolve verification.
 
-    Verts: not present in the pair table. Edges/faces: pair map value is None.
+    Verts: quantized coordinate keys of vertices absent from the pair table.
+    Edges / faces: frozenset of endpoint (or loop) coordinate keys when the
+    pair-map value is None.  Equality of the three Counters is the census
+    check, so equal unmatched *counts* at different positions still fail.
     """
 
-    unmatched_verts = sum(1 for vertex in bm.verts if vertex.index not in pair_maps.vert_pairs)
-    unmatched_edges = sum(1 for partner in pair_maps.edge_pair_by_index.values() if partner is None)
-    unmatched_faces = sum(1 for partner in pair_maps.face_pair_by_index.values() if partner is None)
+    unmatched_verts: Counter = Counter()
+    for vertex in bm.verts:
+        if vertex.index not in pair_maps.vert_pairs:
+            unmatched_verts[_quantize_co_key(vertex.co, tolerance)] += 1
+
+    unmatched_edges: Counter = Counter()
+    for edge in bm.edges:
+        if pair_maps.edge_pair_by_index.get(edge.index) is None:
+            key = frozenset(_quantize_co_key(vertex.co, tolerance) for vertex in edge.verts)
+            unmatched_edges[key] += 1
+
+    unmatched_faces: Counter = Counter()
+    for face in bm.faces:
+        if pair_maps.face_pair_by_index.get(face.index) is None:
+            key = frozenset(_quantize_co_key(vertex.co, tolerance) for vertex in face.verts)
+            unmatched_faces[key] += 1
+
     return unmatched_verts, unmatched_edges, unmatched_faces
 
 
@@ -443,6 +475,43 @@ class MESH_OT_ydd_symmetric_edit_delete(bpy.types.Operator):
         return result
 
 
+def _native_dissolve_mode_has(prop_name: str) -> bool:
+    """Whether native mesh.dissolve_mode exposes *prop_name* on this Blender."""
+
+    try:
+        # getattr: bpy type stubs treat ops as bound methods that demand self.
+        op = getattr(bpy.ops.mesh, "dissolve_mode")  # noqa: B009
+        rna = op.get_rna_type()
+        return prop_name in rna.properties
+    except Exception:
+        return False
+
+
+def _operator_property_is_set(operator, name: str) -> bool:
+    """Return whether *name* was explicitly set on an operator instance.
+
+    Prefer ``Operator.properties.is_property_set`` — calling
+    ``operator.is_property_set`` is not available on all Blender versions'
+    Operator RNA.
+    """
+
+    props = getattr(operator, "properties", None)
+    if props is not None:
+        checker = getattr(props, "is_property_set", None)
+        if callable(checker):
+            try:
+                return bool(checker(name))
+            except (TypeError, AttributeError):
+                pass
+    checker = getattr(operator, "is_property_set", None)
+    if callable(checker):
+        try:
+            return bool(checker(name))
+        except (TypeError, AttributeError):
+            pass
+    return False
+
+
 class MESH_OT_ydd_symmetric_edit_dissolve(bpy.types.Operator):
     """Expand the selection to mirrored counterparts, then dissolve once."""
 
@@ -455,6 +524,8 @@ class MESH_OT_ydd_symmetric_edit_dissolve(bpy.types.Operator):
         use_verts: bool
         use_face_split: bool
         use_boundary_tear: bool
+        angle_threshold: float
+        use_preserve_quads: bool
     else:
         mode: EnumProperty(
             name="Mode",
@@ -477,6 +548,20 @@ class MESH_OT_ydd_symmetric_edit_dissolve(bpy.types.Operator):
             description="Split off face corners instead of merging faces",
             default=False,
         )
+        # Native dissolve_edges / dissolve_mode (Blender 5.2): ANGLE, default π.
+        angle_threshold: FloatProperty(
+            name="Max Angle",
+            description="Maximum face angle for dissolving vertices along the edge",
+            subtype="ANGLE",
+            default=math.pi,
+            min=0.0,
+            max=math.pi,
+        )
+        use_preserve_quads: BoolProperty(
+            name="Preserve Quads",
+            description="Do not dissolve vertices that form a quad face",
+            default=True,
+        )
 
     @classmethod
     def poll(cls, context):
@@ -494,6 +579,10 @@ class MESH_OT_ydd_symmetric_edit_dissolve(bpy.types.Operator):
         elif self.mode == "EDGES":
             layout.prop(self, "use_verts")
             layout.prop(self, "use_face_split")
+            if _native_dissolve_mode_has("angle_threshold"):
+                layout.prop(self, "angle_threshold")
+            if _native_dissolve_mode_has("use_preserve_quads"):
+                layout.prop(self, "use_preserve_quads")
         else:
             layout.prop(self, "use_verts")
 
@@ -508,6 +597,8 @@ class MESH_OT_ydd_symmetric_edit_dissolve(bpy.types.Operator):
             return {
                 "use_verts": bool(self.use_verts),
                 "use_face_split": bool(self.use_face_split),
+                "angle_threshold": float(self.angle_threshold),
+                "use_preserve_quads": bool(self.use_preserve_quads),
             }
         return {"use_verts": bool(self.use_verts)}
 
@@ -542,14 +633,12 @@ class MESH_OT_ydd_symmetric_edit_dissolve(bpy.types.Operator):
             )
             return {"CANCELLED"}
 
-        census_before = _symmetry_census(pair_maps, bm)
+        census_before = _symmetry_census(pair_maps, bm, tolerance)
 
-        apply_expansion_plan(bm, plan)
-        bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
-
+        # Backup before expansion so census rollback restores the original
+        # one-sided selection (select flags are part of the mesh backup).
         backup_mesh = None
         try:
-            bm = bmesh.from_edit_mesh(mesh)
             try:
                 backup_mesh = backup.create_topology_backup(bm)
             except Exception:
@@ -559,49 +648,70 @@ class MESH_OT_ydd_symmetric_edit_dissolve(bpy.types.Operator):
                     {"ERROR"},
                     "backup creation failed; dissolve aborted",
                 )
-                bm = bmesh.from_edit_mesh(mesh)
-                _restore_expansion_selection(bm, plan)
-                bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
                 return {"CANCELLED"}
 
-            result = _native_dissolve_call(cast(_DissolveMode, self.mode), self._options())
+            apply_expansion_plan(bm, plan)
+            bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
 
-            if "CANCELLED" in result and "FINISHED" not in result:
-                bm = bmesh.from_edit_mesh(mesh)
-                _restore_expansion_selection(bm, plan)
-                bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+            try:
+                result = _native_dissolve_call(cast(_DissolveMode, self.mode), self._options())
+
+                if "CANCELLED" in result and "FINISHED" not in result:
+                    bm = bmesh.from_edit_mesh(mesh)
+                    _restore_expansion_selection(bm, plan)
+                    bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+                    return result
+
+                if plan.unmatched_count == 0:
+                    bm = bmesh.from_edit_mesh(mesh)
+                    pair_maps_after = build_element_pair_maps(bm, axis_index, tolerance)
+                    census_after = _symmetry_census(pair_maps_after, bm, tolerance)
+                    if census_before != census_after:
+                        try:
+                            backup.restore_topology_backup(mesh, backup_mesh)
+                        except Exception:
+                            traceback.print_exc()
+                            _delete_report(
+                                self,
+                                {"ERROR"},
+                                "mirrored dissolve produced an asymmetric result; rollback failed",
+                            )
+                        else:
+                            _delete_report(
+                                self,
+                                {"WARNING"},
+                                "mirrored dissolve produced an asymmetric result; rolled back",
+                            )
+                        return {"FINISHED"}
+
+                if plan.unmatched_count > 0:
+                    _delete_report(
+                        self,
+                        {"INFO"},
+                        f"{plan.unmatched_count} element(s) had no mirrored counterpart",
+                    )
                 return result
-
-            if plan.unmatched_count == 0:
-                bm = bmesh.from_edit_mesh(mesh)
-                pair_maps_after = build_element_pair_maps(bm, axis_index, tolerance)
-                census_after = _symmetry_census(pair_maps_after, bm)
-                if census_before != census_after:
-                    try:
-                        backup.restore_topology_backup(mesh, backup_mesh)
-                    except Exception:
-                        traceback.print_exc()
-                        _delete_report(
-                            self,
-                            {"ERROR"},
-                            "mirrored dissolve produced an asymmetric result; rollback failed",
-                        )
-                    else:
-                        _delete_report(
-                            self,
-                            {"WARNING"},
-                            "mirrored dissolve produced an asymmetric result; rolled back",
-                        )
-                    return {"FINISHED"}
-
-            if plan.unmatched_count > 0:
-                _delete_report(
-                    self,
-                    {"INFO"},
-                    f"{plan.unmatched_count} element(s) had no mirrored counterpart",
-                )
-            return result
+            except Exception:
+                # F1: protect native dissolve + census path (merge/connect shape).
+                traceback.print_exc()
+                try:
+                    backup.restore_topology_backup(mesh, backup_mesh)
+                except Exception:
+                    traceback.print_exc()
+                    _delete_report(
+                        self,
+                        {"ERROR"},
+                        "native dissolve failed; rollback failed",
+                    )
+                else:
+                    _delete_report(
+                        self,
+                        {"WARNING"},
+                        "native dissolve failed; rolled back",
+                    )
+                return {"FINISHED"}
         finally:
+            # F10: layer cleanup must not prevent backup removal.
             try:
                 if obj.mode == "EDIT":
                     bm = bmesh.from_edit_mesh(mesh)
@@ -609,7 +719,8 @@ class MESH_OT_ydd_symmetric_edit_dissolve(bpy.types.Operator):
                         bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
             except (ReferenceError, RuntimeError):
                 pass
-            backup.remove_backup(backup_mesh)
+            finally:
+                backup.remove_backup(backup_mesh)
 
 
 class MESH_OT_ydd_symmetric_edit_dissolve_mode(bpy.types.Operator):
@@ -621,25 +732,83 @@ class MESH_OT_ydd_symmetric_edit_dissolve_mode(bpy.types.Operator):
 
     if TYPE_CHECKING:
         use_verts: bool
+        use_face_split: bool
+        use_boundary_tear: bool
+        angle_threshold: float
+        use_preserve_quads: bool
     else:
         use_verts: BoolProperty(
             name="Dissolve Vertices",
             description="Dissolve remaining vertices which connect to only two edges",
-            # Native mesh.dissolve_mode default (Blender 4.2 / 5.2).
+            # Native mesh.dissolve_mode RNA default (Blender 4.2 / 5.2).
             default=False,
+        )
+        use_face_split: BoolProperty(
+            name="Face Split",
+            description="Split off face corners to maintain surrounding geometry",
+            default=False,
+        )
+        use_boundary_tear: BoolProperty(
+            name="Tear Boundary",
+            description="Split off face corners instead of merging faces",
+            default=False,
+        )
+        angle_threshold: FloatProperty(
+            name="Max Angle",
+            description="Maximum face angle for dissolving vertices along the edge",
+            subtype="ANGLE",
+            default=math.pi,
+            min=0.0,
+            max=math.pi,
+        )
+        use_preserve_quads: BoolProperty(
+            name="Preserve Quads",
+            description="Do not dissolve vertices that form a quad face",
+            default=True,
         )
 
     @classmethod
     def poll(cls, context):
         return context.mode == "EDIT_MESH" and context.edit_object is not None
 
+    def draw(self, context):
+        del context
+        layout = self.layout
+        if layout is None:
+            return
+        # Mirror native dissolve_mode panel (all mode-relevant props).
+        layout.prop(self, "use_verts")
+        layout.prop(self, "use_face_split")
+        layout.prop(self, "use_boundary_tear")
+        if _native_dissolve_mode_has("angle_threshold"):
+            layout.prop(self, "angle_threshold")
+        if _native_dissolve_mode_has("use_preserve_quads"):
+            layout.prop(self, "use_preserve_quads")
+
     def execute(self, context):
         mode = _dissolve_mode_from_select_mode(context.tool_settings.mesh_select_mode)
         kwargs: dict = {"mode": mode}
-        if mode in ("EDGES", "FACES"):
-            kwargs["use_verts"] = bool(self.use_verts)
-        # VERTS uses native-like face_split / boundary_tear defaults on the
-        # target operator (False / False); dissolve_mode only exposes use_verts.
+
+        if mode == "VERTS":
+            kwargs["use_face_split"] = bool(self.use_face_split)
+            kwargs["use_boundary_tear"] = bool(self.use_boundary_tear)
+        elif mode == "EDGES":
+            # Native dissolve_mode RNA defaults use_verts=False, but pure EDGE
+            # dispatch calls dissolve_edges whose default is True when the
+            # property is unset on the operator / KMI (probe-confirmed).
+            if _operator_property_is_set(self, "use_verts"):
+                kwargs["use_verts"] = bool(self.use_verts)
+            else:
+                kwargs["use_verts"] = True
+            kwargs["use_face_split"] = bool(self.use_face_split)
+            kwargs["angle_threshold"] = float(self.angle_threshold)
+            kwargs["use_preserve_quads"] = bool(self.use_preserve_quads)
+        else:
+            # FACES: native dissolve_faces use_verts default is False; only
+            # forward when the caller / KMI set the property explicitly.
+            if _operator_property_is_set(self, "use_verts"):
+                kwargs["use_verts"] = bool(self.use_verts)
+
         # Constant getattr: bpy type stubs omit dynamically registered ops (B009).
         dissolve = getattr(bpy.ops.mesh, "ydd_symmetric_edit_dissolve")  # noqa: B009
         return cast(set[str], dissolve(**kwargs))
@@ -695,6 +864,10 @@ class YSE_MT_delete(bpy.types.Menu):
 
         layout.operator("mesh.edge_collapse")
         layout.operator("mesh.delete_edgeloop", text="Edge Loops")
+
+        # Native VIEW3D_MT_edit_mesh_delete ends with asset catalog items.
+        if hasattr(layout, "template_node_operator_asset_menu_items"):
+            layout.template_node_operator_asset_menu_items(catalog_path="Mesh/Delete")
 
 
 CLASSES = (

@@ -322,6 +322,44 @@ def check_already_selected_counterpart() -> None:
         bm.free()
 
 
+def check_pair_map_involution() -> None:
+    """All edge/face pairs are involutions when a partner exists (pairs[p]==i)."""
+
+    bm = _build_symmetric_grid()
+    try:
+        maps = delete_dissolve.build_element_pair_maps(bm, _AXIS, _TOL)
+        for index, partner in maps.edge_pair_by_index.items():
+            if partner is None:
+                continue
+            assert maps.edge_pair_by_index[partner] == index, (index, partner, maps.edge_pair_by_index)
+        for index, partner in maps.face_pair_by_index.items():
+            if partner is None:
+                continue
+            assert maps.face_pair_by_index[partner] == index, (index, partner, maps.face_pair_by_index)
+        for index, partner in maps.vert_pairs.items():
+            assert maps.vert_pairs[partner] == index, (index, partner, maps.vert_pairs)
+    finally:
+        bm.free()
+
+
+def check_hidden_and_selected_counterpart() -> None:
+    """Hidden + already-selected counterparts still count as hidden (F9m)."""
+
+    bm = _build_symmetric_grid()
+    try:
+        maps = delete_dissolve.build_element_pair_maps(bm, _AXIS, _TOL)
+        _clear_select(bm)
+        bm.verts[0].select = True
+        bm.verts[2].hide = True
+        bm.verts[2].select = True
+        plan = delete_dissolve.plan_leading_domain_expansion(bm, maps, domains=("VERT",))
+        assert plan.add_vert_indices == ()
+        assert plan.hidden_counterpart_count == 1
+        assert plan.unmatched_count == 0
+    finally:
+        bm.free()
+
+
 def run() -> None:
     check_symmetric_grid_domains()
     check_on_plane_self_pairs()
@@ -331,6 +369,8 @@ def run() -> None:
     check_edge_face_composite_domain()
     check_apply_expansion_plan_no_flush()
     check_already_selected_counterpart()
+    check_pair_map_involution()
+    check_hidden_and_selected_counterpart()
     print("YSE_DELETE_UNITS_OK", flush=True)
 
 

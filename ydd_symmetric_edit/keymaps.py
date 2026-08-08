@@ -32,8 +32,9 @@ _RETRY_INTERVAL = 0.25
 _REGISTERED_ITEMS: list[tuple[object, KeymapEventLike]] = []
 _ROUTES_BY_KEY: dict[str, NativeRoute] = {}
 _FINGERPRINT: KeymapFingerprint | None = None
-_DELETE_FINGERPRINT: tuple[tuple[str, str, str, KeymapEvent], ...] | None = None
-_DISSOLVE_FINGERPRINT: tuple[tuple[str, str, str, KeymapEvent], ...] | None = None
+_DeleteRouteFingerprint = tuple[str, str, str, KeymapEvent, bool, tuple[tuple[str, object], ...]]
+_DELETE_FINGERPRINT: tuple[_DeleteRouteFingerprint, ...] | None = None
+_DISSOLVE_FINGERPRINT: tuple[_DeleteRouteFingerprint, ...] | None = None
 _HAS_DELETE_ROUTES = False
 _ENABLED = False
 _RUNNING = False
@@ -41,12 +42,15 @@ _RUNNING = False
 
 @dataclass(frozen=True, slots=True)
 class DeleteMenuRoute:
-    """One scanned native delete-menu binding to clone into the add-on config."""
+    """One scanned native delete-menu / dissolve_mode binding to clone."""
 
     keymap_name: str
     space_type: str
     region_type: str
     event: KeymapEvent
+    is_tool: bool = False
+    # Explicitly-set native KMI properties (dissolve_mode use_verts etc.).
+    properties: tuple[tuple[str, object], ...] = ()
 
     @property
     def keymap_identity(self) -> KeymapIdentity:
@@ -132,6 +136,43 @@ def _find_keymap(key_config, identity: KeymapIdentity):
     )
 
 
+def _capture_set_kmi_properties(item) -> tuple[tuple[str, object], ...]:
+    """Return (identifier, value) for properties explicitly set on a KMI."""
+
+    props = getattr(item, "properties", None)
+    if props is None:
+        return ()
+    captured: list[tuple[str, object]] = []
+    try:
+        for prop in props.bl_rna.properties:
+            identifier = prop.identifier
+            if identifier == "rna_type":
+                continue
+            if not props.is_property_set(identifier):
+                continue
+            value = getattr(props, identifier)
+            # Fingerprint / seen-set require hashable values.
+            if isinstance(value, (bool, int, float, str)):
+                captured.append((identifier, value))
+            else:
+                captured.append((identifier, str(value)))
+    except Exception:
+        traceback.print_exc()
+        return ()
+    return tuple(captured)
+
+
+def _route_fingerprint(route: DeleteMenuRoute) -> _DeleteRouteFingerprint:
+    return (
+        route.keymap_name,
+        route.space_type,
+        route.region_type,
+        route.event,
+        route.is_tool,
+        route.properties,
+    )
+
+
 def _native_routes(window_manager) -> tuple[list[NativeRoute], KeymapFingerprint]:
     key_config = window_manager.keyconfigs.user
     active_config = window_manager.keyconfigs.active
@@ -189,7 +230,7 @@ def _native_routes(window_manager) -> tuple[list[NativeRoute], KeymapFingerprint
 
 def _delete_menu_routes(
     window_manager,
-) -> tuple[list[DeleteMenuRoute], tuple[tuple[str, str, str, KeymapEvent], ...]]:
+) -> tuple[list[DeleteMenuRoute], tuple[_DeleteRouteFingerprint, ...]]:
     """Scan user keymaps for active delete-menu call_menu bindings.
 
     Does not touch ``_native_routes`` / ``OPERATOR_TOOL_KINDS`` (those only
@@ -201,7 +242,7 @@ def _delete_menu_routes(
         return [], ()
 
     routes: list[DeleteMenuRoute] = []
-    seen: set[tuple[str, str, str, KeymapEvent]] = set()
+    seen: set[_DeleteRouteFingerprint] = set()
     for keymap in key_config.keymaps:
         if keymap.is_modal:
             continue
@@ -213,26 +254,26 @@ def _delete_menu_routes(
             if getattr(item.properties, "name", "") != NATIVE_DELETE_MENU:
                 continue
             event = _event_signature(item)
-            identity = (keymap.name, keymap.space_type, keymap.region_type, event)
+            route = DeleteMenuRoute(
+                keymap_name=keymap.name,
+                space_type=keymap.space_type,
+                region_type=keymap.region_type,
+                event=event,
+                is_tool=keymap.name in TOOL_KEYMAP_NAMES,
+            )
+            identity = _route_fingerprint(route)
             if identity in seen:
                 continue
             seen.add(identity)
-            routes.append(
-                DeleteMenuRoute(
-                    keymap_name=keymap.name,
-                    space_type=keymap.space_type,
-                    region_type=keymap.region_type,
-                    event=event,
-                )
-            )
+            routes.append(route)
 
-    fingerprint = tuple((route.keymap_name, route.space_type, route.region_type, route.event) for route in routes)
+    fingerprint = tuple(_route_fingerprint(route) for route in routes)
     return routes, fingerprint
 
 
 def _dissolve_mode_routes(
     window_manager,
-) -> tuple[list[DeleteMenuRoute], tuple[tuple[str, str, str, KeymapEvent], ...]]:
+) -> tuple[list[DeleteMenuRoute], tuple[_DeleteRouteFingerprint, ...]]:
     """Scan user keymaps for active mesh.dissolve_mode bindings (Ctrl+X / IC)."""
 
     key_config = window_manager.keyconfigs.user
@@ -240,7 +281,7 @@ def _dissolve_mode_routes(
         return [], ()
 
     routes: list[DeleteMenuRoute] = []
-    seen: set[tuple[str, str, str, KeymapEvent]] = set()
+    seen: set[_DeleteRouteFingerprint] = set()
     for keymap in key_config.keymaps:
         if keymap.is_modal:
             continue
@@ -250,20 +291,22 @@ def _dissolve_mode_routes(
             if item.idname != NATIVE_DISSOLVE_MODE:
                 continue
             event = _event_signature(item)
-            identity = (keymap.name, keymap.space_type, keymap.region_type, event)
+            properties = _capture_set_kmi_properties(item)
+            route = DeleteMenuRoute(
+                keymap_name=keymap.name,
+                space_type=keymap.space_type,
+                region_type=keymap.region_type,
+                event=event,
+                is_tool=keymap.name in TOOL_KEYMAP_NAMES,
+                properties=properties,
+            )
+            identity = _route_fingerprint(route)
             if identity in seen:
                 continue
             seen.add(identity)
-            routes.append(
-                DeleteMenuRoute(
-                    keymap_name=keymap.name,
-                    space_type=keymap.space_type,
-                    region_type=keymap.region_type,
-                    event=event,
-                )
-            )
+            routes.append(route)
 
-    fingerprint = tuple((route.keymap_name, route.space_type, route.region_type, route.event) for route in routes)
+    fingerprint = tuple(_route_fingerprint(route) for route in routes)
     return routes, fingerprint
 
 
@@ -364,15 +407,17 @@ def _register_delete_menu_keymaps(window_manager, routes: list[DeleteMenuRoute])
 
     addon_keymaps = {}
     for route in routes:
-        keymap = addon_keymaps.get(route.keymap_identity)
+        cache_key = (route.keymap_identity, route.is_tool)
+        keymap = addon_keymaps.get(cache_key)
         if keymap is None:
             keymap = addon_config.keymaps.new(
                 name=route.keymap_name,
                 space_type=route.space_type,
                 region_type=route.region_type,
                 modal=False,
+                tool=route.is_tool,
             )
-            addon_keymaps[route.keymap_identity] = keymap
+            addon_keymaps[cache_key] = keymap
 
         item = keymap.keymap_items.new(
             "wm.call_menu",
@@ -397,21 +442,29 @@ def _register_dissolve_mode_keymaps(window_manager, routes: list[DeleteMenuRoute
 
     addon_keymaps = {}
     for route in routes:
-        keymap = addon_keymaps.get(route.keymap_identity)
+        cache_key = (route.keymap_identity, route.is_tool)
+        keymap = addon_keymaps.get(cache_key)
         if keymap is None:
             keymap = addon_config.keymaps.new(
                 name=route.keymap_name,
                 space_type=route.space_type,
                 region_type=route.region_type,
                 modal=False,
+                tool=route.is_tool,
             )
-            addon_keymaps[route.keymap_identity] = keymap
+            addon_keymaps[cache_key] = keymap
 
         item = keymap.keymap_items.new(
             DISSOLVE_MODE_OPERATOR,
             head=True,
             **_event_arguments(route.event),
         )
+        # Replay explicitly-set native KMI props (custom use_verts etc.).
+        for prop_name, prop_value in route.properties:
+            try:
+                setattr(item.properties, prop_name, prop_value)
+            except Exception:
+                traceback.print_exc()
         item.active = _ENABLED
         _REGISTERED_ITEMS.append((keymap, item))
 
