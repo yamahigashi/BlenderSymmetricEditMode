@@ -972,6 +972,66 @@ def _discover_path_edges(
     return [edge for edge in bm.edges if _is_path_edge_by_markers(edge, edge_layer, face_layer)]
 
 
+def path_ring_includes_pre_hidden_edges(bm: bmesh.types.BMesh) -> bool:
+    """True when the Loop Cut / Offset ring includes a pre-hidden edge.
+
+    Native ``loopcut`` skips hidden ring edges and yields a *partial* (open)
+    path. A closed selected path means the cut ring was complete, so unrelated
+    hidden geometry on another ring must not decline. An open path together
+    with a pre-hidden edge in the face-neighbourhood of a path endpoint is the
+    partial-ring case that must decline.
+    """
+
+    edge_hidden = bm.edges.layers.int.get(EDGE_HIDDEN_LAYER)
+    edge_layer = bm.edges.layers.int.get(EDGE_ORIGINAL_LAYER)
+    if edge_hidden is None or edge_layer is None:
+        return False
+
+    face_layer = bm.faces.layers.int.get(FACE_ID_LAYER)
+    path_edges = [edge for edge in bm.edges if edge.select and _is_path_edge_by_markers(edge, edge_layer, face_layer)]
+    if not path_edges:
+        return False
+
+    degree: dict[int, int] = defaultdict(int)
+    vert_by_key: dict[int, bmesh.types.BMVert] = {}
+    for edge in path_edges:
+        for vertex in edge.verts:
+            key = hash(vertex)
+            degree[key] += 1
+            vert_by_key[key] = vertex
+    # Closed loop: every path vertex is incident to exactly two path edges.
+    if degree and all(count == 2 for count in degree.values()):
+        return False
+
+    endpoint_verts = [vert_by_key[key] for key, count in degree.items() if count == 1]
+    if not endpoint_verts:
+        return False
+
+    # BFS over faces around path endpoints: the skipped (hidden) ring edges
+    # sit in the gap adjacent to the open ends.
+    seen_faces: set[int] = set()
+    face_queue: list[bmesh.types.BMFace] = []
+    for vertex in endpoint_verts:
+        for face in vertex.link_faces:
+            if face.is_valid and face.index not in seen_faces:
+                seen_faces.add(face.index)
+                face_queue.append(face)
+
+    # Expand one adjacency step so a one-edge gap still reaches the hidden edge.
+    for face in list(face_queue):
+        for edge in face.edges:
+            for other in edge.link_faces:
+                if other.is_valid and other.index not in seen_faces:
+                    seen_faces.add(other.index)
+                    face_queue.append(other)
+
+    for face in face_queue:
+        for edge in face.edges:
+            if edge.is_valid and edge[edge_hidden]:
+                return True
+    return False
+
+
 def classify_path_edges_by_side(
     path_edges: Iterable[bmesh.types.BMEdge],
     axis_index: int,
@@ -1218,8 +1278,9 @@ def apply_crosses_p_stitch(
 ) -> tuple[int, str]:
     """Split non-self-mirrored CROSSES edges at their plane intersection *p*.
 
-    Contract §4.1-2: collect all *p* first, cluster (§1.1), then apply with
-    priority (existing vertex → existing edge split → new via edge_split).
+    All intersections are collected before any mutation, clustered, then
+    applied with priority (existing vertex → existing edge split → new via
+    edge_split); mutating mid-collection would shift later intersections.
     Self-mirrored CROSSES (endpoints are a mirror pair) are left untouched.
 
     Returns ``(stitched_edge_count, failure_reason)``. On failure the mesh may
@@ -1413,7 +1474,8 @@ def _plan_plane_stitch_vertex(
         return exact_vertices[0][2], None, ""
 
     # (2) Existing edges whose interior contains the representative.
-    # Contract §1.1: single threshold = Match Tolerance (no second edge_limit).
+    # Match Tolerance is the only threshold; a wider edge limit would adopt
+    # unrelated edges.
     edge_limit = max(tolerance, 1.0e-9)
     host_edges: list[tuple[float, int, bmesh.types.BMEdge, float]] = []
     member_ids = {id(edge) for edge in member_edges}
@@ -1725,6 +1787,11 @@ def apply_reflected_path_topology(
     coordinate tolerance (same store as :func:`build_reflected_cutter`) so a
     near-self-mirrored stroke does not invent a geometric duplicate. Multiple
     tol-local vertex candidates decline the whole apply (all-or-nothing).
+
+    Straddling Loop Cut rings symmetrize through this same path: reflection
+    onto self-mirrored or paired carrier faces creates the counterpart ring
+    or counts it as already present.  The face correspondence is load-bearing;
+    without it the counterpart check below declines.
 
     Returns ``(created_edges, already_present_edges, failure_reason)``. Callers
     must provide rollback because a late validation error can occur after an

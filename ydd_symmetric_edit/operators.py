@@ -955,7 +955,10 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     warning += f"; {already_present} segment(s) already existed"
                 result = {"FINISHED"}
             else:
-                # Loop Cut / Offset: keep one-side source selection (contract §4.2).
+                # Loop Cut / Offset keep the one-side source selection.
+                # Straddling rings symmetrize through the ordinary reflection
+                # only because their carrier faces map to themselves or their
+                # pairs; when pairing fails the counterpart check declines.
                 source_edges, side, total_path_edges, crossing_count = core.collect_source_path_edges(
                     bm,
                     session.axis_index,
@@ -975,6 +978,11 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     raise SymmetricKnifeError(
                         "Could not determine the source side; keep the new topology on one side of the mirror plane"
                     )
+
+                # Native loopcut skips hidden ring edges, leaving an open
+                # partial ring whose mirror is not well-defined.
+                if core.path_ring_includes_pre_hidden_edges(bm):
+                    raise SymmetricKnifeError("the cut ring includes hidden edges; partial ring cuts are not mirrored")
 
                 target_face_ids, unmatched = core.target_face_ids_for_edges(
                     source_edges,
@@ -1061,7 +1069,8 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     projection_committed = True
                     result = {"FINISHED"}
                     if not created:
-                        self.report(
+                        _finish_report(
+                            self,
                             {"INFO"},
                             f"The opposite side already contains this {tool_label}",
                         )
@@ -1073,7 +1082,8 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     if already_present:
                         warning_parts.append(f"{already_present} segment(s) already existed")
                     suffix = f"; {'; '.join(warning_parts)}" if warning_parts else ""
-                    self.report(
+                    _finish_report(
+                        self,
                         {"WARNING"} if warning_parts else {"INFO"},
                         f"Mirrored {created} {tool_label} segment(s) from the {side.lower()} side{suffix}",
                     )
@@ -1199,7 +1209,8 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
             except Exception:
                 traceback.print_exc()
 
-        # Contract §2.2: after native changes, always return FINISHED.
+        # After the native cut mutated the mesh, always return FINISHED so
+        # its undo push survives.
         # Successful rollback (or no backup / mirror not started) → WARNING
         # decline that keeps the native result. Backup create failure or
         # rollback exception → fatal ERROR (§2.2-4). Pre-mirror decline that
