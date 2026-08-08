@@ -179,7 +179,7 @@ class VertexMirrorLookup:
     """Index of registered coordinates for mirror-plane counterpart lookup.
 
     Built by :func:`build_vertex_mirror_lookup`. Matching reuses the shared
-    floor-bin neighborhood and Chebyshev verification (Phase 2a contract).
+    floor-bin neighborhood and Chebyshev verification.
     """
 
     def __init__(
@@ -928,7 +928,7 @@ def choose_source_side(
 
 
 def _is_path_edge_by_markers(edge: bmesh.types.BMEdge, edge_layer, face_layer) -> bool:
-    """True when *edge* is a native cut fragment (contract §2.0 novelty).
+    """True when *edge* is a native cut fragment.
 
     Tag==0 is the primary signal. Existing-edge splits inherit a non-zero parent
     tag, so also accept internal edges whose link faces all share one original
@@ -956,10 +956,10 @@ def _discover_path_edges(
     than CustomData inheritance on complex rings. Knife strokes can honor
     "Select Result" being disabled, so their marker-based path stays intact.
 
-    Both branches use the same novelty test (tag==0 or FACE_ID complement;
-    contract §2.0). *selected_only* only adds the selection filter for Loop
-    Cut / Offset; Knife (selected_only=False) must still recover inherited-tag
-    CROSSES fragments so the whole-stage decline cannot be skipped.
+    Both branches use the same novelty test (tag==0 or FACE_ID complement).
+    *selected_only* only adds the selection filter for Loop Cut / Offset;
+    Knife (selected_only=False) must still recover inherited-tag CROSSES
+    fragments so the whole-stage decline cannot be skipped.
     """
 
     edge_layer = bm.edges.layers.int.get(EDGE_ORIGINAL_LAYER)
@@ -1057,10 +1057,9 @@ def collect_knife_path_edges_by_side(
 ) -> tuple[dict[str, list[bmesh.types.BMEdge]], int]:
     """Classify every new Knife path edge without choosing a source side.
 
-    Phase 1/2 (axis-crossing contract §4.1): both POSITIVE and NEGATIVE
-    buckets are mirrored toward each other. PLANE edges are shared.
-    CROSSES edges are p-stitched (Phase 2) before the half-edges join the
-    POSITIVE/NEGATIVE mirror path.
+    Both POSITIVE and NEGATIVE buckets are mirrored toward each other. PLANE
+    edges are shared. CROSSES edges are p-stitched before the half-edges join
+    the POSITIVE/NEGATIVE mirror path.
 
     Returns ``(by_side, total_path_edge_count)``.
     """
@@ -1116,7 +1115,7 @@ def cluster_points_by_tolerance(
     points: Sequence[Vector],
     tolerance: float,
 ) -> list[list[int]]:
-    """§1.1 clustering: lex-order scan, absorb within tol of the representative.
+    """Lex-order scan clustering: absorb within tol of the representative.
 
     Returns clusters as lists of indices into *points*. The first index of each
     cluster is the representative (lex-first member). Member-to-rep distance is
@@ -1206,7 +1205,7 @@ def resolve_live_mirror_face_map(
     Orphan self-map (source → source) is allowed only when the live region
     (all faces sharing that FACE_ID in path scope) is geometrically
     self-mirrored under ρ within *tolerance*, allowing path endpoints to be
-    asymmetric until the X is completed (contract §4.1-2 ρ(F)=F). Asymmetric
+    asymmetric until the X is completed (ρ(F)=F). Asymmetric
     dissolved unions (e.g. L∪R∪ear) fail the guard and drop the pair so the
     existing unmatched-face decline fires.
 
@@ -1386,7 +1385,7 @@ def apply_crosses_p_stitch(
             if new_vertex != vertex:
                 try:
                     # Survivor first: keeps *vertex* valid across ≥3 merges in
-                    # one cluster (contract §4.1-2 multi-segment X at p).
+                    # one cluster (multi-segment X at p).
                     bmesh.ops.pointmerge(bm, verts=[vertex, new_vertex], merge_co=vertex.co)
                 except (RuntimeError, ValueError) as exc:
                     return stitched, f"could not unify plane-stitch vertices: {exc}"
@@ -1405,8 +1404,8 @@ def _mirror_invariant_endpoint_key(
     """Canonical endpoint key with |axis| so ρ-related seeds share the key.
 
     Absolute value on the mirror axis makes (M,I) and (ρM,ρI) order-equivalent
-    for seed selection. Full orbit ties are allowed under contract §1.2
-    best-effort attribute inheritance (shape keys etc.).
+    for seed selection. Full orbit ties are allowed as best-effort attribute
+    inheritance (shape keys etc.).
     """
 
     components = [float(co[0]), float(co[1]), float(co[2])]
@@ -1418,7 +1417,7 @@ def _lex_first_edge(
     edges: Sequence[bmesh.types.BMEdge],
     axis_index: int = 0,
 ) -> bmesh.types.BMEdge:
-    """Deterministic edge pick by mirror-invariant endpoint keys (§1.2 best-effort).
+    """Deterministic edge pick by mirror-invariant endpoint keys.
 
     Keys use |axis| on the mirror component so a seed and its mirror image
     sort equivalently. Remaining complete-orbit ties are acceptable best-effort.
@@ -1492,7 +1491,7 @@ def _plan_plane_stitch_vertex(
     if host_edges:
         host_edges.sort(key=lambda item: (item[0], item[1]))
         if len(host_edges) > 1:
-            # §4.1-2: multi-candidate host edges are ambiguous.
+            # Multi-candidate host edges are ambiguous.
             # - Nearest fallback is forbidden.
             # - A mirror pair both within tol is equidistant from on-plane p
             #   (degenerate); edge.index tie-break is also forbidden → decline.
@@ -1656,9 +1655,9 @@ def _resolve_reflected_vertex_on_target(
     Shared by preflight (dry-run) and apply so both use identical E/F semantics.
     Returns ``(kind, exact_vertex, split_edge, factor, error_reason)``.
 
-    Multiple distinct vertices within *tolerance* of *expected* are ambiguous
-    (contract §1.1 / direct-topology safety): callers must decline rather than
-    pick an arbitrary vertex that could invent a duplicate edge.
+    Multiple distinct vertices within *tolerance* of *expected* are ambiguous:
+    callers must decline rather than pick an arbitrary vertex that could
+    invent a duplicate edge.
     """
 
     if not candidate_faces:

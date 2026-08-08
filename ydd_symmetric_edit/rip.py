@@ -2,7 +2,7 @@
 
 """Symmetric postprocess for Blender's native Rip (``mesh.rip_move``).
 
-R0 measurements (contract §5, identical on Blender 4.2.23 / 5.2.0):
+R0 measurements (identical on Blender 4.2.23 / 5.2.0):
 
 - ``MESH_OT_rip`` copies integer CustomData onto duplicated vertices and
   edges, so a unique per-vertex ID layer written before the native operator
@@ -20,7 +20,7 @@ The mirror application therefore reflects the *observed* seam onto the paired
 edges and replays ``split_edges`` there, then assigns mirrored final
 coordinates to the matching copies.
 
-Axis-crossing (contract §4.3, S3 measurements):
+Axis-crossing measurements:
 
 - Selection overlap is no longer a prepare-time passthrough; the post-native
   seam is the sole criterion.  A fully self-mirrored seam (seam edge set
@@ -72,13 +72,13 @@ def prepare_guard_reason(context, bm: bmesh.types.BMesh, axis_index: int, tolera
         return "INFO", "Nothing selected to rip"
 
     # This on-plane guard stays ahead of any seam classification: Rip does
-    # not support on-plane selections at all (contract §4.3-1).
+    # not support on-plane selections at all.
     on_plane = sum(1 for vertex in selected if abs(vertex.co[axis_index]) <= tolerance)
     if on_plane:
         return "WARNING", f"{on_plane} selected vertex(es) lie on the mirror plane"
 
-    # Selection/mirror overlap is deliberately not declined here (contract
-    # §4.3-2).  The session continues; post-native seam analysis decides
+    # Selection/mirror overlap is deliberately not declined here.  The
+    # session continues; post-native seam analysis decides
     # between the external split path, the self-mirrored V-opening path, or a
     # visible WARNING decline (partial self-overlap / missing counterparts).
     del axis_index, tolerance
@@ -304,8 +304,8 @@ def _derive(
     if not dup_ids.issubset(seam_vertex_ids):
         return None, "a duplicated vertex is not part of any seam edge (unsupported result)"
 
-    # Classify self-mirror status via seam *edge* set mirror-closure
-    # (contract §4.3-3): full → V-opening path; partial → explicit decline.
+    # Classify self-mirror status via seam *edge* set mirror-closure:
+    # full → V-opening path; partial → explicit decline.
     # Vertex-only "every dup's mirror is also a dup" is necessary but not
     # sufficient: a mixed seam {A–A′, A–B} with unduplicated extension
     # endpoint B has all dups self-paired yet ρ(A–B)=A′–B′ is not a seam
@@ -444,8 +444,8 @@ def apply_mirrored_rip(
     records = snapshot.record_by_id()
 
     # Native Rip duplicates ONLY the selected vertices; unselected seam ends
-    # stay pinched even on a mesh boundary (R0 §5-2).  split_edges reproduces
-    # this exactly when the split vertices are passed explicitly.
+    # stay pinched even on a mesh boundary.  split_edges reproduces this
+    # exactly when the split vertices are passed explicitly.
     mirror_split_verts = []
     split_plan: list[tuple[int, list[tuple[frozenset[int], Vector]]]] = []
     for vertex_id, dup in derived.dup_vertices.items():
@@ -524,8 +524,8 @@ def apply_self_mirrored_rip(
 
     source bank = native moved/selected bank (kept).  Each non-source copy of
     vertex V receives ρ of the source copy of mirror(V) — role-based, not
-    same-vid overwrite (S3 / contract §4.3-3).  Fill faces ride along because
-    their corners are the bank vertices.
+    same-vid overwrite.  Fill faces ride along because their corners are the
+    bank vertices.
     """
 
     if derived is None:
@@ -549,7 +549,7 @@ def apply_self_mirrored_rip(
         # Face-ID sets already distinguish the two copies; require they stay
         # distinct after excluding fill (checked in _derive).  Cross-check that
         # the partner's face sets are resolvable via the face pair table so
-        # bank identity is well-defined under §2(iv).
+        # bank identity is well-defined.
         for face_ids in dup.copy_face_ids:
             for face_id in face_ids:
                 if FaceId(face_id) not in mirror_face_ids:
@@ -560,7 +560,7 @@ def apply_self_mirrored_rip(
 
     # Seam-wide bank consistency: source(V) and source(mirror(V)) must sit on
     # face-paired sides.  A mixed face-side assignment across vertices means
-    # bank identity is not a single global choice (§2(iv) / §4.3-3).
+    # bank identity is not a single global choice.
     checked_pairs: set[frozenset[int]] = set()
     for vertex_id, source_face_ids in source_face_ids_by_vid.items():
         mirror_vertex_id = records[vertex_id].mirror_vertex_id
@@ -601,7 +601,7 @@ def _identify_source_bank(
 ) -> tuple[bmesh.types.BMVert | None, bmesh.types.BMVert | None, frozenset[int] | None, str | None]:
     """Pick (source, non-source, source face-IDs) for one duplicated seam vertex.
 
-    Preference order (contract §4.3-3 / S3):
+    Preference order:
     1. Exactly one selected copy → that is the native moved bank, provided
        movement (when measurable) does not contradict the selection signal.
     2. Exactly one copy that left the pre-rip location → moved bank.
@@ -656,8 +656,8 @@ def _mirror_fill_faces(
     """Recreate the native Rip Fill bridge faces on the mirrored seam.
 
     Fill faces are re-found after the mirror split by the repeated-corner
-    rule (contract §5-4); corner-level copy identity comes from the stable
-    per-copy face-ID sets captured before any mutation.
+    rule; corner-level copy identity comes from the stable per-copy face-ID
+    sets captured before any mutation.
     """
 
     records = snapshot.record_by_id()

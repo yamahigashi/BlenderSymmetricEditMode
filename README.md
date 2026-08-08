@@ -30,7 +30,8 @@ In Blender 4.2 or later, open **Edit > Preferences > Add-ons**, choose
    settings in the 3D Viewport header or Tool settings.
 3. Open **N panel > Edit > ydd Symmetric Edit** and turn on **Enable Symmetric
    Edit Mode**.
-4. Work on one side of the mesh with the supported tools and confirm normally.
+4. Work with the supported tools — on one side or across the plane — and
+   confirm normally.
 5. The toggle persists across sessions.
 
 ## Cut tools (Knife / Loop Cut / Offset Edge Loop Cut)
@@ -76,13 +77,18 @@ are mirrored after the native confirmation:
   native rip is kept, the mirror step is rolled back completely, and a
   warning is reported.
 
-A selection with vertices on both sides is still mirrored as long as it does
-not overlap its own mirror image. Rip passes through to the native tool
-without mirroring when the selection touches the symmetry plane, overlaps its
-own mirror image, or when Proportional Editing or Auto Merge is enabled. When
-the ripped seam itself lacks mirrored counterparts, the native rip is kept and
-the mirror step is declined with a warning; counterpart-less selected vertices
-that the native Rip left untouched do not block mirroring of the seam.
+Selections may span both sides of the plane: what matters is the seam the
+native Rip actually tears. A one-sided seam is mirrored to the other side as
+usual. A seam that is its own mirror image — a crack crossing the plane, such
+as ripping the edge between two mutually mirrored vertices — opens
+symmetrically: the flap you dragged keeps its native position and the
+opposite flap receives the reflected one, so the crack opens as a V. A seam
+that only partially overlaps its own mirror image keeps the native rip and
+declines the mirror step with a warning. Rip still passes through to the
+native tool when the selection touches the symmetry plane or when
+Proportional Editing or Auto Merge is enabled. When the ripped seam lacks
+mirrored counterparts (asymmetric topology), the native rip is kept and the
+mirror step is declined with a warning.
 
 **Adjust Last Operation (F9) is not supported for Rip.** This is a limitation
 of Blender itself: re-executing `Rip and Move` cannot repeat the rip, so the
@@ -111,14 +117,18 @@ always with a report, never silently:
   mirrored normally, even when it has vertices on both sides of the plane.
 - A fully self-mirrored selection runs the native operation once; the result
   is already symmetric. **At First** and **At Last** merge each side to its
-  own first/last vertex instead, so the two halves stay apart symmetrically.
+  own first/last vertex instead, so the two halves stay apart symmetrically;
+  selected vertices on the symmetry plane stay put as the shared link
+  between the two survivors.
 - A selection that partially overlaps its mirror image is completed with the
   missing mirrored vertices first (reported as INFO) and then merged natively
-  once; Connect runs natively only, with a warning, because an overlapping
-  ordered path has no safe symmetric interpretation.
-- Vertices without a mirrored counterpart are merged natively; Connect requires
-  the full path to have counterparts and otherwise connects the source side
-  only.
+  once. Connect adds the mirror image of the edges the native connect
+  actually created, so partially overlapping paths connect symmetrically too.
+- A Connect path that crosses its own mirror image is stitched at the
+  crossing point on the symmetry plane, the same way the native tool joins
+  self-intersecting paths.
+- Vertices without a mirrored counterpart are merged natively; a Connect path
+  with missing counterparts connects the source side only, with a warning.
 - Multi-object Edit Mode, no symmetry axis, or multiple axes: the native
   operator runs unchanged.
 
@@ -144,8 +154,12 @@ Connect and Merge are mirrored through their J / M bindings and the M menu.
 - Cut targets on the opposite side must have an exact mirrored counterpart
   within **Match Tolerance** before the native operation starts; Connect and
   Merge match individual vertices with the same tolerance.
-- Knife strokes should remain on one side. Cross-plane segments are skipped;
-  endpoints may lie on the plane.
+- Knife strokes may cross the symmetry plane. Both sides of the stroke are
+  mirrored toward each other, and a segment crossing the plane is stitched
+  to its mirror image at an on-plane vertex — the same X a native
+  self-intersecting stroke would produce. Loop cuts on rings that cross the
+  plane come out symmetric; a ring left partial by hidden edges declines the
+  mirror step with a warning.
 - UVs and other CustomData are interpolated on the target side and kept finite,
   but exact parity with every native **Correct UVs** case is not guaranteed.
 

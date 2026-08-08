@@ -45,8 +45,8 @@ class ToolProfile:
     passthrough_stable_ticks: int
     supports_nested_offset: bool
     # Adjust Last Operation re-executes the native operator via exec.  Rip's
-    # macro cannot repeat (MESH_OT_rip has no exec; contract §5-7), so only
-    # tools whose native repeat is sound take part in the F9 baseline flow.
+    # macro cannot repeat (MESH_OT_rip has no exec), so only tools whose
+    # native repeat is sound take part in the F9 baseline flow.
     supports_adjust_repeat: bool
 
 
@@ -558,7 +558,7 @@ def _remove_cutter(cutter, mesh) -> None:
 
     Called from finish ``finally`` blocks: must not raise. Any exception is
     logged and swallowed so later stages (backup rollback, selection restore,
-    layer removal, result return) still run (contract §2.2 undo preservation).
+    layer removal, result return) still run.
     """
 
     try:
@@ -576,13 +576,12 @@ def _finish_rip_session(
     obj,
     window_pointer: int,
 ) -> OperatorResult:
-    """Mirror a confirmed native Rip.  All-or-nothing (contract §2.5).
+    """Mirror a confirmed native Rip.  All-or-nothing.
 
     The native result already changed the mesh, so this always returns
     FINISHED; a mirror failure restores the pre-mirror state and reports a
     WARNING while keeping the native rip intact (undo stays one step).
-    Backup creation failure is fatal ERROR (contract §2.2-4), same as the
-    cut-tool finish path.
+    Backup creation failure is fatal ERROR, same as the cut-tool finish path.
     """
 
     backup_mesh = None
@@ -708,7 +707,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                 raise SymmetricKnifeError("Temporary topology markers are missing")
 
             def _create_backup(edit_bm):
-                """Create topology backup; classify create failure as fatal (§2.2-4)."""
+                """Create topology backup; classify create failure as fatal."""
                 nonlocal backup_creation_failed
                 try:
                     return backup.create_topology_backup(edit_bm)
@@ -718,9 +717,9 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     raise SymmetricKnifeError(f"Could not create topology backup for rollback: {exc}") from exc
 
             if session.tool_kind == "KNIFE":
-                # Phase 1/2: both-sides mirror. CROSSES are p-stitched first
-                # (contract §4.1-2), then half-edges join the POSITIVE/NEGATIVE
-                # mirror path inside one backup transaction (§2.1).
+                # Both-sides mirror. CROSSES are p-stitched first, then
+                # half-edges join the POSITIVE/NEGATIVE mirror path inside
+                # one backup transaction.
                 by_side, total_path_edges = core.collect_knife_path_edges_by_side(
                     bm,
                     session.axis_index,
@@ -750,7 +749,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                 )
 
                 if crossing_count:
-                    # Single backup covers p-stitch + mirror (contract §2.1).
+                    # Single backup covers p-stitch + mirror.
                     selection_state = core.add_selection_layers(bm)
                     backup_mesh = _create_backup(bm)
                     bm = bmesh.from_edit_mesh(obj.data)
@@ -1159,14 +1158,14 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                 result = {"FINISHED"}
         except SymmetricKnifeError as exc:
             # Defer report until after finally so rollback success/failure can
-            # classify the outcome (contract §2.2).
+            # classify the outcome.
             mirror_failure = str(exc)
         except Exception as exc:
             traceback.print_exc()
             mirror_failure = str(exc)
         finally:
             # Each stage is isolated: a failure here must not skip later stages
-            # or prevent returning a post-native result (contract §2.2).
+            # or prevent returning a post-native result.
             _remove_cutter(cutter, cutter_mesh)
 
             if backup_mesh is not None and not projection_committed:
@@ -1213,8 +1212,8 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
         # its undo push survives.
         # Successful rollback (or no backup / mirror not started) → WARNING
         # decline that keeps the native result. Backup create failure or
-        # rollback exception → fatal ERROR (§2.2-4). Pre-mirror decline that
-        # never attempted backup stays WARNING.
+        # rollback exception → fatal ERROR. Pre-mirror decline that never
+        # attempted backup stays WARNING.
         if mirror_failure is not None:
             if rollback_failed or backup_creation_failed:
                 _finish_report(
@@ -1231,8 +1230,8 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
             result = {"FINISHED"}
 
         # Success INFO only when the mirror stage completed (not after a
-        # WARNING decline that still returns FINISHED under §2.2). Routed
-        # through _finish_report so tests can observe dual-report suppression.
+        # WARNING decline that still returns FINISHED). Routed through
+        # _finish_report so tests can observe dual-report suppression.
         if result == {"FINISHED"} and mirrored_segment_count and mirror_failure is None:
             assert side is not None
             if side == "BOTH":

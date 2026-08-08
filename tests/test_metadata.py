@@ -31,8 +31,8 @@ def run() -> None:
 
     assert manifest["blender_version_min"] == "4.2.0"
     assert bl_info["blender"] == (4, 2, 0)
-    assert manifest["version"] == "0.6.0"
-    assert bl_info["version"] == (0, 6, 0)
+    assert manifest["version"] == "0.7.0"
+    assert bl_info["version"] == (0, 7, 0)
     assert project["project"]["version"] == manifest["version"]
     assert project["project"]["requires-python"] == ">=3.11"
     print("YSE_METADATA_TEST_OK", flush=True)

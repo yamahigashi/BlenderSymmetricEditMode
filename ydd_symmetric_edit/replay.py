@@ -159,7 +159,7 @@ def _map_history_via_pairs(
     Deliberately shares the classification's pair table instead of running a
     separate lookup: a coordinate-based partial batch sees no on-plane
     queries, so a near-plane vertex the classification rejected could sneak
-    back in as a counterpart (review finding).
+    back in as a counterpart.
     """
 
     mapped = []
@@ -351,7 +351,7 @@ def _ensure_int_layer(layers, name: str):
 
 
 def _prepare_connect_markers(bm: bmesh.types.BMesh) -> None:
-    """Stamp EDGE_ORIGINAL + FACE_ID for post-hoc R extraction (§4.4-2).
+    """Stamp EDGE_ORIGINAL + FACE_ID for post-hoc R extraction.
 
     Only the two Connect layers are created/overwritten — other temporary
     layers (Knife session etc.) are left alone. Partial failure removes both
@@ -394,7 +394,7 @@ def _edge_float_attr(bm: bmesh.types.BMesh, edge: bmesh.types.BMEdge, name: str)
 
 
 def _edge_attr_tuple(bm: bmesh.types.BMesh, edge: bmesh.types.BMEdge) -> tuple[bool, bool, float, float]:
-    """§1.2 guaranteed edge attributes: seam / sharp / crease / bevel weight."""
+    """Guaranteed edge attributes: seam / sharp / crease / bevel weight."""
 
     return (
         bool(edge.seam),
@@ -406,7 +406,7 @@ def _edge_attr_tuple(bm: bmesh.types.BMesh, edge: bmesh.types.BMEdge) -> tuple[b
 
 @dataclass(frozen=True)
 class _ConnectEffectEdge:
-    """One newly generated connect edge with incidence + attributes for §1.3.
+    """One newly generated connect edge with incidence + attributes.
 
     Coordinates are stored as plain 3-tuples so type-checkers do not confuse
     them with mathutils.Vector's descriptor ``__set__`` signature.
@@ -422,10 +422,10 @@ class _ConnectEffectEdge:
 
 
 def _extract_connect_effect_edges(bm: bmesh.types.BMesh) -> tuple[_ConnectEffectEdge, ...]:
-    """R = newly generated edges after native connect (contract §4.4-2).
+    """R = newly generated edges after native connect.
 
-    Novelty is tag==0 or FACE_ID complement (contract §2.0), same as Knife.
-    Reused pre-existing edges keep a non-zero parent tag and are excluded.
+    Novelty is tag==0 or FACE_ID complement, same as Knife. Reused
+    pre-existing edges keep a non-zero parent tag and are excluded.
     """
 
     path_edges = core._discover_path_edges(bm, selected_only=False)
@@ -542,10 +542,10 @@ def _connect_effect_is_self_mirrored(
     axis_index: int,
     tolerance: float,
 ) -> bool:
-    """True when ρ(R) equals R with 1:1 cancellation (contract §1.3).
+    """True when ρ(R) equals R with 1:1 cancellation.
 
     Each edge must have a unique mirror partner in R whose link-face FACE_IDs
-    correspond under the pre-state face-pair map and whose §1.2 edge attributes
+    correspond under the pre-state face-pair map and whose edge attributes
     match. Coordinate-only multiset equality is insufficient when several edges
     share endpoints.
     """
@@ -739,7 +739,7 @@ def _verify_connect_mirror_effect(
     axis_index: int,
     tolerance: float,
 ) -> bool:
-    """ρ(R) ↔ R′ multiset match with pre-existing cancellation (contract §4.4-4).
+    """ρ(R) ↔ R′ multiset match with pre-existing cancellation.
 
     R′ is re-extracted after the second native (tag==0 + FACE_ID complement).
     Each non-self-mirrored ρ(e) must be realized by exactly one of:
@@ -803,7 +803,7 @@ def _verify_connect_mirror_effect(
 
         return False  # missing mirror realization
 
-    # Excess generation: any unmatched R′ edge fails (contract §4.4-4 逸脱).
+    # Excess generation: any unmatched R′ edge fails.
     return not pool
 
 
@@ -854,7 +854,7 @@ class MESH_OT_ydd_symmetric_edit_connect(bpy.types.Operator):
         )
         mirrored_history = _map_history_via_pairs(history_indices, snapshot.pairs)
 
-        # Contract §4.4-2: stamp markers before native so R is post-hoc recoverable.
+        # Stamp markers before native so R is post-hoc recoverable.
         try:
             _prepare_connect_markers(bm)
             face_id_pairs = _build_face_id_pairs(bm, axis_index, tolerance)
@@ -879,8 +879,8 @@ class MESH_OT_ydd_symmetric_edit_connect(bpy.types.Operator):
                 traceback.print_exc()
             return result
 
-        # Contract §2.2-4: native has mutated the mesh — every post-native path
-        # (including exceptions) must return `result` so the undo push is kept.
+        # Native has mutated the mesh — every post-native path (including
+        # exceptions) must return `result` so the undo push is kept.
         backup_mesh = None
         mirror_warning = None
         mirror_level = "WARNING"
@@ -892,14 +892,14 @@ class MESH_OT_ydd_symmetric_edit_connect(bpy.types.Operator):
             r_edges = tuple(record.endpoint_vectors() for record in r_records)
             _CONNECT_LAST_R = r_edges
 
-            # §4.4-6: empty R (all-reuse / EDGE-mode silent no-op) is WARNING,
-            # not a silent self-mirror success.
+            # Empty R (all-reuse / EDGE-mode silent no-op) is WARNING, not a
+            # silent self-mirror success.
             if not r_records:
                 _connect_report(self, {"WARNING"}, "native connect created no edges")
                 return result
 
-            # Contract §1.3 / §4.4-1: mirror no-op only when the *effect* R is
-            # self-mirrored (incidence + §1.2 attributes, 1:1 cancellation).
+            # Mirror no-op only when the *effect* R is self-mirrored (incidence
+            # + edge attributes, 1:1 cancellation).
             if _connect_effect_is_self_mirrored(r_records, face_id_pairs, axis_index, tolerance):
                 _report_self_mirrored(self)
                 return result
@@ -1196,13 +1196,13 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
         )
         # Pre-native cluster sizes: used after native to distinguish a full
         # no-op (survivors == size) from a partial in-cluster merge
-        # (1 < survivors < size).  Contract §2.1 / §4.5 D4.
+        # (1 < survivors < size).
         cluster_sizes = {number: len(cluster) for number, cluster in enumerate(clusters, start=1)}
 
         # Mark members (+k) and their mirrors (-k) in a temporary layer so the
         # post-native re-identification is exact: a coordinate lookup would
         # miscount whenever an unrelated vertex sits within tolerance of an
-        # old member position (review finding).  The survivor of a native
+        # old member position.  The survivor of a native
         # merge inherits its member's marker.  Layer creation invalidates
         # wrappers, hence the fresh lookup table.
         group_layer = bm.verts.layers.int.get(core.VERT_MERGE_GROUP_LAYER)
@@ -1259,8 +1259,8 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
                     # marked members then still exist.  Mirroring such a
                     # cluster would merge geometry the native operator never
                     # merged.  A partial in-cluster merge (some but not all
-                    # members consumed) is a cluster-level decline under
-                    # §2.1 and must be visible (contract §4.5 D4).
+                    # members consumed) is a cluster-level decline and must
+                    # be visible.
                     if len(survivors) > 1:
                         original_size = cluster_sizes.get(cluster_number, 0)
                         if original_size and len(survivors) < original_size:
@@ -1337,7 +1337,7 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
         endpoint (5-2).  One native run would drag both sides to one point.
 
         On-plane vertices in the extended selection are shared by both side
-        clusters (contract §4.5 D7) but are **not** collapsed into either
+        clusters but are **not** collapsed into either
         side's target: each side merges only its off-plane members, and the
         on-plane verts stay put so both survivors remain linked through them
         (sequential stand-in for "each cluster = off-plane ∪ on-plane").
@@ -1377,10 +1377,10 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
         source_sign = 1.0 if target_co[axis_index] > 0.0 else -1.0
         on_plane = {index for index in extended_selection if abs(coords[index][axis_index]) <= tolerance}
         # Off-plane only — on_plane is excluded from both merge sets so it
-        # survives as the shared link between the two side survivors (§4.5 D7).
+        # survives as the shared link between the two side survivors.
         # The exclusion must be explicit: a vertex with 0 < |x| <= tolerance is
-        # on-plane by §1.1 yet has a nonzero sign, so a raw sign test alone
-        # would leak it into a side merge (adversarial-review finding).
+        # on-plane yet has a nonzero sign, so a raw sign test alone would leak
+        # it into a side merge.
         source_side = {
             index
             for index in extended_selection
@@ -1395,8 +1395,8 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
         # Step 3: rebuild per-side history.  target_index is always the FIRST
         # or LAST entry of history_indices and, being the off-plane merge
         # target, always sits in source_side.  Therefore the rebuilt endpoint
-        # equals target_index structurally (contract §4.5 D8: the old
-        # "rebuild failed → native only" branch was unreachable).
+        # equals target_index structurally (the old "rebuild failed → native
+        # only" branch was unreachable).
         source_history = [index for index in history_indices if index in source_side]
         rebuilt_endpoint = None
         if source_history:
@@ -1426,7 +1426,7 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
 
         # Group markers (source=1, mirror=2) make the post-native
         # re-identification exact; a coordinate lookup could confuse
-        # coincident vertices (review finding).  On-plane verts stay unmarked
+        # coincident vertices.  On-plane verts stay unmarked
         # (not part of either side merge).  Layer creation invalidates
         # wrappers, hence the fresh lookup table.
         group_layer = bm.verts.layers.int.get(core.VERT_MERGE_GROUP_LAYER)
@@ -1521,8 +1521,8 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
         finally:
             if not mirror_committed:
                 # Post-state recovery on every failed path, including a failed
-                # backup creation where no rollback ran (review finding):
-                # reselect the mirror side, keep a source-only history.  The
+                # backup creation where no rollback ran: reselect the mirror
+                # side, keep a source-only history.  The
                 # marker layer exists on the live mesh and inside the restored
                 # backup alike.
                 self._reselect_side_split_groups(mesh)
