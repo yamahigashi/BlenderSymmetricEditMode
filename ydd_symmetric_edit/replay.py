@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import traceback
+from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
@@ -148,22 +149,6 @@ def calculate_merge_target(
     return target / len(cluster)
 
 
-def map_mirrored_history(
-    history_coords: Sequence[Vector],
-    coords: Sequence[Vector],
-    *,
-    axis_index: int,
-    tolerance: float,
-) -> tuple[int, ...] | None:
-    """Map a history path atomically; plane coordinates resolve to themselves."""
-
-    lookup = core.build_vertex_mirror_lookup(coords, axis_index, tolerance)
-    mapped = lookup.find_all_mirrored(history_coords)
-    if any(index is None for index in mapped):
-        return None
-    return cast(tuple[int, ...], mapped)
-
-
 def _map_history_via_pairs(
     history_indices: Sequence[int],
     pairs: dict[int, int],
@@ -184,30 +169,6 @@ def _map_history_via_pairs(
             return None
         mapped.append(partner)
     return tuple(mapped)
-
-
-def _history_is_mirror_invariant(
-    history_indices: Sequence[int],
-    pairs: dict[int, int],
-) -> bool:
-    """True when ρ(H) equals H itself or reversed(H), elementwise.
-
-    A self-mirrored vertex *set* does not make the ordered connect path
-    symmetric (a zig-zag alternating between sides is the counterexample);
-    only these two sequence shapes keep the native edge set mirror-invariant.
-    On-plane vertices map to themselves in the pair table.
-    """
-
-    if not history_indices:
-        return False
-    mapped = []
-    for index in history_indices:
-        partner = pairs.get(index)
-        if partner is None:
-            return False
-        mapped.append(partner)
-    sequence = list(history_indices)
-    return mapped == sequence or mapped == sequence[::-1]
 
 
 def _vertex_snapshot(
@@ -299,6 +260,21 @@ def _set_vertex_path(
     return True
 
 
+# Test-visible Connect reports (Operator.report is not patchable; same pattern
+# as operators._FINISH_REPORTS).
+_CONNECT_REPORTS: list[tuple[str, str]] = []
+# Last extracted R edge endpoint pairs (coords only) for intermediate asserts.
+_CONNECT_LAST_R: tuple[tuple[Vector, Vector], ...] = ()
+
+
+def _connect_report(operator, level: set[str], message: str) -> None:
+    """Report and record for Connect tests."""
+
+    kind = "WARNING" if "WARNING" in level else "ERROR" if "ERROR" in level else "INFO"
+    _CONNECT_REPORTS.append((kind, message))
+    operator.report(level, message)
+
+
 def _report_missing(operator, count: int, *, partial: bool) -> None:
     if not count:
         return
@@ -308,14 +284,16 @@ def _report_missing(operator, count: int, *, partial: bool) -> None:
             f"{count} vertices have no mirror counterpart; mirrored partially",
         )
     else:
-        operator.report(
+        _connect_report(
+            operator,
             {"WARNING"},
             f"{count} vertices have no mirror counterpart; mirrored connect skipped",
         )
 
 
 def _report_self_mirrored(operator) -> None:
-    operator.report(
+    _connect_report(
+        operator,
         {"INFO"},
         "Selection is symmetric; the native result is already symmetric",
     )
@@ -326,6 +304,492 @@ def _report_partial_overlap(operator, action: str) -> None:
         {"WARNING"},
         f"Selection partially overlaps its mirror image; ran the native {action} only",
     )
+
+
+def _native_vert_connect_path() -> set[str]:
+    """Invoke native Vertex Connect Path.
+
+    Exposed as a module-level callable so fault-injection tests can replace
+    the second call without touching bpy.ops registration.
+    """
+
+    return cast(set[str], bpy.ops.mesh.vert_connect_path())
+
+
+def _remove_connect_markers(bm: bmesh.types.BMesh) -> None:
+    """Remove only the two Connect marker layers (EDGE_ORIGINAL / FACE_ID)."""
+
+    for layers, name in (
+        (bm.edges.layers.int, core.EDGE_ORIGINAL_LAYER),
+        (bm.faces.layers.int, core.FACE_ID_LAYER),
+    ):
+        layer = layers.get(name)
+        if layer is not None:
+            layers.remove(layer)
+
+
+def _ensure_int_layer(layers, name: str):
+    layer = layers.get(name)
+    if layer is None:
+        layer = layers.new(name)
+    return layer
+
+
+def _prepare_connect_markers(bm: bmesh.types.BMesh) -> None:
+    """Stamp EDGE_ORIGINAL + FACE_ID for post-hoc R extraction (§4.4-2).
+
+    Only the two Connect layers are created/overwritten — other temporary
+    layers (Knife session etc.) are left alone. Partial failure removes both
+    Connect layers before re-raising so native fallback sees a clean mesh.
+    """
+
+    try:
+        edge_layer = _ensure_int_layer(bm.edges.layers.int, core.EDGE_ORIGINAL_LAYER)
+        face_layer = _ensure_int_layer(bm.faces.layers.int, core.FACE_ID_LAYER)
+        for edge_id, edge in enumerate(bm.edges, start=1):
+            edge[edge_layer] = edge_id
+        for face_id, face in enumerate(bm.faces, start=1):
+            face[face_layer] = face_id
+    except Exception:
+        try:
+            _remove_connect_markers(bm)
+        except Exception:
+            traceback.print_exc()
+        raise
+
+
+def _remark_connect_markers(bm: bmesh.types.BMesh) -> None:
+    """Re-stamp every current edge/face so the next native call's novelty is clean."""
+
+    edge_layer = _ensure_int_layer(bm.edges.layers.int, core.EDGE_ORIGINAL_LAYER)
+    face_layer = _ensure_int_layer(bm.faces.layers.int, core.FACE_ID_LAYER)
+    for edge_id, edge in enumerate(bm.edges, start=1):
+        edge[edge_layer] = edge_id
+    for face_id, face in enumerate(bm.faces, start=1):
+        face[face_layer] = face_id
+
+
+def _edge_float_attr(bm: bmesh.types.BMesh, edge: bmesh.types.BMEdge, name: str) -> float:
+    """Non-mutating read of crease_edge / bevel_weight_edge (default 0)."""
+
+    layer = bm.edges.layers.float.get(name)
+    if layer is None:
+        return 0.0
+    return float(edge[layer])
+
+
+def _edge_attr_tuple(bm: bmesh.types.BMesh, edge: bmesh.types.BMEdge) -> tuple[bool, bool, float, float]:
+    """§1.2 guaranteed edge attributes: seam / sharp / crease / bevel weight."""
+
+    return (
+        bool(edge.seam),
+        not bool(edge.smooth),  # sharp == not smooth
+        _edge_float_attr(bm, edge, "crease_edge"),
+        _edge_float_attr(bm, edge, "bevel_weight_edge"),
+    )
+
+
+@dataclass(frozen=True)
+class _ConnectEffectEdge:
+    """One newly generated connect edge with incidence + attributes for §1.3.
+
+    Coordinates are stored as plain 3-tuples so type-checkers do not confuse
+    them with mathutils.Vector's descriptor ``__set__`` signature.
+    """
+
+    co_a: tuple[float, float, float]
+    co_b: tuple[float, float, float]
+    face_ids: frozenset[int]
+    attrs: tuple[bool, bool, float, float]
+
+    def endpoint_vectors(self) -> tuple[Vector, Vector]:
+        return Vector(self.co_a), Vector(self.co_b)
+
+
+def _extract_connect_effect_edges(bm: bmesh.types.BMesh) -> tuple[_ConnectEffectEdge, ...]:
+    """R = newly generated edges after native connect (contract §4.4-2).
+
+    Novelty is tag==0 or FACE_ID complement (contract §2.0), same as Knife.
+    Reused pre-existing edges keep a non-zero parent tag and are excluded.
+    """
+
+    path_edges = core._discover_path_edges(bm, selected_only=False)
+    face_layer = bm.faces.layers.int.get(core.FACE_ID_LAYER)
+    records: list[_ConnectEffectEdge] = []
+    for edge in path_edges:
+        if face_layer is None:
+            face_ids: frozenset[int] = frozenset()
+        else:
+            face_ids = frozenset(int(face[face_layer]) for face in edge.link_faces)
+        co_a = edge.verts[0].co
+        co_b = edge.verts[1].co
+        records.append(
+            _ConnectEffectEdge(
+                (float(co_a[0]), float(co_a[1]), float(co_a[2])),
+                (float(co_b[0]), float(co_b[1]), float(co_b[2])),
+                face_ids,
+                _edge_attr_tuple(bm, edge),
+            )
+        )
+    return tuple(records)
+
+
+def _extract_connect_r_coords(bm: bmesh.types.BMesh) -> tuple[tuple[Vector, Vector], ...]:
+    """Coordinate-only view of R (for ρ(R) multiset matching)."""
+
+    return tuple(record.endpoint_vectors() for record in _extract_connect_effect_edges(bm))
+
+
+def _edge_coords_match(
+    first_a: Vector,
+    first_b: Vector,
+    second_a: Vector,
+    second_b: Vector,
+    tolerance: float,
+) -> bool:
+    return (
+        core.coordinates_match(first_a, second_a, tolerance) and core.coordinates_match(first_b, second_b, tolerance)
+    ) or (core.coordinates_match(first_a, second_b, tolerance) and core.coordinates_match(first_b, second_a, tolerance))
+
+
+def _quantize_co_key(co: Vector, tolerance: float) -> tuple[float, float, float]:
+    scale = max(tolerance, 1.0e-12)
+    return (
+        round(round(float(co[0]) / scale) * scale, 12),
+        round(round(float(co[1]) / scale) * scale, 12),
+        round(round(float(co[2]) / scale) * scale, 12),
+    )
+
+
+def _build_face_id_pairs(
+    bm: bmesh.types.BMesh,
+    axis_index: int,
+    tolerance: float,
+) -> dict[int, int] | None:
+    """Pre-state FACE_ID → mirror FACE_ID (involutive). ``None`` if incomplete."""
+
+    face_layer = bm.faces.layers.int.get(core.FACE_ID_LAYER)
+    if face_layer is None:
+        return {}
+    by_key: dict[frozenset[tuple[float, float, float]], list[int]] = {}
+    face_keys: dict[int, frozenset[tuple[float, float, float]]] = {}
+    for face in bm.faces:
+        face_id = int(face[face_layer])
+        key = frozenset(_quantize_co_key(vertex.co, tolerance) for vertex in face.verts)
+        face_keys[face_id] = key
+        by_key.setdefault(key, []).append(face_id)
+
+    pairs: dict[int, int] = {}
+    used: set[int] = set()
+    for face_id in sorted(face_keys):
+        if face_id in used:
+            continue
+        key = face_keys[face_id]
+        mirrored_key = frozenset(
+            _quantize_co_key(core.mirror_coordinate(Vector(co), axis_index), tolerance) for co in key
+        )
+        candidates = by_key.get(mirrored_key, [])
+        if not candidates:
+            return None
+        partner: int | None = None
+        if key == mirrored_key and face_id in candidates:
+            partner = face_id
+        else:
+            for candidate in sorted(candidates):
+                if candidate not in used:
+                    partner = candidate
+                    break
+        if partner is None:
+            return None
+        pairs[face_id] = partner
+        pairs[partner] = face_id
+        used.add(face_id)
+        used.add(partner)
+    return pairs
+
+
+def _attrs_match(
+    first: tuple[bool, bool, float, float],
+    second: tuple[bool, bool, float, float],
+    tolerance: float,
+) -> bool:
+    return (
+        first[0] == second[0]
+        and first[1] == second[1]
+        and abs(first[2] - second[2]) <= tolerance
+        and abs(first[3] - second[3]) <= tolerance
+    )
+
+
+def _connect_effect_is_self_mirrored(
+    r_edges: Sequence[_ConnectEffectEdge],
+    face_id_pairs: dict[int, int] | None,
+    axis_index: int,
+    tolerance: float,
+) -> bool:
+    """True when ρ(R) equals R with 1:1 cancellation (contract §1.3).
+
+    Each edge must have a unique mirror partner in R whose link-face FACE_IDs
+    correspond under the pre-state face-pair map and whose §1.2 edge attributes
+    match. Coordinate-only multiset equality is insufficient when several edges
+    share endpoints.
+    """
+
+    if not r_edges:
+        return True
+    if face_id_pairs is None:
+        return False
+
+    unmatched = set(range(len(r_edges)))
+    while unmatched:
+        index = min(unmatched)
+        unmatched.remove(index)
+        record = r_edges[index]
+        co_a, co_b = record.endpoint_vectors()
+        mirrored_a = core.mirror_coordinate(co_a, axis_index)
+        mirrored_b = core.mirror_coordinate(co_b, axis_index)
+        mapped_faces: list[int] = []
+        for face_id in record.face_ids:
+            partner_face = face_id_pairs.get(face_id)
+            if partner_face is None:
+                return False
+            mapped_faces.append(partner_face)
+        expected_faces = Counter(mapped_faces)
+
+        partner_index: int | None = None
+        # Self-mirrored edge may pair with itself (checked first).
+        for other_index in (index, *sorted(unmatched)):
+            other = r_edges[other_index]
+            other_a, other_b = other.endpoint_vectors()
+            if not _edge_coords_match(mirrored_a, mirrored_b, other_a, other_b, tolerance):
+                continue
+            if Counter(other.face_ids) != expected_faces:
+                continue
+            if not _attrs_match(record.attrs, other.attrs, tolerance):
+                continue
+            partner_index = other_index
+            break
+        if partner_index is None:
+            return False
+        if partner_index != index:
+            unmatched.remove(partner_index)
+    return True
+
+
+def _find_vert_at(
+    bm: bmesh.types.BMesh,
+    coordinate: Vector,
+    tolerance: float,
+) -> bmesh.types.BMVert | None:
+    for vertex in bm.verts:
+        if core.coordinates_match(vertex.co, coordinate, tolerance):
+            return vertex
+    return None
+
+
+def _verts_share_edge(first: bmesh.types.BMVert, second: bmesh.types.BMVert) -> bool:
+    return any(edge.other_vert(first) is second for edge in first.link_edges)
+
+
+def _point_on_segment_and_plane(
+    point: Vector,
+    endpoint_a: Vector,
+    endpoint_b: Vector,
+    axis_index: int,
+    tolerance: float,
+) -> bool:
+    """True when *point* lies on segment A–B, is collinear, and on the mirror plane."""
+
+    if abs(float(point[axis_index])) > tolerance:
+        return False
+    # Euclidean point-to-segment (geometric, not Chebyshev identity).
+    delta = endpoint_b - endpoint_a
+    length_squared = float(delta.length_squared)
+    if length_squared <= 1.0e-30:
+        return core.coordinates_match(point, endpoint_a, tolerance)
+    factor = (point - endpoint_a).dot(delta) / length_squared
+    if factor < -1.0e-9 or factor > 1.0 + 1.0e-9:
+        return False
+    factor = max(0.0, min(1.0, factor))
+    closest = endpoint_a + factor * delta
+    return (point - closest).length <= tolerance
+
+
+def _vertex_coords_snapshot(bm: bmesh.types.BMesh) -> tuple[Vector, ...]:
+    bm.verts.ensure_lookup_table()
+    return tuple(vertex.co.copy() for vertex in bm.verts)
+
+
+def _is_new_vertex(
+    coordinate: Vector,
+    pre_coords: Sequence[Vector],
+    tolerance: float,
+) -> bool:
+    return all(not core.coordinates_match(coordinate, previous, tolerance) for previous in pre_coords)
+
+
+def _match_edge_in_pool(
+    co_a: Vector,
+    co_b: Vector,
+    pool: list[tuple[Vector, Vector]],
+    tolerance: float,
+) -> int | None:
+    for index, (other_a, other_b) in enumerate(pool):
+        if _edge_coords_match(co_a, co_b, other_a, other_b, tolerance):
+            return index
+    return None
+
+
+def _match_p_stitch_in_pool(
+    co_a: Vector,
+    co_b: Vector,
+    pool: list[tuple[Vector, Vector]],
+    pre_second_coords: Sequence[Vector],
+    axis_index: int,
+    tolerance: float,
+) -> tuple[int, int] | None:
+    """Find exactly two R′ edges A–p, p–B with *p* newly created on segment A–B."""
+
+    n = len(pool)
+    for i in range(n):
+        for j in range(i + 1, n):
+            first = pool[i]
+            second = pool[j]
+            for p_candidate, other_first in (
+                (first[0], first[1]),
+                (first[1], first[0]),
+            ):
+                for p_other, other_second in (
+                    (second[0], second[1]),
+                    (second[1], second[0]),
+                ):
+                    if not core.coordinates_match(p_candidate, p_other, tolerance):
+                        continue
+                    p = p_candidate
+                    ab_match = (
+                        core.coordinates_match(other_first, co_a, tolerance)
+                        and core.coordinates_match(other_second, co_b, tolerance)
+                    ) or (
+                        core.coordinates_match(other_first, co_b, tolerance)
+                        and core.coordinates_match(other_second, co_a, tolerance)
+                    )
+                    if not ab_match:
+                        continue
+                    if not _is_new_vertex(p, pre_second_coords, tolerance):
+                        continue
+                    if not _point_on_segment_and_plane(p, co_a, co_b, axis_index, tolerance):
+                        continue
+                    return (i, j)
+    return None
+
+
+def _preexisting_realization(
+    bm: bmesh.types.BMesh,
+    co_a: Vector,
+    co_b: Vector,
+    pre_second_coords: Sequence[Vector],
+    axis_index: int,
+    tolerance: float,
+) -> bool:
+    """True when A–B is already realized without consuming R′.
+
+    Allowed forms:
+    - a direct edge A–B
+    - A–p–B where *p* already existed before the second native (so the stitch
+      came from the first native / was already in R ∩ ρ(R)), is on-plane, and
+      lies on segment A–B. Arbitrary unrelated on-plane vertices are rejected.
+    """
+
+    vertex_a = _find_vert_at(bm, co_a, tolerance)
+    vertex_b = _find_vert_at(bm, co_b, tolerance)
+    if vertex_a is None or vertex_b is None:
+        return False
+    if _verts_share_edge(vertex_a, vertex_b):
+        return True
+    for edge in vertex_a.link_edges:
+        mid = edge.other_vert(vertex_a)
+        if _is_new_vertex(mid.co, pre_second_coords, tolerance):
+            continue  # new p must be claimed via the R′ pool, not here
+        if not _point_on_segment_and_plane(mid.co, co_a, co_b, axis_index, tolerance):
+            continue
+        if _verts_share_edge(mid, vertex_b):
+            return True
+    return False
+
+
+def _verify_connect_mirror_effect(
+    bm: bmesh.types.BMesh,
+    r_edges: Sequence[tuple[Vector, Vector]],
+    pre_second_coords: Sequence[Vector],
+    axis_index: int,
+    tolerance: float,
+) -> bool:
+    """ρ(R) ↔ R′ multiset match with pre-existing cancellation (contract §4.4-4).
+
+    R′ is re-extracted after the second native (tag==0 + FACE_ID complement).
+    Each non-self-mirrored ρ(e) must be realized by exactly one of:
+
+    1. a direct edge in R′
+    2. a new-p stitch A–p–B using exactly two R′ edges (p created by the
+       second native, on-plane, on segment A–B)
+    3. a pre-existing realization from the first native (direct edge or
+       pre-existing p-stitch) — required when R ∩ ρ(R) is non-empty (zig-zag)
+
+    Any leftover R′ edge is excess generation and fails verification.
+    """
+
+    r_prime = list(_extract_connect_r_coords(bm))
+    pool: list[tuple[Vector, Vector]] = list(r_prime)
+
+    for co_a, co_b in r_edges:
+        mirrored_a = core.mirror_coordinate(co_a, axis_index)
+        mirrored_b = core.mirror_coordinate(co_b, axis_index)
+        if core.coordinates_match(co_a, mirrored_b, tolerance) and core.coordinates_match(
+            co_b,
+            mirrored_a,
+            tolerance,
+        ):
+            # Self-mirrored edge: already realized by the first native; must
+            # still exist as a direct edge (not required to appear in R′).
+            vertex_a = _find_vert_at(bm, co_a, tolerance)
+            vertex_b = _find_vert_at(bm, co_b, tolerance)
+            if vertex_a is None or vertex_b is None or not _verts_share_edge(vertex_a, vertex_b):
+                return False
+            continue
+
+        direct = _match_edge_in_pool(mirrored_a, mirrored_b, pool, tolerance)
+        if direct is not None:
+            pool.pop(direct)
+            continue
+
+        stitch = _match_p_stitch_in_pool(
+            mirrored_a,
+            mirrored_b,
+            pool,
+            pre_second_coords,
+            axis_index,
+            tolerance,
+        )
+        if stitch is not None:
+            for index in sorted(stitch, reverse=True):
+                pool.pop(index)
+            continue
+
+        # Already present from first native (R ∩ ρ(R) or reused pre-edge).
+        if _preexisting_realization(
+            bm,
+            mirrored_a,
+            mirrored_b,
+            pre_second_coords,
+            axis_index,
+            tolerance,
+        ):
+            continue
+
+        return False  # missing mirror realization
+
+    # Excess generation: any unmatched R′ edge fails (contract §4.4-4 逸脱).
+    return not pool
 
 
 class MESH_OT_ydd_symmetric_edit_connect(bpy.types.Operator):
@@ -340,11 +804,31 @@ class MESH_OT_ydd_symmetric_edit_connect(bpy.types.Operator):
         return context.mode == "EDIT_MESH" and context.edit_object is not None
 
     def execute(self, context):
+        global _CONNECT_LAST_R
+        _CONNECT_REPORTS.clear()
+        _CONNECT_LAST_R = ()
+
         symmetry = _symmetry_parameters(context)
         if symmetry is None:
-            return bpy.ops.mesh.vert_connect_path()
+            return _native_vert_connect_path()
         obj, axis_index, tolerance = symmetry
         mesh = cast(bpy.types.Mesh, obj.data)
+
+        # Knife (etc.) session in progress: do not touch temporary layers.
+        try:
+            from . import operators as _operators
+
+            sessions_active = bool(_operators._SESSIONS)
+        except Exception:
+            sessions_active = False
+        if sessions_active:
+            _connect_report(
+                self,
+                {"INFO"},
+                "A cut-tool session is active; ran the native connect only",
+            )
+            return _native_vert_connect_path()
+
         bm = bmesh.from_edit_mesh(mesh)
         coords, selected_indices, history_coords, history_indices = _vertex_snapshot(bm)
         snapshot = classify_mirror_selection(
@@ -355,35 +839,73 @@ class MESH_OT_ydd_symmetric_edit_connect(bpy.types.Operator):
         )
         mirrored_history = _map_history_via_pairs(history_indices, snapshot.pairs)
 
-        result = cast(set[str], bpy.ops.mesh.vert_connect_path())
+        # Contract §4.4-2: stamp markers before native so R is post-hoc recoverable.
+        try:
+            _prepare_connect_markers(bm)
+            face_id_pairs = _build_face_id_pairs(bm, axis_index, tolerance)
+            bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+        except Exception:
+            traceback.print_exc()
+            try:
+                bm = bmesh.from_edit_mesh(mesh)
+                _remove_connect_markers(bm)
+                bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+            except Exception:
+                traceback.print_exc()
+            return _native_vert_connect_path()
+
+        result = _native_vert_connect_path()
         if "FINISHED" not in result:
-            return result
-        if snapshot.overlap is MirrorOverlap.SELF_MIRRORED:
-            if _history_is_mirror_invariant(history_indices, snapshot.pairs):
-                # The native cut path is mirror-invariant, so one native run
-                # already produced the symmetric result.
-                _report_self_mirrored(self)
-            else:
-                _report_partial_overlap(self, "connect")
-            return result
-        if snapshot.overlap is MirrorOverlap.PARTIAL:
-            _report_partial_overlap(self, "connect")
-            return result
-        if mirrored_history is None:
-            _report_missing(self, max(1, len(snapshot.missing)), partial=False)
+            try:
+                bm = bmesh.from_edit_mesh(mesh)
+                _remove_connect_markers(bm)
+                bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+            except Exception:
+                traceback.print_exc()
             return result
 
-        mirrored_history_coords = tuple(coords[index].copy() for index in mirrored_history)
-        selected_coords = tuple(coords[index].copy() for index in selected_indices)
-        # The source-side mesh is already mutated, so from here on every path,
-        # including exceptions, must return `result`: returning CANCELLED (or
-        # raising) would skip the undo push and fold that mutation into the
-        # previous undo step.
+        # Contract §2.2-4: native has mutated the mesh — every post-native path
+        # (including exceptions) must return `result` so the undo push is kept.
         backup_mesh = None
         mirror_warning = None
+        mirror_level = "WARNING"
+        backup_creation_failed = False
+        rollback_failed = False
         try:
             bm = bmesh.from_edit_mesh(mesh)
-            backup_mesh = backup.create_topology_backup(bm)
+            r_records = _extract_connect_effect_edges(bm)
+            r_edges = tuple(record.endpoint_vectors() for record in r_records)
+            _CONNECT_LAST_R = r_edges
+
+            # §4.4-6: empty R (all-reuse / EDGE-mode silent no-op) is WARNING,
+            # not a silent self-mirror success.
+            if not r_records:
+                _connect_report(self, {"WARNING"}, "native connect created no edges")
+                return result
+
+            # Contract §1.3 / §4.4-1: mirror no-op only when the *effect* R is
+            # self-mirrored (incidence + §1.2 attributes, 1:1 cancellation).
+            if _connect_effect_is_self_mirrored(r_records, face_id_pairs, axis_index, tolerance):
+                _report_self_mirrored(self)
+                return result
+
+            # Counterpart missing → legitimate decline (native kept + WARNING).
+            if mirrored_history is None:
+                _report_missing(self, max(1, len(snapshot.missing)), partial=False)
+                return result
+
+            mirrored_history_coords = tuple(coords[index].copy() for index in mirrored_history)
+            selected_coords = tuple(coords[index].copy() for index in selected_indices)
+
+            try:
+                backup_mesh = backup.create_topology_backup(bm)
+            except Exception as exc:
+                traceback.print_exc()
+                backup_creation_failed = True
+                mirror_warning = f"Could not create topology backup for mirrored connect: {exc}"
+                mirror_level = "ERROR"
+                raise
+
             try:
                 bm = bmesh.from_edit_mesh(mesh)
                 if not _set_vertex_path(
@@ -394,25 +916,42 @@ class MESH_OT_ydd_symmetric_edit_connect(bpy.types.Operator):
                 ):
                     mirror_warning = "Mirrored connect path changed after native execution; mirrored connect skipped"
                 else:
+                    # Snapshot verts before second native (for p-newness).
+                    pre_second_coords = _vertex_coords_snapshot(bm)
+                    # Re-stamp so the second call's novelty set is R′ only.
+                    _remark_connect_markers(bm)
                     bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
-                    mirrored_result = cast(set[str], bpy.ops.mesh.vert_connect_path())
-                    if "FINISHED" not in mirrored_result:
-                        # A clean native refusal keeps the source result;
-                        # rollback is reserved for exceptions.
-                        mirror_warning = "Mirrored connect did not finish; applied the native connect only"
+                    second_result = _native_vert_connect_path()
+                    bm = bmesh.from_edit_mesh(mesh)
+                    # CANCELLED → always rollback regardless of side effects.
+                    if "CANCELLED" in second_result and "FINISHED" not in second_result:
+                        backup.restore_topology_backup(mesh, backup_mesh)
+                        mirror_warning = "Mirrored connect returned CANCELLED; rolled back to the native connect only"
+                    elif not _verify_connect_mirror_effect(
+                        bm,
+                        r_edges,
+                        pre_second_coords,
+                        axis_index,
+                        tolerance,
+                    ):
+                        backup.restore_topology_backup(mesh, backup_mesh)
+                        mirror_warning = (
+                            "Mirrored connect effect did not match the expected mirror; "
+                            "rolled back to the native connect only"
+                        )
             except Exception:
                 traceback.print_exc()
-                backup.restore_topology_backup(mesh, backup_mesh)
-                mirror_warning = "Unexpected error; the mirrored connect was rolled back"
-        except Exception:
-            # Backup creation or the rollback itself failed.  There is no way
-            # to restore, so returning `result` (and keeping the undo push)
-            # takes priority over a perfect mesh state.
-            traceback.print_exc()
-            mirror_warning = mirror_warning or "Internal error during the mirrored connect"
-        finally:
+                try:
+                    backup.restore_topology_backup(mesh, backup_mesh)
+                    mirror_warning = mirror_warning or "Unexpected error; the mirrored connect was rolled back"
+                except Exception:
+                    rollback_failed = True
+                    traceback.print_exc()
+                    mirror_warning = mirror_warning or "Internal error during the mirrored connect"
+                    mirror_level = "ERROR"
+
+            # Selection restore is best effort (signature compare is post-normalize).
             try:
-                # Selection restore is best effort on every path.
                 bm = bmesh.from_edit_mesh(mesh)
                 if _set_vertex_path(
                     bm,
@@ -429,19 +968,27 @@ class MESH_OT_ydd_symmetric_edit_connect(bpy.types.Operator):
             except Exception:
                 traceback.print_exc()
                 mirror_warning = mirror_warning or "Could not restore the original selection after the mirrored connect"
+        except Exception:
+            if not backup_creation_failed:
+                traceback.print_exc()
+            mirror_warning = mirror_warning or "Internal error during the mirrored connect"
+            if backup_creation_failed or rollback_failed:
+                mirror_level = "ERROR"
+        finally:
             try:
-                # The backup ID layer survives both the success path and the
-                # rollback path (the rollback writes it back from the backup
-                # mesh), so it is removed unconditionally.
                 bm = bmesh.from_edit_mesh(mesh)
+                # Backup ID layer + Connect markers; best-effort on every path.
                 core.remove_temporary_layers(bm)
                 bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
             except Exception:
                 traceback.print_exc()
             backup.remove_backup(backup_mesh)
+
         try:
             if mirror_warning:
-                self.report({"WARNING"}, mirror_warning)
+                if backup_creation_failed or rollback_failed:
+                    mirror_level = "ERROR"
+                _connect_report(self, {mirror_level}, mirror_warning)
         except Exception:
             traceback.print_exc()
         return result

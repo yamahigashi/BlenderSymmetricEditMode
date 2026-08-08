@@ -101,34 +101,18 @@ def check_merge_target_precomputation() -> None:
 
 
 def check_connect_history_mapping_is_all_or_nothing() -> None:
-    coords = tuple(
-        Vector(co)
-        for co in (
-            (-1.0, 0.0, 0.0),
-            (1.0, 0.0, 0.0),
-            (0.0, 1.0, 0.0),
-            (-2.0, 2.0, 0.0),
-            (2.0, 2.0, 0.0),
-        )
-    )
-    history = (coords[0].copy(), coords[2].copy(), coords[3].copy())
-    assert replay.map_mirrored_history(
-        history,
-        coords,
-        axis_index=0,
-        tolerance=1.0e-5,
-    ) == (1, 2, 4)
+    """``_map_history_via_pairs`` is all-or-nothing over the involutive pair table."""
 
-    incomplete_coords = coords[:-1]
-    assert (
-        replay.map_mirrored_history(
-            history,
-            incomplete_coords,
-            axis_index=0,
-            tolerance=1.0e-5,
-        )
-        is None
-    )
+    # Indices: 0=(-1,0), 1=(1,0), 2=(0,1), 3=(-2,2), 4=(2,2)
+    pairs = {0: 1, 1: 0, 2: 2, 3: 4, 4: 3}
+    assert replay._map_history_via_pairs((0, 2, 3), pairs) == (1, 2, 4)
+
+    # Vertex 3 has no entry in the pair table → whole path declines.
+    incomplete_pairs = {0: 1, 1: 0, 2: 2}
+    assert replay._map_history_via_pairs((0, 2, 3), incomplete_pairs) is None
+
+    # Empty path maps to empty (no unpaired entries).
+    assert replay._map_history_via_pairs((), pairs) == ()
 
 
 def check_remove_backup_is_noexcept() -> None:
