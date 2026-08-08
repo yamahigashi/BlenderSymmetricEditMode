@@ -581,11 +581,15 @@ def _finish_rip_session(
     The native result already changed the mesh, so this always returns
     FINISHED; a mirror failure restores the pre-mirror state and reports a
     WARNING while keeping the native rip intact (undo stays one step).
+    Backup creation failure is fatal ERROR (contract §2.2-4), same as the
+    cut-tool finish path.
     """
 
     backup_mesh = None
     mirrored_count = 0
     reason: str | None = None
+    backup_creation_failed = False
+    rollback_failed = False
     try:
         if session.rip is None:
             reason = "the pre-rip snapshot was lost"
@@ -593,14 +597,25 @@ def _finish_rip_session(
             bm = bmesh.from_edit_mesh(obj.data)
             reason = rip.preflight_reason(bm, session.rip, session.mirror_face_ids)
             if reason is None:
-                backup_mesh = backup.create_topology_backup(bm)
-                bm = bmesh.from_edit_mesh(obj.data)
-                mirrored_count, reason = rip.apply_mirrored_rip(bm, session.rip, session.mirror_face_ids)
-                if reason is None:
-                    bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=True)
-                else:
-                    mirrored_count = 0
-                    backup.restore_topology_backup(obj.data, backup_mesh)
+                try:
+                    backup_mesh = backup.create_topology_backup(bm)
+                except Exception as exc:
+                    traceback.print_exc()
+                    backup_creation_failed = True
+                    reason = f"Could not create topology backup for rollback: {exc}"
+                if backup_mesh is not None:
+                    bm = bmesh.from_edit_mesh(obj.data)
+                    mirrored_count, reason = rip.apply_mirrored_rip(bm, session.rip, session.mirror_face_ids)
+                    if reason is None:
+                        bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=True)
+                    else:
+                        mirrored_count = 0
+                        try:
+                            backup.restore_topology_backup(obj.data, backup_mesh)
+                        except Exception:
+                            traceback.print_exc()
+                            rollback_failed = True
+                            reason = f"Rip mirror failed and rollback failed: {reason}"
     except Exception as exc:
         traceback.print_exc()
         reason = str(exc)
@@ -609,6 +624,8 @@ def _finish_rip_session(
                 backup.restore_topology_backup(obj.data, backup_mesh)
             except Exception:
                 traceback.print_exc()
+                rollback_failed = True
+                reason = f"Rip mirror failed and rollback failed: {exc}"
     finally:
         if obj is not None and obj.mode == "EDIT":
             try:
@@ -621,9 +638,10 @@ def _finish_rip_session(
         cleanup_session(window_pointer, keep_history_record=True)
 
     if reason is not None:
-        operator.report({"WARNING"}, f"ydd Symmetric Edit: Rip was not mirrored: {reason}")
+        level = {"ERROR"} if backup_creation_failed or rollback_failed else {"WARNING"}
+        _finish_report(operator, level, f"ydd Symmetric Edit: Rip was not mirrored: {reason}")
     else:
-        operator.report({"INFO"}, f"Mirrored Rip across {mirrored_count} seam edge(s)")
+        _finish_report(operator, {"INFO"}, f"Mirrored Rip across {mirrored_count} seam edge(s)")
     return {"FINISHED"}
 
 

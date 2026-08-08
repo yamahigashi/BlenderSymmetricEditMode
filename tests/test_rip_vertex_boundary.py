@@ -18,8 +18,9 @@ Serialized cases on an X-symmetric grid plane:
                 backup while keeping the native rip.
 5. bothsides    disjoint both-sides selection (no mirror pair): the session
                 runs and the result stays X-symmetric.
-6. crossing     selection contains a mirror pair: guard passes through and
-                the session never starts.  Must stay last (see case list).
+6. crossing     selection contains a disconnected mirror pair: session may
+                start (overlap passthrough removed in Phase 4) but native
+                rip fails / leaves an unmirrored result.  Must stay last.
 """
 
 from __future__ import annotations
@@ -230,6 +231,7 @@ def run_case(name, select_ij, cursor_ij, verify, *, mutate=None):
             STATE["baseline"] = topology_counts(bm)
             select_verts(bm, select_ij)
             bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+            operators._FINISH_REPORTS.clear()
 
             def settled():
                 try:
@@ -302,14 +304,33 @@ def verify_rollback(bm):
         rip.apply_mirrored_rip = STATE["original_apply"]
 
 
+def warning_messages():
+    return [message for kind, message in operators._FINISH_REPORTS if kind == "WARNING"]
+
+
 def verify_crossing_passthrough(bm):
-    # Mirror-pair selection: the guard skips the session; native rips one
-    # island unmirrored.
-    assert not operators._SESSIONS, "crossing selection must not create a session"
+    # Disconnected mirror-pair selection: after settle the session is gone.
+    # Native typically fails ("Rip failed"); if it rips anything it stays
+    # unmirrored (no clean seam for either path).  Must stay last in the
+    # case list (a failed native V can poison the next simulated rip).
+    #
+    # Phase 4 removed the prepare-time overlap passthrough: a native-only
+    # change must surface as a visible WARNING (not silent INFO success).
+    # Asserting the WARNING keeps the old guard from being re-introduced
+    # as a silent path that would still pass coordinate checks.
+    assert not operators._SESSIONS, "crossing selection must leave no live session"
     dv = len(bm.verts) - STATE["baseline"][0]
     assert dv in (0, 1, 2), f"expected a native-only rip at most, got dv={dv}"
     if dv:
         assert vertex_multiset(bm) != mirrored_multiset(bm), "crossing rip must not be mirrored"
+        warnings = warning_messages()
+        assert warnings, (
+            f"crossing with native-only change (dv={dv}) must report WARNING, got {list(operators._FINISH_REPORTS)}"
+        )
+        assert any(
+            "not mirrored" in message or "Rip was not mirrored" in message or "partial" in message.lower()
+            for message in warnings
+        ), warnings
     assert_layers_removed(bm)
 
 

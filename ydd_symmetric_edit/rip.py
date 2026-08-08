@@ -19,6 +19,16 @@ R0 measurements (contract §5, identical on Blender 4.2.23 / 5.2.0):
 The mirror application therefore reflects the *observed* seam onto the paired
 edges and replays ``split_edges`` there, then assigns mirrored final
 coordinates to the matching copies.
+
+Axis-crossing (contract §4.3, S3 measurements):
+
+- Selection overlap is no longer a prepare-time passthrough; the post-native
+  seam is the sole criterion.  A fully self-mirrored seam (seam edge set
+  closed under endpoint mirror: S = ρ(S)) takes the V-opening path: source
+  bank = native moved/selected bank, non-source bank coordinates replaced by
+  ρ of the mirror-role source vertex.  Partial self-overlap (S ∩ ρ(S) nonempty
+  but S ≠ ρ(S)) declines with a visible WARNING.  Bank identity also requires
+  selection/movement agreement and seam-wide face-ID side consistency.
 """
 
 from __future__ import annotations
@@ -33,7 +43,6 @@ from ._types import (
     Coordinate3D,
     FaceId,
     MirrorFaceMap,
-    MirrorOverlap,
     RipDupSignature,
     RipSignature,
     RipSnapshot,
@@ -62,31 +71,17 @@ def prepare_guard_reason(context, bm: bmesh.types.BMesh, axis_index: int, tolera
     if not selected:
         return "INFO", "Nothing selected to rip"
 
-    # This on-plane guard stays ahead of the overlap classification: Rip does
-    # not support on-plane selections at all, classification aside.
+    # This on-plane guard stays ahead of any seam classification: Rip does
+    # not support on-plane selections at all (contract §4.3-1).
     on_plane = sum(1 for vertex in selected if abs(vertex.co[axis_index]) <= tolerance)
     if on_plane:
         return "WARNING", f"{on_plane} selected vertex(es) lie on the mirror plane"
 
-    coords = [vertex.co.copy() for vertex in bm.verts]
-    selected_indices = [index for index, vertex in enumerate(bm.verts) if vertex.select and not vertex.hide]
-    classification = core.classify_selection_overlap(
-        coords,
-        selected_indices,
-        axis_index=axis_index,
-        tolerance=tolerance,
-    )
-    if classification.overlap is not MirrorOverlap.DISJOINT:
-        return "INFO", "The selection overlaps its own mirror image"
-    # Missing counterparts (incomplete classification) deliberately do NOT
-    # decline here: reports from this pre-session hook run inside the
-    # PASS_THROUGH intercept and never reach the user.  The session continues
-    # and the post-rip preflight declines with its visible WARNING
-    # ("a seam vertex has no mirrored counterpart") while the all-or-nothing
-    # rollback keeps the native result intact.
-    # DISJOINT and complete: the session continues even for a both-sides
-    # selection.  The mirrored-seam-ripped check in _derive and the
-    # all-or-nothing rollback stay in place as the safety net.
+    # Selection/mirror overlap is deliberately not declined here (contract
+    # §4.3-2).  The session continues; post-native seam analysis decides
+    # between the external split path, the self-mirrored V-opening path, or a
+    # visible WARNING decline (partial self-overlap / missing counterparts).
+    del axis_index, tolerance
     return None
 
 
@@ -208,6 +203,7 @@ class _DerivedRip:
     fill_faces: list[bmesh.types.BMFace]
     verts_by_id: dict[int, list[bmesh.types.BMVert]]
     mirror_seam_edges: dict[int, bmesh.types.BMEdge]
+    self_mirrored: bool = False
 
 
 def _derive(
@@ -308,7 +304,66 @@ def _derive(
     if not dup_ids.issubset(seam_vertex_ids):
         return None, "a duplicated vertex is not part of any seam edge (unsupported result)"
 
-    # Resolve the mirrored counterpart edge for every seam edge.
+    # Classify self-mirror status via seam *edge* set mirror-closure
+    # (contract §4.3-3): full → V-opening path; partial → explicit decline.
+    # Vertex-only "every dup's mirror is also a dup" is necessary but not
+    # sufficient: a mixed seam {A–A′, A–B} with unduplicated extension
+    # endpoint B has all dups self-paired yet ρ(A–B)=A′–B′ is not a seam
+    # edge, so V-opening would leave asymmetric topology.
+    for vertex_id in dup_ids:
+        record = records.get(vertex_id)
+        if record is None:
+            return None, f"seam vertex {vertex_id} is outside the captured one-ring"
+        if record.mirror_vertex_id is None:
+            return None, "a seam vertex has no mirrored counterpart"
+
+    seam_edge_keys: set[frozenset[int]] = set()
+    for endpoint_ids, _group in seam_edge_pairs.values():
+        seam_edge_keys.add(frozenset(endpoint_ids))
+
+    mirrored_edge_keys: set[frozenset[int]] = set()
+    for endpoints in seam_edge_keys:
+        mirrored_endpoints: list[int] = []
+        for vertex_id in endpoints:
+            record = records.get(vertex_id)
+            if record is None:
+                return None, f"seam vertex {vertex_id} is outside the captured one-ring"
+            if record.mirror_vertex_id is None:
+                return None, "a seam vertex has no mirrored counterpart"
+            mirrored_endpoints.append(record.mirror_vertex_id)
+        mirrored_edge_keys.add(frozenset(mirrored_endpoints))
+
+    if seam_edge_keys == mirrored_edge_keys:
+        fully_self_mirrored = True
+    elif seam_edge_keys & mirrored_edge_keys:
+        return None, "partial self-overlap is not supported yet"
+    else:
+        fully_self_mirrored = False
+
+    # Preflight the face pairing needed to tell copies / banks apart.
+    for dup in dup_vertices.values():
+        for face_ids in dup.copy_face_ids:
+            for face_id in face_ids:
+                if FaceId(face_id) not in mirror_face_ids:
+                    return None, "a ripped face has no exact mirrored counterpart"
+
+    if fully_self_mirrored:
+        # No external mirror edges to split; bank identity is resolved at apply
+        # time from selection + pre-native mirror_vertex_id + face-ID sets.
+        return (
+            _DerivedRip(
+                dup_vertices=dup_vertices,
+                seam_edge_pairs=seam_edge_pairs,
+                fill_faces=fill_faces,
+                verts_by_id=verts_by_id,
+                mirror_seam_edges={},
+                self_mirrored=True,
+            ),
+            None,
+        )
+
+    # External (non-self-mirrored) path: resolve the mirrored counterpart edge
+    # for every seam edge.  Mirror endpoints must still be unripped.
     mirror_seam_edges: dict[int, bmesh.types.BMEdge] = {}
     used_mirror_edges: set[int] = set()
     for edge_id, (endpoint_ids, _group) in seam_edge_pairs.items():
@@ -324,6 +379,9 @@ def _derive(
             if not group:
                 return None, "a mirrored seam vertex disappeared during Rip"
             if len(group) > 1:
+                # Should have been caught as partial self-overlap above when
+                # the ripped mirror is itself a seam vertex; any residual case
+                # (mirror ripped but not classified as seam) stays declined.
                 return None, "a mirrored seam vertex was itself ripped (selection spans both sides?)"
             mirror_endpoint_verts.append(group[0])
         mirror_edge = bm.edges.get(mirror_endpoint_verts)
@@ -334,13 +392,6 @@ def _derive(
         used_mirror_edges.add(mirror_edge.index)
         mirror_seam_edges[edge_id] = mirror_edge
 
-    # Preflight the face pairing needed to tell mirrored copies apart later.
-    for dup in dup_vertices.values():
-        for face_ids in dup.copy_face_ids:
-            for face_id in face_ids:
-                if FaceId(face_id) not in mirror_face_ids:
-                    return None, "a ripped face has no exact mirrored counterpart"
-
     return (
         _DerivedRip(
             dup_vertices=dup_vertices,
@@ -348,6 +399,7 @@ def _derive(
             fill_faces=fill_faces,
             verts_by_id=verts_by_id,
             mirror_seam_edges=mirror_seam_edges,
+            self_mirrored=False,
         ),
         None,
     )
@@ -376,11 +428,17 @@ def apply_mirrored_rip(
 
     Returns ``(mirrored_seam_edge_count, failure_reason)``.  The caller owns
     the topology backup and must roll back when a reason is returned.
+
+    Fully self-mirrored seams take the V-opening path (coordinate overwrite
+    only); ordinary seams still split the external mirror edge set.
     """
 
     derived, reason = _derive(bm, snapshot, mirror_face_ids)
     if reason is not None or derived is None:
         return 0, reason or "internal error deriving the rip result"
+
+    if derived.self_mirrored:
+        return apply_self_mirrored_rip(bm, snapshot, mirror_face_ids, derived)
 
     axis_index = snapshot.axis_index
     records = snapshot.record_by_id()
@@ -454,6 +512,136 @@ def apply_mirrored_rip(
             return 0, "the mirrored fill produced a different number of faces"
 
     return len(mirror_edges), None
+
+
+def apply_self_mirrored_rip(
+    bm: bmesh.types.BMesh,
+    snapshot: RipSnapshot,
+    mirror_face_ids: MirrorFaceMap,
+    derived: _DerivedRip | None = None,
+) -> tuple[int, str | None]:
+    """V-open a fully self-mirrored seam: coordinate overwrite only (no topo).
+
+    source bank = native moved/selected bank (kept).  Each non-source copy of
+    vertex V receives ρ of the source copy of mirror(V) — role-based, not
+    same-vid overwrite (S3 / contract §4.3-3).  Fill faces ride along because
+    their corners are the bank vertices.
+    """
+
+    if derived is None:
+        derived, reason = _derive(bm, snapshot, mirror_face_ids)
+        if reason is not None or derived is None:
+            return 0, reason or "internal error deriving the rip result"
+    if not derived.self_mirrored:
+        return 0, "internal error: self-mirrored path invoked on a non-self-mirrored seam"
+
+    records = snapshot.record_by_id()
+    axis_index = snapshot.axis_index
+
+    source_by_vid: dict[int, bmesh.types.BMVert] = {}
+    nonsource_by_vid: dict[int, bmesh.types.BMVert] = {}
+    source_face_ids_by_vid: dict[int, frozenset[int]] = {}
+
+    for vertex_id, dup in derived.dup_vertices.items():
+        source, nonsource, source_face_ids, identify_reason = _identify_source_bank(dup, records[vertex_id])
+        if identify_reason is not None or source is None or nonsource is None or source_face_ids is None:
+            return 0, identify_reason or f"could not identify banks of vertex {vertex_id}"
+        # Face-ID sets already distinguish the two copies; require they stay
+        # distinct after excluding fill (checked in _derive).  Cross-check that
+        # the partner's face sets are resolvable via the face pair table so
+        # bank identity is well-defined under §2(iv).
+        for face_ids in dup.copy_face_ids:
+            for face_id in face_ids:
+                if FaceId(face_id) not in mirror_face_ids:
+                    return 0, "a ripped face has no exact mirrored counterpart"
+        source_by_vid[vertex_id] = source
+        nonsource_by_vid[vertex_id] = nonsource
+        source_face_ids_by_vid[vertex_id] = source_face_ids
+
+    # Seam-wide bank consistency: source(V) and source(mirror(V)) must sit on
+    # face-paired sides.  A mixed face-side assignment across vertices means
+    # bank identity is not a single global choice (§2(iv) / §4.3-3).
+    checked_pairs: set[frozenset[int]] = set()
+    for vertex_id, source_face_ids in source_face_ids_by_vid.items():
+        mirror_vertex_id = records[vertex_id].mirror_vertex_id
+        if mirror_vertex_id is None:
+            return 0, "a seam vertex has no mirrored counterpart"
+        pair_key = frozenset((vertex_id, mirror_vertex_id))
+        if pair_key in checked_pairs:
+            continue
+        checked_pairs.add(pair_key)
+        partner_face_ids = source_face_ids_by_vid.get(mirror_vertex_id)
+        if partner_face_ids is None:
+            return 0, "a self-mirrored seam vertex has no source counterpart"
+        expected = frozenset(int(mirror_face_ids[FaceId(face_id)]) for face_id in source_face_ids)
+        if expected != partner_face_ids:
+            return 0, "source banks have inconsistent face-sides across the seam"
+
+    # Role-based V-opening: nonsource(V) ← ρ(source(mirror(V))).
+    for vertex_id, nonsource in nonsource_by_vid.items():
+        mirror_vertex_id = records[vertex_id].mirror_vertex_id
+        if mirror_vertex_id is None:
+            return 0, "a seam vertex has no mirrored counterpart"
+        source_mirror = source_by_vid.get(mirror_vertex_id)
+        if source_mirror is None:
+            return 0, "a self-mirrored seam vertex has no source counterpart"
+        nonsource.co = core.mirror_coordinate(source_mirror.co, axis_index)
+        nonsource.select = False
+
+    # Native already selects the source bank; re-assert so selection state is
+    # definite after our non-source clear.
+    for source in source_by_vid.values():
+        source.select = True
+
+    return len(derived.seam_edge_pairs), None
+
+
+def _identify_source_bank(
+    dup: _DupVertex, record: RipVertexRecord
+) -> tuple[bmesh.types.BMVert | None, bmesh.types.BMVert | None, frozenset[int] | None, str | None]:
+    """Pick (source, non-source, source face-IDs) for one duplicated seam vertex.
+
+    Preference order (contract §4.3-3 / S3):
+    1. Exactly one selected copy → that is the native moved bank, provided
+       movement (when measurable) does not contradict the selection signal.
+    2. Exactly one copy that left the pre-rip location → moved bank.
+    3. Zero move / ambiguous selection → decline (caller keeps native result).
+    """
+
+    copies = dup.copies
+    if len(copies) != 2:
+        return None, None, None, f"vertex {dup.vertex_id} does not have exactly two copies"
+
+    old = Vector(record.location.as_tuple())
+    moved = [copy for copy in copies if (copy.co - old).length > _MOVE_EPSILON]
+    selected = [copy for copy in copies if copy.select]
+
+    def _banks(source: bmesh.types.BMVert) -> tuple[bmesh.types.BMVert, bmesh.types.BMVert, frozenset[int]]:
+        nonsource = copies[1] if copies[0] is source else copies[0]
+        source_index = 0 if copies[0] is source else 1
+        return source, nonsource, dup.copy_face_ids[source_index]
+
+    if len(selected) == 1:
+        source, nonsource, source_face_ids = _banks(selected[0])
+        # Movement is always measurable from the pre-rip snapshot.  Accept
+        # selection only when it agrees with movement (or both banks still
+        # sit at the pre-state location — zero-move / Esc).
+        source_moved = source in moved
+        nonsource_moved = nonsource in moved
+        if source_moved and nonsource_moved:
+            return None, None, None, "both banks of a self-mirrored seam moved (unsupported)"
+        if (not source_moved) and nonsource_moved:
+            return None, None, None, "selection and movement disagree about the source bank"
+        # Consistent: source moved & nonsource stationary, or zero-move.
+        return source, nonsource, source_face_ids, None
+
+    if len(moved) == 1:
+        source, nonsource, source_face_ids = _banks(moved[0])
+        return source, nonsource, source_face_ids, None
+
+    if len(moved) > 1:
+        return None, None, None, "both banks of a self-mirrored seam moved (unsupported)"
+    return None, None, None, "could not identify the source bank of the self-mirrored seam"
 
 
 def _mirror_fill_faces(
