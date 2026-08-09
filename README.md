@@ -10,6 +10,10 @@ symmetrical mesh:
 - **Topology edits** — **Rip (V / Alt+V)**, **Vertex Connect (J)**, and
   **Merge Vertices (M)**. The operation runs on the selected side and is
   applied to the mirrored vertices in the same step.
+- **Removal tools** — the **Delete menu (X / Del)**, **Dissolve
+  Vertices/Edges/Faces**, **Dissolve Selection (Ctrl+X)**, **Edge Collapse**,
+  and **Edge Loops**. The selection is expanded to its mirrored counterparts
+  and the native operator runs once, so both sides change together.
 
 In both cases the native tool remains the one you are using: shortcuts, modal
 controls, operator options, and the Adjust Last Operation (F9) panel all stay
@@ -136,11 +140,39 @@ Exact coordinate symmetry of **By Distance** results follows the native
 `Merge by Distance` behavior of the running Blender version; pairs straddling
 the plane merge once, and mismatches stay within the merge distance.
 
+## Delete and Dissolve (X / Del / Ctrl+X)
+
+The add-on finds every key the active keymap binds to the native Delete menu
+and to `mesh.dissolve_mode` — including Industry Compatible's Backspace/Del —
+and routes them to symmetry-aware replacements. The replacement Delete menu
+keeps the native layout; **Limited Dissolve** stays native (out of scope).
+
+- **Delete** (Vertices / Edges / Faces / Only Edges & Faces / Only Faces),
+  **Dissolve Vertices / Edges / Faces**, **Ctrl+X**, **Edge Collapse**, and
+  **Edge Loops** expand the selection to its mirrored counterparts and run
+  the native operator once, preserving its options (including the Blender
+  5.x dissolve parameters) in the redo panel.
+- Elements without a mirrored counterpart are processed on the selected side
+  only and reported as INFO. If any mirrored counterpart is hidden, the
+  operation declines with a warning and nothing changes.
+- Dissolve, Edge Collapse, and Edge Loops run inside a whole-mesh backup: if
+  the single native call still produces an asymmetric result, the mesh is
+  rolled back and a warning names the reason.
+- Edge Collapse tracks each selected edge cluster through the native call;
+  clusters that are their own mirror image collapse onto the symmetry plane
+  exactly, and mirrored cluster pairs land on exactly mirrored positions.
+- If the panel shows **Delete key route not found**, the active keymap has no
+  binding to the native Delete menu for the scanner to replace.
+
 ## Direct operator calls
 
 Menu, F3, and scripted calls to the native cut operators bypass the keymap
 hook, so they are not mirrored; use a shortcut or toolbar route instead.
 Connect and Merge are mirrored through their J / M bindings and the M menu.
+The same applies to the removal family: F3 or scripted calls to the native
+`mesh.delete` / `mesh.dissolve_*` / `mesh.edge_collapse` operators stay
+native, while the X / Del / Ctrl+X routes (and direct calls to the
+`mesh.ydd_symmetric_edit_*` operators) are mirrored.
 
 ## Scope and data
 

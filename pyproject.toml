@@ -1,6 +1,6 @@
 [project]
 name = "ydd-symmetric-edit"
-version = "0.7.0"
+version = "0.8.0"
 description = "Blender add-on that makes native cut, connect, and merge tools symmetry-aware."
 requires-python = ">=3.11"
 
