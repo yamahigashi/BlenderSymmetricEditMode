@@ -23,9 +23,11 @@ class YSE_AddonPreferences(bpy.types.AddonPreferences):
         enabled: bool
     else:
         enabled: BoolProperty(
-            name="Enable Symmetric Edit Mode",
+            name="Symmetric Edit Mode",
             description=(
-                "Mirror Blender's native Knife, Loop Cut, Offset Edge Loop Cut, Rip, Vertex Connect, and Merge Vertices"
+                "Mirror Blender's native Knife, Loop Cut, Offset Edge Loop Cut, Rip, "
+                "Vertex Connect, Merge, Delete, Dissolve, and Edge Collapse. "
+                "Use the native tool on one side; the mirror is applied on confirm"
             ),
             default=False,
             update=_update_persistent_mode,
@@ -34,7 +36,12 @@ class YSE_AddonPreferences(bpy.types.AddonPreferences):
     def draw(self, _context):
         layout = self.layout
         layout.prop(self, "enabled", toggle=True)
-        layout.label(text="Knife, Loop Cut, Offset Edge Loop Cut, Rip (V), Connect (J), Merge (M)")
+        layout.label(
+            text=(
+                "Knife, Loop Cut, Offset Edge Loop Cut, Rip (V), Connect (J), "
+                "Merge (M), Delete (X), Dissolve, Edge Collapse"
+            )
+        )
         layout.label(text="Native events and tools are not replaced.")
 
 
@@ -100,39 +107,33 @@ class VIEW3D_PT_ydd_symmetric_edit(bpy.types.Panel):
         obj = context.edit_object
         axes = tuple(axis for axis, _index in core.enabled_mesh_symmetry_axes(obj))
 
+        enabled = preferences is not None and preferences.enabled
         if preferences is not None:
             layout.prop(
                 preferences,
                 "enabled",
-                text="Enable Symmetric Edit Mode",
+                text="Symmetric Edit Mode",
                 icon="MOD_MIRROR",
                 toggle=True,
             )
-            if preferences.enabled and not keymaps.has_delete_routes():
-                layout.label(text="Delete key route not found", icon="ERROR")
+            if enabled and not keymaps.has_delete_routes():
+                layout.label(text="No Delete key binding found", icon="ERROR")
         else:
             layout.label(text="Persistent setting unavailable", icon="ERROR")
 
-        status = layout.box()
-        if len(axes) == 1:
-            status.label(text=f"Mesh Symmetry Axis: {axes[0]}", icon="CHECKMARK")
-        elif not axes:
-            status.label(text="Enable a Mesh Symmetry axis", icon="ERROR")
-        else:
-            status.label(
-                text=f"Enable one axis only (currently {', '.join(axes)})",
-                icon="ERROR",
-            )
-        status.label(text="Uses Blender's X / Y / Z symmetry setting")
-        layout.prop(settings, "source_side")
-        layout.prop(settings, "tolerance")
-        box = layout.box()
-        if preferences is not None and preferences.enabled:
-            box.label(text="Cut, Rip (V), Connect (J), and Merge (M) are mirrored.")
-        else:
-            box.label(text="Symmetric editing is disabled.")
-        box.label(text="Use the native tool on one side, then confirm.")
-        box.label(text="GG Edge Slide uses Blender's native mirror.")
+        body = layout.column()
+        body.active = enabled
+        body.use_property_split = True
+        body.use_property_decorate = False
+
+        row = body.row(heading="Symmetry", align=True)
+        for axis, _index, property_name in core.MESH_SYMMETRY_PROPERTIES:
+            row.prop(obj, property_name, text=axis, toggle=True)
+        if len(axes) != 1:
+            body.label(text="Enable exactly one axis", icon="ERROR")
+
+        body.prop(settings, "source_side", text="Source")
+        body.prop(settings, "tolerance", text="Tolerance")
 
 
 CLASSES = (
