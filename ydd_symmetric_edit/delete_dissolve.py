@@ -48,6 +48,16 @@ class ExpansionPlan:
     hidden_counterpart_count: int
 
 
+@dataclass(frozen=True)
+class CollapseTracking:
+    """Pre-native component identity retained across ``mesh.edge_collapse``."""
+
+    group_ids: tuple[int, ...]
+    original_vertices_by_group: dict[int, tuple[bmesh.types.BMVert, ...]]
+    self_mirrored_groups: frozenset[int]
+    mirror_group_by_group: dict[int, int | None]
+
+
 def build_element_pair_maps(
     bm: bmesh.types.BMesh,
     axis_index: int,
@@ -351,12 +361,25 @@ def _native_dissolve_call(mode: str, options: dict) -> set[str]:
     raise ValueError(f"unknown dissolve mode: {mode!r}")
 
 
+def _native_edge_collapse_call() -> set[str]:
+    """Invoke native edge collapse once (module-level for fault injection)."""
+
+    return cast(set[str], bpy.ops.mesh.edge_collapse())
+
+
+def _native_delete_edgeloop_call(options: dict) -> set[str]:
+    """Invoke native edge-loop deletion once (module-level for tests)."""
+
+    op = bpy.ops.mesh.delete_edgeloop
+    return cast(set[str], op(**_native_op_kwargs(op, options)))
+
+
 def _symmetry_census(
     pair_maps: ElementPairMaps,
     bm: bmesh.types.BMesh,
     tolerance: float,
 ) -> tuple[Counter, Counter, Counter]:
-    """Multiset of unmatched element signatures for post-dissolve verification.
+    """Multiset of unmatched element signatures for post-operation verification.
 
     Verts: quantized coordinate keys of vertices absent from the pair table.
     Edges / faces: frozenset of endpoint (or loop) coordinate keys when the
@@ -382,6 +405,203 @@ def _symmetry_census(
             unmatched_faces[key] += 1
 
     return unmatched_verts, unmatched_edges, unmatched_faces
+
+
+def _mark_collapse_components(
+    bm: bmesh.types.BMesh,
+    pair_maps: ElementPairMaps,
+) -> CollapseTracking:
+    """Mark visible selected-edge components and retain their pre-native identity."""
+
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    selected_edge_indices = sorted(edge.index for edge in bm.edges if edge.select and not edge.hide)
+
+    selected_edges_by_vertex: dict[int, list[int]] = defaultdict(list)
+    for edge_index in selected_edge_indices:
+        edge = bm.edges[edge_index]
+        for vertex in edge.verts:
+            selected_edges_by_vertex[vertex.index].append(edge_index)
+
+    component_vertex_indices: list[tuple[int, ...]] = []
+    visited_edges: set[int] = set()
+    for start_index in selected_edge_indices:
+        if start_index in visited_edges:
+            continue
+        pending = [start_index]
+        component_vertices: set[int] = set()
+        visited_edges.add(start_index)
+        while pending:
+            edge = bm.edges[pending.pop()]
+            for vertex in edge.verts:
+                component_vertices.add(vertex.index)
+                for linked_index in selected_edges_by_vertex[vertex.index]:
+                    if linked_index not in visited_edges:
+                        visited_edges.add(linked_index)
+                        pending.append(linked_index)
+        component_vertex_indices.append(tuple(sorted(component_vertices)))
+
+    group_by_vertex = {
+        vertex_index: group_id
+        for group_id, indices in enumerate(component_vertex_indices, start=1)
+        for vertex_index in indices
+    }
+    self_mirrored_groups: set[int] = set()
+    mirror_group_by_group: dict[int, int | None] = {}
+    for group_id, indices in enumerate(component_vertex_indices, start=1):
+        mirrored_groups = {
+            group_by_vertex[partner]
+            for vertex_index in indices
+            if (partner := pair_maps.vert_pairs.get(vertex_index)) is not None and partner in group_by_vertex
+        }
+        is_closed = (
+            len(mirrored_groups) == 1
+            and group_id in mirrored_groups
+            and all(
+                (partner := pair_maps.vert_pairs.get(vertex_index)) is not None
+                and group_by_vertex.get(partner) == group_id
+                for vertex_index in indices
+            )
+        )
+        if is_closed:
+            self_mirrored_groups.add(group_id)
+        mirror_group_by_group[group_id] = next(iter(mirrored_groups)) if len(mirrored_groups) == 1 else None
+
+    old_layer = bm.verts.layers.int.get(core.VERT_COLLAPSE_GROUP_LAYER)
+    if old_layer is not None:
+        bm.verts.layers.int.remove(old_layer)
+    group_layer = bm.verts.layers.int.new(core.VERT_COLLAPSE_GROUP_LAYER)
+    # CustomData layer creation invalidates element wrappers. Rebuild the
+    # lookup and only then retain references for post-native validity checks.
+    bm.verts.ensure_lookup_table()
+    original_vertices_by_group: dict[int, tuple[bmesh.types.BMVert, ...]] = {}
+    for group_id, indices in enumerate(component_vertex_indices, start=1):
+        marked_vertices = tuple(bm.verts[index] for index in indices)
+        original_vertices_by_group[group_id] = marked_vertices
+        for vertex in marked_vertices:
+            vertex[group_layer] = group_id
+
+    return CollapseTracking(
+        group_ids=tuple(range(1, len(component_vertex_indices) + 1)),
+        original_vertices_by_group=original_vertices_by_group,
+        self_mirrored_groups=frozenset(self_mirrored_groups),
+        mirror_group_by_group=mirror_group_by_group,
+    )
+
+
+def _collapse_survivors(
+    bm: bmesh.types.BMesh,
+    tracking: CollapseTracking,
+) -> tuple[dict[int, bmesh.types.BMVert], bool]:
+    """Recover one survivor per component, allowing marker loss on fusion."""
+
+    group_layer = bm.verts.layers.int.get(core.VERT_COLLAPSE_GROUP_LAYER)
+    if group_layer is None:
+        return {}, False
+
+    survivors_by_group: dict[int, list[bmesh.types.BMVert]] = defaultdict(list)
+    expected_groups = set(tracking.group_ids)
+    for vertex in bm.verts:
+        group_id = int(vertex[group_layer])
+        if group_id > 0:
+            if group_id not in expected_groups:
+                return {}, False
+            survivors_by_group[group_id].append(vertex)
+
+    survivors: dict[int, bmesh.types.BMVert] = {}
+    missing_groups: list[int] = []
+    for group_id in tracking.group_ids:
+        group_survivors = survivors_by_group.get(group_id, [])
+        if len(group_survivors) > 1:
+            return {}, False
+        if group_survivors:
+            survivors[group_id] = group_survivors[0]
+            continue
+        original_vertices = tracking.original_vertices_by_group[group_id]
+        if any(vertex.is_valid for vertex in original_vertices):
+            return {}, False
+        missing_groups.append(group_id)
+
+    # A missing marker is valid only when native fused that component into a
+    # component whose marker survived. With no surviving marker there is no
+    # identifiable fusion target.
+    if missing_groups and not survivors:
+        return {}, False
+    return survivors, True
+
+
+def _coordinates_are_mirrored(first, second, axis_index: int, tolerance: float) -> bool:
+    for coordinate_index in range(3):
+        expected = -float(first[coordinate_index]) if coordinate_index == axis_index else float(first[coordinate_index])
+        if abs(expected - float(second[coordinate_index])) > tolerance:
+            return False
+    return True
+
+
+def _validate_and_snap_collapse(
+    bm: bmesh.types.BMesh,
+    tracking: CollapseTracking,
+    axis_index: int,
+    tolerance: float,
+) -> bool:
+    """Validate collapse cardinality/mirroring and snap self-mirrored survivors."""
+
+    survivors, valid = _collapse_survivors(bm, tracking)
+    if not valid:
+        return False
+
+    for group_id in tracking.self_mirrored_groups:
+        survivor = survivors.get(group_id)
+        if survivor is not None:
+            survivor.co[axis_index] = 0.0
+
+    all_survivors = tuple(dict.fromkeys(survivors.values()))
+    checked_pairs: set[frozenset[int]] = set()
+    for group_id, mirror_group_id in tracking.mirror_group_by_group.items():
+        if mirror_group_id is None or mirror_group_id == group_id:
+            continue
+        pair_key = frozenset((group_id, mirror_group_id))
+        if pair_key in checked_pairs:
+            continue
+        checked_pairs.add(pair_key)
+        survivor = survivors.get(group_id)
+        mirror_survivor = survivors.get(mirror_group_id)
+        if survivor is not None and mirror_survivor is not None:
+            if not _coordinates_are_mirrored(survivor.co, mirror_survivor.co, axis_index, tolerance):
+                return False
+            continue
+
+        # Marker inheritance is unspecified when native fuses components. If
+        # one paired ID disappeared, accept any surviving fusion marker at the
+        # expected mirrored coordinate; the census below remains the topology
+        # safety net for complete expansion plans.
+        remaining = survivor if survivor is not None else mirror_survivor
+        if remaining is not None and not any(
+            candidate is not remaining and _coordinates_are_mirrored(remaining.co, candidate.co, axis_index, tolerance)
+            for candidate in all_survivors
+        ):
+            return False
+    return True
+
+
+def _rollback_with_report(
+    operator,
+    mesh,
+    backup_mesh,
+    *,
+    warning_message: str,
+    error_message: str,
+) -> set[str]:
+    """Restore a transaction backup and report the rollback outcome."""
+
+    try:
+        backup.restore_topology_backup(mesh, backup_mesh)
+    except Exception:
+        traceback.print_exc()
+        _delete_report(operator, {"ERROR"}, error_message)
+    else:
+        _delete_report(operator, {"WARNING"}, warning_message)
+    return {"FINISHED"}
 
 
 def _domains_for_dissolve_mode(mode: str) -> tuple[str, ...]:
@@ -723,6 +943,240 @@ class MESH_OT_ydd_symmetric_edit_dissolve(bpy.types.Operator):
                 backup.remove_backup(backup_mesh)
 
 
+class MESH_OT_ydd_symmetric_edit_edge_collapse(bpy.types.Operator):
+    """Expand selected edges, collapse once, then validate component survivors."""
+
+    bl_idname = "mesh.ydd_symmetric_edit_edge_collapse"
+    bl_label = "Edge Collapse"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == "EDIT_MESH" and context.edit_object is not None
+
+    def _native(self) -> set[str]:
+        return _native_edge_collapse_call()
+
+    def execute(self, context):
+        _DELETE_REPORTS.clear()
+
+        if _sessions_active():
+            return self._native()
+
+        symmetry = _symmetry_parameters(context)
+        if symmetry is None:
+            return self._native()
+
+        obj, axis_index, tolerance = symmetry
+        mesh = cast(bpy.types.Mesh, obj.data)
+        bm = bmesh.from_edit_mesh(mesh)
+        pair_maps = build_element_pair_maps(bm, axis_index, tolerance)
+        plan = plan_leading_domain_expansion(bm, pair_maps, domains=("EDGE",))
+
+        if plan.hidden_counterpart_count > 0:
+            _delete_report(
+                self,
+                {"WARNING"},
+                "mirrored element(s) are hidden; edge collapse declined",
+            )
+            return {"CANCELLED"}
+
+        backup_mesh = None
+        try:
+            try:
+                backup_mesh = backup.create_topology_backup(bm)
+            except Exception:
+                traceback.print_exc()
+                _delete_report(
+                    self,
+                    {"ERROR"},
+                    "backup creation failed; edge collapse aborted",
+                )
+                return {"CANCELLED"}
+
+            apply_expansion_plan(bm, plan)
+            tracking = _mark_collapse_components(bm, pair_maps)
+            census_before = _symmetry_census(pair_maps, bm, tolerance)
+            bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+
+            try:
+                result = _native_edge_collapse_call()
+
+                if "CANCELLED" in result and "FINISHED" not in result:
+                    bm = bmesh.from_edit_mesh(mesh)
+                    _restore_expansion_selection(bm, plan)
+                    bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+                    return result
+
+                bm = bmesh.from_edit_mesh(mesh)
+                if not _validate_and_snap_collapse(bm, tracking, axis_index, tolerance):
+                    return _rollback_with_report(
+                        self,
+                        mesh,
+                        backup_mesh,
+                        warning_message="edge collapse produced an unexpected result; rolled back",
+                        error_message="edge collapse produced an unexpected result; rollback failed",
+                    )
+                bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+
+                if plan.unmatched_count == 0:
+                    bm = bmesh.from_edit_mesh(mesh)
+                    pair_maps_after = build_element_pair_maps(bm, axis_index, tolerance)
+                    census_after = _symmetry_census(pair_maps_after, bm, tolerance)
+                    if census_before != census_after:
+                        return _rollback_with_report(
+                            self,
+                            mesh,
+                            backup_mesh,
+                            warning_message="mirrored edge collapse produced an asymmetric result; rolled back",
+                            error_message="mirrored edge collapse produced an asymmetric result; rollback failed",
+                        )
+
+                if plan.unmatched_count > 0:
+                    _delete_report(
+                        self,
+                        {"INFO"},
+                        f"{plan.unmatched_count} element(s) had no mirrored counterpart",
+                    )
+                return result
+            except Exception:
+                traceback.print_exc()
+                return _rollback_with_report(
+                    self,
+                    mesh,
+                    backup_mesh,
+                    warning_message="native edge collapse failed; rolled back",
+                    error_message="native edge collapse failed; rollback failed",
+                )
+        finally:
+            try:
+                if obj.mode == "EDIT":
+                    bm = bmesh.from_edit_mesh(mesh)
+                    if core.remove_temporary_layers(bm):
+                        bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+            except (ReferenceError, RuntimeError):
+                pass
+            finally:
+                backup.remove_backup(backup_mesh)
+
+
+class MESH_OT_ydd_symmetric_edit_delete_edgeloop(bpy.types.Operator):
+    """Expand selected edges, then run native edge-loop deletion once."""
+
+    bl_idname = "mesh.ydd_symmetric_edit_delete_edgeloop"
+    bl_label = "Edge Loops"
+    bl_options = {"REGISTER", "UNDO"}
+
+    if TYPE_CHECKING:
+        use_face_split: bool
+    else:
+        use_face_split: BoolProperty(
+            name="Face Split",
+            description="Split off face corners to maintain surrounding geometry",
+            default=True,
+        )
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == "EDIT_MESH" and context.edit_object is not None
+
+    def _options(self) -> dict:
+        return {"use_face_split": bool(self.use_face_split)}
+
+    def _native(self) -> set[str]:
+        return _native_delete_edgeloop_call(self._options())
+
+    def execute(self, context):
+        _DELETE_REPORTS.clear()
+
+        if _sessions_active():
+            return self._native()
+
+        symmetry = _symmetry_parameters(context)
+        if symmetry is None:
+            return self._native()
+
+        obj, axis_index, tolerance = symmetry
+        mesh = cast(bpy.types.Mesh, obj.data)
+        bm = bmesh.from_edit_mesh(mesh)
+        pair_maps = build_element_pair_maps(bm, axis_index, tolerance)
+        plan = plan_leading_domain_expansion(bm, pair_maps, domains=("EDGE",))
+
+        if plan.hidden_counterpart_count > 0:
+            _delete_report(
+                self,
+                {"WARNING"},
+                "mirrored element(s) are hidden; edge-loop deletion declined",
+            )
+            return {"CANCELLED"}
+
+        census_before = _symmetry_census(pair_maps, bm, tolerance)
+        backup_mesh = None
+        try:
+            try:
+                backup_mesh = backup.create_topology_backup(bm)
+            except Exception:
+                traceback.print_exc()
+                _delete_report(
+                    self,
+                    {"ERROR"},
+                    "backup creation failed; edge-loop deletion aborted",
+                )
+                return {"CANCELLED"}
+
+            apply_expansion_plan(bm, plan)
+            bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+
+            try:
+                result = _native_delete_edgeloop_call(self._options())
+
+                if "CANCELLED" in result and "FINISHED" not in result:
+                    bm = bmesh.from_edit_mesh(mesh)
+                    _restore_expansion_selection(bm, plan)
+                    bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+                    return result
+
+                if plan.unmatched_count == 0:
+                    bm = bmesh.from_edit_mesh(mesh)
+                    pair_maps_after = build_element_pair_maps(bm, axis_index, tolerance)
+                    census_after = _symmetry_census(pair_maps_after, bm, tolerance)
+                    if census_before != census_after:
+                        return _rollback_with_report(
+                            self,
+                            mesh,
+                            backup_mesh,
+                            warning_message="mirrored edge-loop deletion produced an asymmetric result; rolled back",
+                            error_message="mirrored edge-loop deletion produced an asymmetric result; rollback failed",
+                        )
+
+                if plan.unmatched_count > 0:
+                    _delete_report(
+                        self,
+                        {"INFO"},
+                        f"{plan.unmatched_count} element(s) had no mirrored counterpart",
+                    )
+                return result
+            except Exception:
+                traceback.print_exc()
+                return _rollback_with_report(
+                    self,
+                    mesh,
+                    backup_mesh,
+                    warning_message="native edge-loop deletion failed; rolled back",
+                    error_message="native edge-loop deletion failed; rollback failed",
+                )
+        finally:
+            try:
+                if obj.mode == "EDIT":
+                    bm = bmesh.from_edit_mesh(mesh)
+                    if core.remove_temporary_layers(bm):
+                        bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+            except (ReferenceError, RuntimeError):
+                pass
+            finally:
+                backup.remove_backup(backup_mesh)
+
+
 class MESH_OT_ydd_symmetric_edit_dissolve_mode(bpy.types.Operator):
     """Dissolve based on the current mesh select mode (Ctrl+X replacement)."""
 
@@ -862,8 +1316,8 @@ class YSE_MT_delete(bpy.types.Menu):
 
         layout.separator()
 
-        layout.operator("mesh.edge_collapse")
-        layout.operator("mesh.delete_edgeloop", text="Edge Loops")
+        layout.operator(MESH_OT_ydd_symmetric_edit_edge_collapse.bl_idname)
+        layout.operator(MESH_OT_ydd_symmetric_edit_delete_edgeloop.bl_idname, text="Edge Loops")
 
         # Native VIEW3D_MT_edit_mesh_delete ends with asset catalog items.
         if hasattr(layout, "template_node_operator_asset_menu_items"):
@@ -873,6 +1327,8 @@ class YSE_MT_delete(bpy.types.Menu):
 CLASSES = (
     MESH_OT_ydd_symmetric_edit_delete,
     MESH_OT_ydd_symmetric_edit_dissolve,
+    MESH_OT_ydd_symmetric_edit_edge_collapse,
+    MESH_OT_ydd_symmetric_edit_delete_edgeloop,
     MESH_OT_ydd_symmetric_edit_dissolve_mode,
     YSE_MT_delete,
 )

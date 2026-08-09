@@ -54,6 +54,7 @@ EDGE_HIDDEN_LAYER = ".yse_edge_hidden"
 VERT_BACKUP_ID_LAYER = ".yse_backup_vertex_id"
 VERT_RIP_ID_LAYER = ".yse_rip_vertex_id"
 VERT_MERGE_GROUP_LAYER = ".yse_merge_group"
+VERT_COLLAPSE_GROUP_LAYER = "yse_collapse_group"
 
 TEMP_LAYER_NAMES = (
     EDGE_ORIGINAL_LAYER,
@@ -69,6 +70,7 @@ TEMP_LAYER_NAMES = (
     VERT_BACKUP_ID_LAYER,
     VERT_RIP_ID_LAYER,
     VERT_MERGE_GROUP_LAYER,
+    VERT_COLLAPSE_GROUP_LAYER,
 )
 
 AXIS_INDEX = {"X": 0, "Y": 1, "Z": 2}
@@ -636,6 +638,7 @@ def remove_temporary_layers(bm: bmesh.types.BMesh) -> bool:
         (bm.verts.layers.int, VERT_BACKUP_ID_LAYER),
         (bm.verts.layers.int, VERT_RIP_ID_LAYER),
         (bm.verts.layers.int, VERT_MERGE_GROUP_LAYER),
+        (bm.verts.layers.int, VERT_COLLAPSE_GROUP_LAYER),
     )
     for layers, name in layer_groups:
         layer = layers.get(name)
