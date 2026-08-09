@@ -58,6 +58,20 @@ class Coordinate3D:
         raise IndexError(axis_index)
 
 
+@dataclass(frozen=True, slots=True)
+class CarrierFrameSnapshot:
+    """An ordered pre-native face walk and its canonical planar frame."""
+
+    vertices: tuple[Coordinate3D, ...]
+    origin: Coordinate3D
+    normal: Coordinate3D | None
+    basis_u: Coordinate3D | None
+    deviation: float
+
+
+CarrierFrameMap: TypeAlias = dict[FaceId, CarrierFrameSnapshot]
+
+
 @dataclass(frozen=True, slots=True, order=True)
 class PathEdgeSignature:
     """One canonical, rounded edge in a newly created native cut path."""
@@ -181,6 +195,7 @@ class TopologyPreparation:
 
     mirror_face_ids: MirrorFaceMap
     hidden_by_face_id: HiddenFaceMap
+    carrier_frames: CarrierFrameMap
     matched_faces: int
     total_faces: int
 
@@ -263,6 +278,7 @@ class KnifeSession:
     tolerance: float
     mirror_face_ids: MirrorFaceMap
     hidden_by_face_id: HiddenFaceMap
+    carrier_frames: CarrierFrameMap
     mesh_select_mode: MeshSelectionMode
     started_at: float
     tool_kind: str = "KNIFE"

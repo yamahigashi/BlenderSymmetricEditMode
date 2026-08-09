@@ -467,6 +467,7 @@ def _prepare_session(
         tolerance=settings.tolerance,
         mirror_face_ids=topology.mirror_face_ids,
         hidden_by_face_id=topology.hidden_by_face_id,
+        carrier_frames=topology.carrier_frames,
         mesh_select_mode=MeshSelectionMode(
             vertices=bool(context.tool_settings.mesh_select_mode[0]),
             edges=bool(context.tool_settings.mesh_select_mode[1]),
@@ -816,6 +817,82 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                         # Persist p-stitch into the edit mesh so subsequent
                         # BMesh rebuilds (layer add / backup refresh) see it.
                         bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=True)
+
+                        bm = bmesh.from_edit_mesh(obj.data)
+                        _edge_layer, face_layer = core.get_required_layers(bm)
+                        by_side, total_path_edges = core.collect_knife_path_edges_by_side(
+                            bm,
+                            session.axis_index,
+                            session.tolerance,
+                        )
+                        live_mirror_face_ids = core.resolve_live_mirror_face_map(
+                            bm,
+                            session.mirror_face_ids,
+                            session.axis_index,
+                            session.tolerance,
+                            path_edges=_all_path_edges(by_side),
+                        )
+
+                crossing_plan, crossing_reason = core.plan_mirrored_path_crossings(
+                    bm,
+                    by_side,
+                    session.axis_index,
+                    session.tolerance,
+                    live_mirror_face_ids,
+                    session.carrier_frames,
+                )
+                if crossing_reason:
+                    raise SymmetricKnifeError(crossing_reason)
+                if crossing_plan:
+                    if backup_mesh is None:
+                        selection_state = core.add_selection_layers(bm)
+                        backup_mesh = _create_backup(bm)
+                        bm = bmesh.from_edit_mesh(obj.data)
+                        _edge_layer, face_layer = core.get_required_layers(bm)
+                        by_side, total_path_edges = core.collect_knife_path_edges_by_side(
+                            bm,
+                            session.axis_index,
+                            session.tolerance,
+                        )
+                        live_mirror_face_ids = core.resolve_live_mirror_face_map(
+                            bm,
+                            session.mirror_face_ids,
+                            session.axis_index,
+                            session.tolerance,
+                            path_edges=_all_path_edges(by_side),
+                        )
+                        crossing_plan, crossing_reason = core.plan_mirrored_path_crossings(
+                            bm,
+                            by_side,
+                            session.axis_index,
+                            session.tolerance,
+                            live_mirror_face_ids,
+                            session.carrier_frames,
+                        )
+                        if crossing_reason:
+                            raise SymmetricKnifeError(crossing_reason)
+                        if not crossing_plan:
+                            raise SymmetricKnifeError("The mirrored path crossing plan changed before apply")
+
+                    _crossings_stitched, crossing_reason = core.apply_mirrored_path_crossings(
+                        bm,
+                        crossing_plan,
+                    )
+                    if crossing_reason:
+                        raise SymmetricKnifeError(crossing_reason)
+                    by_side, total_path_edges = core.collect_knife_path_edges_by_side(
+                        bm,
+                        session.axis_index,
+                        session.tolerance,
+                    )
+                    live_mirror_face_ids = core.resolve_live_mirror_face_map(
+                        bm,
+                        session.mirror_face_ids,
+                        session.axis_index,
+                        session.tolerance,
+                        path_edges=_all_path_edges(by_side),
+                    )
+                    _edge_layer, face_layer = core.get_required_layers(bm)
 
                 source_edges = by_side["POSITIVE"] + by_side["NEGATIVE"]
                 if not source_edges:

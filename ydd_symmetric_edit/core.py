@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 from collections.abc import Iterable, Iterator, Sequence
+from dataclasses import dataclass
 from typing import Literal, cast
 
 import bmesh
@@ -19,6 +20,8 @@ from mathutils import Vector
 from mathutils.kdtree import KDTree
 
 from ._types import (
+    CarrierFrameMap,
+    CarrierFrameSnapshot,
     Coordinate3D,
     EdgeMarkerId,
     EdgeSelectionHistory,
@@ -660,6 +663,52 @@ def remove_temporary_mesh_attributes(mesh) -> bool:
     return removed
 
 
+def _carrier_frame_snapshot(face: bmesh.types.BMFace) -> CarrierFrameSnapshot:
+    vertices = tuple(_coordinate_3d(vertex.co) for vertex in face.verts)
+    if not vertices:
+        zero = Coordinate3D(0.0, 0.0, 0.0)
+        return CarrierFrameSnapshot(vertices, zero, None, None, 0.0)
+
+    count = float(len(vertices))
+    origin_vector = Vector(
+        (
+            sum(vertex.x for vertex in vertices) / count,
+            sum(vertex.y for vertex in vertices) / count,
+            sum(vertex.z for vertex in vertices) / count,
+        )
+    )
+    newell = Vector((0.0, 0.0, 0.0))
+    for index, current in enumerate(vertices):
+        following = vertices[(index + 1) % len(vertices)]
+        newell.x += (current.y - following.y) * (current.z + following.z)
+        newell.y += (current.z - following.z) * (current.x + following.x)
+        newell.z += (current.x - following.x) * (current.y + following.y)
+
+    origin = _coordinate_3d(origin_vector)
+    if newell.length <= 1.0e-12:
+        return CarrierFrameSnapshot(vertices, origin, None, None, 0.0)
+    normal_vector = newell.normalized()
+
+    basis_u = None
+    for vertex in sorted(vertices):
+        delta = Vector(vertex.as_tuple()) - origin_vector
+        projected = delta - normal_vector * delta.dot(normal_vector)
+        if projected.length > 1.0e-12:
+            basis_u = projected.normalized()
+            break
+    if basis_u is None:
+        return CarrierFrameSnapshot(vertices, origin, _coordinate_3d(normal_vector), None, 0.0)
+
+    deviation = max(abs((Vector(vertex.as_tuple()) - origin_vector).dot(normal_vector)) for vertex in vertices)
+    return CarrierFrameSnapshot(
+        vertices=vertices,
+        origin=origin,
+        normal=_coordinate_3d(normal_vector),
+        basis_u=_coordinate_3d(basis_u),
+        deviation=float(deviation),
+    )
+
+
 def prepare_topology(
     bm: bmesh.types.BMesh,
     axis_index: int,
@@ -713,6 +762,7 @@ def prepare_topology(
     hidden_by_face_id: HiddenFaceMap = {}
     key_to_face_ids: dict[FaceKey, list[FaceId]] = defaultdict(list)
     face_records: dict[FaceId, FaceMatchRecord] = {}
+    carrier_frames: CarrierFrameMap = {}
     face_vertex_ids: dict[FaceId, tuple[int, ...]] = {}
     face_ids_by_vertex_set: dict[frozenset[int], list[FaceId]] = defaultdict(list)
     # Lazy fallback index (contract R2-3): only materialize on first exact miss.
@@ -735,6 +785,7 @@ def prepare_topology(
             centroid=_coordinate_3d(centroid_vector),
         )
         face_records[face_id] = record
+        carrier_frames[face_id] = _carrier_frame_snapshot(face)
         key_to_face_ids[record.key].append(face_id)
         vertex_ids = tuple(vertex.index for vertex in face.verts)
         face_vertex_ids[face_id] = vertex_ids
@@ -864,6 +915,7 @@ def prepare_topology(
     return TopologyPreparation(
         mirror_face_ids=mirror_face_ids,
         hidden_by_face_id=hidden_by_face_id,
+        carrier_frames=carrier_frames,
         matched_faces=len(mirror_face_ids),
         total_faces=len(face_records),
     )
@@ -1506,6 +1558,746 @@ def _plan_plane_stitch_vertex(
     return None, None, ""
 
 
+@dataclass(frozen=True, slots=True)
+class _MirroredSegmentIntersection:
+    kind: Literal["NONE", "PROPER", "ENDPOINT_INTERIOR", "ENDPOINT_ENDPOINT", "COLLINEAR"]
+    factor_a: float = 0.0
+    factor_b: float = 0.0
+    point_a: Vector | None = None
+    point_b: Vector | None = None
+    coordinate: Vector | None = None
+    endpoint_a: int | None = None
+    endpoint_b: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _MirroredPathOccurrence:
+    edge: bmesh.types.BMEdge
+    edge_id: int
+    factor: float
+    endpoint_index: int | None
+    edge_key: tuple[
+        tuple[float, float, float],
+        tuple[float, float, float],
+    ]
+
+
+@dataclass(frozen=True, slots=True)
+class _RawMirroredPathCrossing:
+    coordinate: Vector
+    positive: tuple[_MirroredPathOccurrence, ...]
+    negative: tuple[_MirroredPathOccurrence, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _MirroredPathCrossingCluster:
+    positive_coordinate: Vector
+    negative_coordinate: Vector
+    positive: tuple[_MirroredPathOccurrence, ...]
+    negative: tuple[_MirroredPathOccurrence, ...]
+    tolerance: float
+
+
+def _edge_survivor_key(
+    edge: bmesh.types.BMEdge,
+    axis_index: int,
+) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    first = _mirror_invariant_endpoint_key(edge.verts[0].co, axis_index)
+    second = _mirror_invariant_endpoint_key(edge.verts[1].co, axis_index)
+    return (first, second) if first <= second else (second, first)
+
+
+def _project_to_carrier(
+    coordinate: Vector,
+    frame: CarrierFrameSnapshot,
+) -> tuple[float, float]:
+    assert frame.normal is not None and frame.basis_u is not None
+    origin = Vector(frame.origin.as_tuple())
+    normal = Vector(frame.normal.as_tuple())
+    basis_u = Vector(frame.basis_u.as_tuple())
+    basis_w = normal.cross(basis_u)
+    delta = coordinate - origin
+    return float(delta.dot(basis_u)), float(delta.dot(basis_w))
+
+
+def _cross_2d(first: tuple[float, float], second: tuple[float, float]) -> float:
+    return first[0] * second[1] - first[1] * second[0]
+
+
+def _distance_to_line_2d(
+    point: tuple[float, float],
+    first: tuple[float, float],
+    second: tuple[float, float],
+) -> float:
+    delta = (second[0] - first[0], second[1] - first[1])
+    length = math.hypot(delta[0], delta[1])
+    if length == 0.0:
+        return math.hypot(point[0] - first[0], point[1] - first[1])
+    offset = (point[0] - first[0], point[1] - first[1])
+    return abs(_cross_2d(offset, delta)) / length
+
+
+def _matching_endpoint_index(
+    point: Vector,
+    endpoints: tuple[Vector, Vector],
+    tolerance: float,
+) -> int | None:
+    matches = [index for index, endpoint in enumerate(endpoints) if coordinates_match(point, endpoint, tolerance)]
+    if not matches:
+        return None
+    return min(matches, key=lambda index: _coordinate_tuple(endpoints[index]))
+
+
+def _classify_segment_contact(
+    factor_a: float,
+    factor_b: float,
+    endpoints_a: tuple[Vector, Vector],
+    endpoints_b: tuple[Vector, Vector],
+    tolerance: float,
+) -> _MirroredSegmentIntersection:
+    point_a = endpoints_a[0].lerp(endpoints_a[1], factor_a)
+    point_b = endpoints_b[0].lerp(endpoints_b[1], factor_b)
+    endpoint_a = _matching_endpoint_index(point_a, endpoints_a, tolerance)
+    endpoint_b = _matching_endpoint_index(point_b, endpoints_b, tolerance)
+    if endpoint_a is not None and endpoint_b is not None:
+        kind = "ENDPOINT_ENDPOINT"
+    elif endpoint_a is not None or endpoint_b is not None:
+        kind = "ENDPOINT_INTERIOR"
+    else:
+        kind = "PROPER"
+    return _MirroredSegmentIntersection(
+        kind=kind,
+        factor_a=factor_a,
+        factor_b=factor_b,
+        point_a=point_a,
+        point_b=point_b,
+        coordinate=(point_a + point_b) * 0.5,
+        endpoint_a=endpoint_a,
+        endpoint_b=endpoint_b,
+    )
+
+
+def _intersect_segments_on_carrier(
+    endpoints_a: tuple[Vector, Vector],
+    endpoints_b: tuple[Vector, Vector],
+    frame: CarrierFrameSnapshot,
+    tolerance: float,
+) -> _MirroredSegmentIntersection:
+    projected_a = tuple(_project_to_carrier(point, frame) for point in endpoints_a)
+    projected_b = tuple(_project_to_carrier(point, frame) for point in endpoints_b)
+    a0, a1 = projected_a
+    b0, b1 = projected_b
+    delta_a = (a1[0] - a0[0], a1[1] - a0[1])
+    delta_b = (b1[0] - b0[0], b1[1] - b0[1])
+    length_a = math.hypot(delta_a[0], delta_a[1])
+    length_b = math.hypot(delta_b[0], delta_b[1])
+
+    if length_a == 0.0 and length_b == 0.0:
+        if math.hypot(a0[0] - b0[0], a0[1] - b0[1]) > tolerance:
+            return _MirroredSegmentIntersection("NONE")
+        return _classify_segment_contact(0.0, 0.0, endpoints_a, endpoints_b, tolerance)
+    if length_a == 0.0:
+        distance, factor_b = _point_segment_distance_2d(a0, b0, b1)
+        if distance > tolerance:
+            return _MirroredSegmentIntersection("NONE")
+        return _classify_segment_contact(0.0, factor_b, endpoints_a, endpoints_b, tolerance)
+    if length_b == 0.0:
+        distance, factor_a = _point_segment_distance_2d(b0, a0, a1)
+        if distance > tolerance:
+            return _MirroredSegmentIntersection("NONE")
+        return _classify_segment_contact(factor_a, 0.0, endpoints_a, endpoints_b, tolerance)
+
+    collinear = (
+        abs(_cross_2d(delta_a, delta_b)) <= tolerance * max(length_a, length_b)
+        and _distance_to_line_2d(a0, b0, b1) <= tolerance
+        and _distance_to_line_2d(a1, b0, b1) <= tolerance
+        and _distance_to_line_2d(b0, a0, a1) <= tolerance
+        and _distance_to_line_2d(b1, a0, a1) <= tolerance
+    )
+    if collinear:
+        direction = delta_a if length_a >= length_b else delta_b
+        direction_length = math.hypot(direction[0], direction[1])
+        unit = (direction[0] / direction_length, direction[1] / direction_length)
+
+        def scalar(point: tuple[float, float]) -> float:
+            return point[0] * unit[0] + point[1] * unit[1]
+
+        a_values = (scalar(a0), scalar(a1))
+        b_values = (scalar(b0), scalar(b1))
+        overlap_start = max(min(a_values), min(b_values))
+        overlap_end = min(max(a_values), max(b_values))
+        if overlap_end < overlap_start:
+            return _MirroredSegmentIntersection("NONE")
+        if overlap_end > overlap_start:
+            return _MirroredSegmentIntersection("COLLINEAR")
+        denominator_a = a_values[1] - a_values[0]
+        denominator_b = b_values[1] - b_values[0]
+        if denominator_a == 0.0 or denominator_b == 0.0:
+            return _MirroredSegmentIntersection("COLLINEAR")
+        factor_a = (overlap_start - a_values[0]) / denominator_a
+        factor_b = (overlap_start - b_values[0]) / denominator_b
+        return _classify_segment_contact(factor_a, factor_b, endpoints_a, endpoints_b, tolerance)
+
+    denominator = _cross_2d(delta_a, delta_b)
+    if denominator == 0.0:
+        return _MirroredSegmentIntersection("NONE")
+    offset = (b0[0] - a0[0], b0[1] - a0[1])
+    factor_a = _cross_2d(offset, delta_b) / denominator
+    factor_b = _cross_2d(offset, delta_a) / denominator
+    if factor_a < 0.0 or factor_a > 1.0 or factor_b < 0.0 or factor_b > 1.0:
+        return _MirroredSegmentIntersection("NONE")
+    return _classify_segment_contact(factor_a, factor_b, endpoints_a, endpoints_b, tolerance)
+
+
+def _point_segment_distance_2d(
+    point: tuple[float, float],
+    first: tuple[float, float],
+    second: tuple[float, float],
+) -> tuple[float, float]:
+    delta = (second[0] - first[0], second[1] - first[1])
+    length_squared = delta[0] * delta[0] + delta[1] * delta[1]
+    if length_squared == 0.0:
+        return math.hypot(point[0] - first[0], point[1] - first[1]), 0.0
+    factor = max(
+        0.0,
+        min(
+            1.0,
+            ((point[0] - first[0]) * delta[0] + (point[1] - first[1]) * delta[1]) / length_squared,
+        ),
+    )
+    nearest = (first[0] + factor * delta[0], first[1] + factor * delta[1])
+    return math.hypot(point[0] - nearest[0], point[1] - nearest[1]), factor
+
+
+def _edge_carrier_ids(edge: bmesh.types.BMEdge, face_layer) -> set[FaceId]:
+    return {FaceId(int(face[face_layer])) for face in edge.link_faces if face.is_valid}
+
+
+def _mirrored_carrier_ids(
+    carrier_ids: set[FaceId],
+    mirror_face_ids: MirrorFaceMap,
+) -> set[FaceId]:
+    return {mirrored for face_id in carrier_ids if (mirrored := mirror_face_ids.get(face_id)) is not None}
+
+
+def _canonical_carrier_frames(
+    carrier_ids: set[FaceId],
+    mirror_face_ids: MirrorFaceMap,
+    carrier_frames: CarrierFrameMap,
+    axis_index: int,
+) -> tuple[list[CarrierFrameSnapshot], str]:
+    by_orbit: dict[tuple[int, int], list[tuple[FaceId, CarrierFrameSnapshot]]] = defaultdict(list)
+    for face_id in carrier_ids:
+        mirrored = mirror_face_ids.get(face_id, face_id)
+        orbit = tuple(sorted((int(face_id), int(mirrored))))
+        frame = carrier_frames.get(face_id)
+        if frame is None:
+            return [], "a mirrored cut carrier has no pre-native canonical frame"
+        by_orbit[orbit].append((face_id, frame))
+
+    selected: list[CarrierFrameSnapshot] = []
+    for entries in by_orbit.values():
+        _face_id, frame = max(
+            entries,
+            key=lambda entry: (
+                entry[1].origin.component(axis_index),
+                entry[1].origin.as_tuple(),
+                -int(entry[0]),
+            ),
+        )
+        if frame.normal is None or frame.basis_u is None:
+            return [], "a mirrored cut carrier has a degenerate canonical frame"
+        selected.append(frame)
+    selected.sort(key=lambda frame: (frame.origin.as_tuple(), frame.normal.as_tuple()))
+    return selected, ""
+
+
+def _intersection_results_match(
+    first: _MirroredSegmentIntersection,
+    second: _MirroredSegmentIntersection,
+    tolerance: float,
+) -> bool:
+    if first.kind != second.kind:
+        return False
+    if first.kind in {"NONE", "COLLINEAR"}:
+        return True
+    if first.coordinate is None or second.coordinate is None:
+        return first.coordinate is second.coordinate
+    return (
+        first.endpoint_a == second.endpoint_a
+        and first.endpoint_b == second.endpoint_b
+        and coordinates_match(first.coordinate, second.coordinate, tolerance)
+    )
+
+
+def _occurrence(
+    edge: bmesh.types.BMEdge,
+    factor: float,
+    endpoint_index: int | None,
+    axis_index: int,
+) -> _MirroredPathOccurrence:
+    return _MirroredPathOccurrence(
+        edge=edge,
+        edge_id=hash(edge),
+        factor=float(factor),
+        endpoint_index=endpoint_index,
+        edge_key=_edge_survivor_key(edge, axis_index),
+    )
+
+
+def _deduplicate_occurrences(
+    occurrences: Iterable[_MirroredPathOccurrence],
+) -> tuple[_MirroredPathOccurrence, ...]:
+    by_edge: dict[int, _MirroredPathOccurrence] = {}
+    for occurrence in occurrences:
+        key = occurrence.edge_id
+        current = by_edge.get(key)
+        if current is None:
+            by_edge[key] = occurrence
+            continue
+        if current.endpoint_index is None and occurrence.endpoint_index is not None:
+            by_edge[key] = occurrence
+        elif (
+            current.endpoint_index is None and occurrence.endpoint_index is None and occurrence.factor < current.factor
+        ):
+            by_edge[key] = occurrence
+    return tuple(sorted(by_edge.values(), key=lambda occurrence: (occurrence.edge_key, occurrence.factor)))
+
+
+def plan_mirrored_path_crossings(
+    bm: bmesh.types.BMesh,
+    by_side: dict[str, Sequence[bmesh.types.BMEdge]],
+    axis_index: int,
+    tolerance: float,
+    mirror_face_ids: MirrorFaceMap,
+    carrier_frames: CarrierFrameMap,
+) -> tuple[list[_MirroredPathCrossingCluster], str]:
+    """Plan mirrored path intersections without modifying *bm*."""
+
+    face_layer = bm.faces.layers.int.get(FACE_ID_LAYER)
+    if face_layer is None:
+        return [], "temporary face markers are missing"
+
+    candidates: dict[int, bmesh.types.BMEdge] = {}
+    for side in ("POSITIVE", "NEGATIVE", "CROSSES"):
+        for edge in by_side.get(side, ()):
+            if edge.is_valid:
+                candidates[hash(edge)] = edge
+
+    positive: list[bmesh.types.BMEdge] = []
+    negative: list[bmesh.types.BMEdge] = []
+    fixed: list[bmesh.types.BMEdge] = []
+    for edge in candidates.values():
+        if is_self_mirrored_edge(edge, axis_index, tolerance):
+            fixed.append(edge)
+            continue
+        midpoint = (float(edge.verts[0].co[axis_index]) + float(edge.verts[1].co[axis_index])) * 0.5
+        if midpoint > 0.0:
+            positive.append(edge)
+        elif midpoint < 0.0:
+            negative.append(edge)
+
+    raw_crossings: list[_RawMirroredPathCrossing] = []
+
+    def evaluate_pair(
+        canonical_a: tuple[Vector, Vector],
+        canonical_b: tuple[Vector, Vector],
+        canonical_carriers: set[FaceId],
+    ) -> tuple[_MirroredSegmentIntersection | None, str]:
+        frames, reason = _canonical_carrier_frames(
+            canonical_carriers,
+            mirror_face_ids,
+            carrier_frames,
+            axis_index,
+        )
+        if reason:
+            return None, reason
+        if not frames:
+            return None, ""
+
+        accepted: _MirroredSegmentIntersection | None = None
+        for frame in frames:
+            result = _intersect_segments_on_carrier(
+                canonical_a,
+                canonical_b,
+                frame,
+                tolerance,
+            )
+            if result.kind == "COLLINEAR":
+                complete = (
+                    coordinates_match(canonical_a[0], canonical_b[0], tolerance)
+                    and coordinates_match(canonical_a[1], canonical_b[1], tolerance)
+                ) or (
+                    coordinates_match(canonical_a[0], canonical_b[1], tolerance)
+                    and coordinates_match(canonical_a[1], canonical_b[0], tolerance)
+                )
+                if not complete:
+                    return None, "mirrored cut segments partially overlap on a carrier"
+            if result.coordinate is not None:
+                assert result.point_a is not None and result.point_b is not None
+                if (result.point_a - result.point_b).length > 2.0 * frame.deviation + 2.0 * tolerance:
+                    return None, "a mirrored cut intersection exceeds its carrier non-planarity guard"
+            if accepted is None:
+                accepted = result
+            elif not _intersection_results_match(accepted, result, tolerance):
+                return None, "mirrored cut carriers produce ambiguous intersection results"
+        return accepted, ""
+
+    for positive_edge in positive:
+        positive_endpoints = (positive_edge.verts[0].co.copy(), positive_edge.verts[1].co.copy())
+        positive_carriers = _edge_carrier_ids(positive_edge, face_layer)
+        for negative_edge in negative:
+            negative_endpoints = (
+                mirror_coordinate(negative_edge.verts[0].co, axis_index),
+                mirror_coordinate(negative_edge.verts[1].co, axis_index),
+            )
+            if (
+                coordinates_match(positive_endpoints[0], negative_endpoints[0], tolerance)
+                and coordinates_match(positive_endpoints[1], negative_endpoints[1], tolerance)
+            ) or (
+                coordinates_match(positive_endpoints[0], negative_endpoints[1], tolerance)
+                and coordinates_match(positive_endpoints[1], negative_endpoints[0], tolerance)
+            ):
+                continue
+            negative_carriers = _mirrored_carrier_ids(
+                _edge_carrier_ids(negative_edge, face_layer),
+                mirror_face_ids,
+            )
+            result, reason = evaluate_pair(
+                positive_endpoints,
+                negative_endpoints,
+                positive_carriers.intersection(negative_carriers),
+            )
+            if reason:
+                return [], reason
+            if result is None or result.kind in {"NONE", "COLLINEAR"}:
+                continue
+            assert result.coordinate is not None
+            raw_crossings.append(
+                _RawMirroredPathCrossing(
+                    coordinate=result.coordinate,
+                    positive=(_occurrence(positive_edge, result.factor_a, result.endpoint_a, axis_index),),
+                    negative=(_occurrence(negative_edge, result.factor_b, result.endpoint_b, axis_index),),
+                )
+            )
+
+    for moving_edges, moving_is_positive in ((positive, True), (negative, False)):
+        for moving_edge in moving_edges:
+            if moving_is_positive:
+                moving_endpoints = (moving_edge.verts[0].co.copy(), moving_edge.verts[1].co.copy())
+                moving_carriers = _edge_carrier_ids(moving_edge, face_layer)
+            else:
+                moving_endpoints = (
+                    mirror_coordinate(moving_edge.verts[0].co, axis_index),
+                    mirror_coordinate(moving_edge.verts[1].co, axis_index),
+                )
+                moving_carriers = _mirrored_carrier_ids(
+                    _edge_carrier_ids(moving_edge, face_layer),
+                    mirror_face_ids,
+                )
+            for fixed_edge in fixed:
+                fixed_endpoints = (
+                    mirror_coordinate(fixed_edge.verts[0].co, axis_index),
+                    mirror_coordinate(fixed_edge.verts[1].co, axis_index),
+                )
+                fixed_carriers = _mirrored_carrier_ids(
+                    _edge_carrier_ids(fixed_edge, face_layer),
+                    mirror_face_ids,
+                )
+                result, reason = evaluate_pair(
+                    moving_endpoints,
+                    fixed_endpoints,
+                    moving_carriers.intersection(fixed_carriers),
+                )
+                if reason:
+                    return [], reason
+                if result is None or result.kind in {"NONE", "COLLINEAR"}:
+                    continue
+                assert result.coordinate is not None
+                moving_occurrence = _occurrence(
+                    moving_edge,
+                    result.factor_a,
+                    result.endpoint_a,
+                    axis_index,
+                )
+                fixed_positive = _occurrence(
+                    fixed_edge,
+                    1.0 - result.factor_b,
+                    None if result.endpoint_b is None else 1 - result.endpoint_b,
+                    axis_index,
+                )
+                fixed_negative = _occurrence(
+                    fixed_edge,
+                    result.factor_b,
+                    result.endpoint_b,
+                    axis_index,
+                )
+                raw_crossings.append(
+                    _RawMirroredPathCrossing(
+                        coordinate=result.coordinate,
+                        positive=(moving_occurrence, fixed_positive) if moving_is_positive else (fixed_positive,),
+                        negative=(fixed_negative,) if moving_is_positive else (moving_occurrence, fixed_negative),
+                    )
+                )
+
+    for first_index, first_edge in enumerate(fixed):
+        first_endpoints = (
+            mirror_coordinate(first_edge.verts[0].co, axis_index),
+            mirror_coordinate(first_edge.verts[1].co, axis_index),
+        )
+        first_carriers = _mirrored_carrier_ids(
+            _edge_carrier_ids(first_edge, face_layer),
+            mirror_face_ids,
+        )
+        for second_edge in fixed[first_index + 1 :]:
+            second_endpoints = (
+                mirror_coordinate(second_edge.verts[0].co, axis_index),
+                mirror_coordinate(second_edge.verts[1].co, axis_index),
+            )
+            second_carriers = _mirrored_carrier_ids(
+                _edge_carrier_ids(second_edge, face_layer),
+                mirror_face_ids,
+            )
+            result, reason = evaluate_pair(
+                first_endpoints,
+                second_endpoints,
+                first_carriers.intersection(second_carriers),
+            )
+            if reason:
+                return [], reason
+            if result is None or result.kind in {"NONE", "COLLINEAR"}:
+                continue
+            assert result.coordinate is not None
+            positive_occurrences = []
+            negative_occurrences = []
+            for edge, factor, endpoint in (
+                (first_edge, result.factor_a, result.endpoint_a),
+                (second_edge, result.factor_b, result.endpoint_b),
+            ):
+                positive_occurrences.append(
+                    _occurrence(
+                        edge,
+                        1.0 - factor,
+                        None if endpoint is None else 1 - endpoint,
+                        axis_index,
+                    )
+                )
+                negative_occurrences.append(_occurrence(edge, factor, endpoint, axis_index))
+            raw_crossings.append(
+                _RawMirroredPathCrossing(
+                    coordinate=result.coordinate,
+                    positive=tuple(positive_occurrences),
+                    negative=tuple(negative_occurrences),
+                )
+            )
+
+    if not raw_crossings:
+        return [], ""
+
+    points = [crossing.coordinate for crossing in raw_crossings]
+    clusters: list[_MirroredPathCrossingCluster] = []
+    for indices in cluster_points_by_tolerance(points, tolerance):
+        representative = points[indices[0]].copy()
+        if abs(float(representative[axis_index])) <= tolerance:
+            representative[axis_index] = 0.0
+        mirrored = mirror_coordinate(representative, axis_index)
+        positive_occurrences = [occurrence for index in indices for occurrence in raw_crossings[index].positive]
+        negative_occurrences = [occurrence for index in indices for occurrence in raw_crossings[index].negative]
+        if representative[axis_index] == 0.0:
+            combined = _deduplicate_occurrences(positive_occurrences + negative_occurrences)
+            positive_occurrences = list(combined)
+            negative_occurrences = []
+        clusters.append(
+            _MirroredPathCrossingCluster(
+                positive_coordinate=representative,
+                negative_coordinate=mirrored,
+                positive=_deduplicate_occurrences(positive_occurrences),
+                negative=_deduplicate_occurrences(negative_occurrences),
+                tolerance=tolerance,
+            )
+        )
+    return clusters, ""
+
+
+def apply_mirrored_path_crossings(
+    bm: bmesh.types.BMesh,
+    plan: Sequence[_MirroredPathCrossingCluster],
+) -> tuple[int, str]:
+    """Apply a mirrored crossing plan on its live BMesh transaction."""
+
+    if not plan:
+        return 0, ""
+    marker_layer = bm.edges.layers.int.get(EDGE_ORIGINAL_LAYER)
+    vertex_selection_layer = bm.verts.layers.int.get(VERT_SELECTION_LAYER)
+    edge_selection_layer = bm.edges.layers.int.get(EDGE_SELECTION_LAYER)
+    if marker_layer is None or vertex_selection_layer is None or edge_selection_layer is None:
+        return 0, "temporary topology or selection markers are missing"
+
+    applications: list[tuple[Vector, tuple[_MirroredPathOccurrence, ...]]] = []
+    for cluster in plan:
+        if cluster.positive:
+            applications.append((cluster.positive_coordinate, cluster.positive))
+        if cluster.negative:
+            applications.append((cluster.negative_coordinate, cluster.negative))
+
+    native_edge_selection: dict[int, bool] = {}
+    native_vertex_selection: dict[int, bool] = {}
+    edge_marker: dict[int, int] = {}
+    endpoint_vertex_by_occurrence: dict[int, bmesh.types.BMVert] = {}
+    participant_endpoints: list[set[bmesh.types.BMVert]] = []
+    for _coordinate, occurrences in applications:
+        endpoints: set[bmesh.types.BMVert] = set()
+        for occurrence in occurrences:
+            edge = occurrence.edge
+            if not edge.is_valid:
+                return 0, "a mirrored crossing source edge was lost before stitching"
+            edge_key = occurrence.edge_id
+            native_edge_selection.setdefault(edge_key, bool(edge.select))
+            edge_marker.setdefault(edge_key, int(edge[marker_layer]))
+            if occurrence.endpoint_index is not None:
+                endpoint = edge.verts[occurrence.endpoint_index]
+                endpoints.add(endpoint)
+                endpoint_vertex_by_occurrence[id(occurrence)] = endpoint
+                native_vertex_selection.setdefault(hash(endpoint), bool(endpoint.select))
+        participant_endpoints.append(endpoints)
+
+    reusable_vertex: list[bmesh.types.BMVert | None] = []
+    for application_index, (coordinate, _occurrences) in enumerate(applications):
+        extras = [
+            vertex
+            for vertex in bm.verts
+            if vertex.is_valid
+            and vertex not in participant_endpoints[application_index]
+            and coordinates_match(vertex.co, coordinate, _plan_tolerance(plan))
+        ]
+        if len(extras) > 1:
+            return 0, "multiple existing vertices are ambiguous at a mirrored cut intersection"
+        reusable_vertex.append(extras[0] if extras else None)
+        if extras:
+            native_vertex_selection.setdefault(hash(extras[0]), bool(extras[0].select))
+
+    split_entries_by_edge: dict[
+        int,
+        list[tuple[float, int, _MirroredPathOccurrence]],
+    ] = defaultdict(list)
+    edge_by_key: dict[int, bmesh.types.BMEdge] = {}
+    for application_index, (_coordinate, occurrences) in enumerate(applications):
+        for occurrence in occurrences:
+            if occurrence.endpoint_index is not None:
+                continue
+            key = occurrence.edge_id
+            edge_by_key[key] = occurrence.edge
+            split_entries_by_edge[key].append((occurrence.factor, application_index, occurrence))
+
+    vertex_by_occurrence: dict[int, bmesh.types.BMVert] = dict(endpoint_vertex_by_occurrence)
+    for edge_key, entries in split_entries_by_edge.items():
+        original_edge = edge_by_key[edge_key]
+        if not original_edge.is_valid:
+            return 0, "a mirrored crossing source edge was lost during stitching"
+        original_start = original_edge.verts[0]
+        original_end = original_edge.verts[1]
+        descendant = original_edge
+        descendant_start = original_start
+        interval_start = 0.0
+        selected = native_edge_selection[edge_key]
+        marker = edge_marker[edge_key]
+        entries.sort(key=lambda entry: entry[0])
+        for factor, _application_index, occurrence in entries:
+            if factor <= interval_start or factor >= 1.0:
+                return 0, "a mirrored crossing split factor is not interior to its descendant edge"
+            local_factor = (factor - interval_start) / (1.0 - interval_start)
+            try:
+                new_edge, new_vertex = bmesh.utils.edge_split(
+                    descendant,
+                    descendant_start,
+                    local_factor,
+                )
+            except (RuntimeError, ValueError) as exc:
+                return 0, f"could not split a mirrored path crossing edge: {exc}"
+
+            for half_edge in (descendant, new_edge):
+                half_edge[marker_layer] = marker
+                half_edge.select = selected
+                half_edge[edge_selection_layer] = int(selected)
+            new_vertex.select = selected
+            new_vertex[vertex_selection_layer] = int(selected)
+            native_vertex_selection[hash(new_vertex)] = selected
+            vertex_by_occurrence[id(occurrence)] = new_vertex
+
+            descendants = [edge for edge in (descendant, new_edge) if original_end in edge.verts]
+            if len(descendants) != 1:
+                return 0, "could not track a mirrored crossing descendant edge"
+            descendant = descendants[0]
+            descendant_start = new_vertex
+            interval_start = factor
+
+    for application_index, (coordinate, occurrences) in enumerate(applications):
+        vertices: list[bmesh.types.BMVert] = []
+        edge_key_by_vertex: dict[int, tuple[tuple[float, float, float], tuple[float, float, float]]] = {}
+        for occurrence in occurrences:
+            vertex = vertex_by_occurrence.get(id(occurrence))
+            if vertex is None or not vertex.is_valid:
+                return 0, "a mirrored crossing vertex was lost before cluster unification"
+            if vertex not in vertices:
+                vertices.append(vertex)
+            vertex_key = hash(vertex)
+            current_key = edge_key_by_vertex.get(vertex_key)
+            if current_key is None or occurrence.edge_key < current_key:
+                edge_key_by_vertex[vertex_key] = occurrence.edge_key
+
+        existing = reusable_vertex[application_index]
+        if existing is not None:
+            if not existing.is_valid:
+                return 0, "an existing mirrored crossing vertex was lost before reuse"
+            if existing not in vertices:
+                vertices.append(existing)
+            survivor = existing
+        else:
+            survivor = min(vertices, key=lambda vertex: edge_key_by_vertex[hash(vertex)])
+
+        selected = any(native_edge_selection[occurrence.edge_id] for occurrence in occurrences)
+        selected |= any(native_vertex_selection.get(hash(vertex), bool(vertex.select)) for vertex in vertices)
+        snapshot_selected = selected or any(
+            bool(vertex[vertex_selection_layer]) for vertex in vertices if vertex.is_valid
+        )
+        survivor.co = coordinate.copy()
+        for vertex in list(vertices):
+            if vertex == survivor:
+                continue
+            try:
+                bmesh.ops.pointmerge(
+                    bm,
+                    verts=[survivor, vertex],
+                    merge_co=coordinate,
+                )
+            except (RuntimeError, ValueError) as exc:
+                return 0, f"could not unify mirrored crossing vertices: {exc}"
+            if not survivor.is_valid:
+                return 0, "the mirrored crossing survivor was lost during point merge"
+        survivor.co = coordinate.copy()
+        survivor.select = selected
+        survivor[vertex_selection_layer] = int(snapshot_selected)
+
+        ambiguous = [
+            vertex
+            for vertex in bm.verts
+            if vertex.is_valid
+            and vertex != survivor
+            and coordinates_match(vertex.co, coordinate, _plan_tolerance(plan))
+        ]
+        if ambiguous:
+            return 0, "a separate existing vertex remains within tolerance of a mirrored cut intersection"
+
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.normal_update()
+    return len(applications), ""
+
+
+def _plan_tolerance(plan: Sequence[_MirroredPathCrossingCluster]) -> float:
+    return plan[0].tolerance if plan else 0.0
+
+
 def collect_source_path_edges(
     bm: bmesh.types.BMesh,
     axis_index: int,
@@ -1880,6 +2672,7 @@ def apply_reflected_path_topology(
                 edge.verts[0].co,
                 edge.verts[1].co,
                 tolerance,
+                face_ids={FaceId(int(face[face_layer])) for face in edge.link_faces},
             )
 
     created_edges = 0
@@ -1904,7 +2697,20 @@ def apply_reflected_path_topology(
                 progress = True
                 continue
 
-            if _edge_coordinate_key_matches(target_a.co, target_b.co, tolerance, existing_edges):
+            endpoint_match = _match_edge_endpoint_pair_for_faces(
+                target_a.co,
+                target_b.co,
+                tolerance,
+                existing_edges,
+                possible_target_ids,
+            )
+            if endpoint_match == "ambiguous":
+                return (
+                    created_edges,
+                    already_present,
+                    "multiple coordinate-matching edges are ambiguous across target faces",
+                )
+            if endpoint_match == "match":
                 already_present += 1
                 progress = True
                 continue
@@ -1941,6 +2747,7 @@ def apply_reflected_path_topology(
                 new_edge.verts[0].co,
                 new_edge.verts[1].co,
                 tolerance,
+                face_ids={FaceId(int(face[face_layer])) for face in new_edge.link_faces},
             )
             created_edges += 1
             progress = True
@@ -1991,8 +2798,12 @@ def _canonical_edge_endpoints(
     return qb, coord_b, coord_a
 
 
-# primary bin of canonical first endpoint -> (marker|None, coord_a, coord_b)
-_EdgeEndpointEntry = tuple[int | None, tuple[float, float, float], tuple[float, float, float]]
+_EdgeEndpointEntry = tuple[
+    int | None,
+    tuple[float, float, float],
+    tuple[float, float, float],
+    frozenset[FaceId] | None,
+]
 _EdgeEndpointStore = dict[QuantizedCoordinate, list[_EdgeEndpointEntry]]
 
 
@@ -2002,11 +2813,13 @@ def _register_edge_endpoint_pair(
     b: Vector,
     tolerance: float,
     marker: int | None = None,
+    face_ids: Iterable[FaceId] | None = None,
 ) -> None:
     """Store real endpoint coords under the primary bin of the canonical first endpoint."""
 
     primary_a, coord_a, coord_b = _canonical_edge_endpoints(a, b, tolerance)
-    store.setdefault(primary_a, []).append((marker, coord_a, coord_b))
+    stored_face_ids = frozenset(face_ids) if face_ids is not None else None
+    store.setdefault(primary_a, []).append((marker, coord_a, coord_b, stored_face_ids))
 
 
 def _match_edge_endpoint_pair(
@@ -2027,7 +2840,7 @@ def _match_edge_endpoint_pair(
         first_coord = _coordinate_tuple(query_first)
         second_coord = _coordinate_tuple(query_second)
         for bin_key in _iter_quantized_neighborhood(query_first, tolerance):
-            for marker, stored_a, stored_b in store.get(bin_key, ()):
+            for marker, stored_a, stored_b, _face_ids in store.get(bin_key, ()):
                 distance_a = _chebyshev_distance_3d(first_coord, stored_a)
                 distance_b = _chebyshev_distance_3d(second_coord, stored_b)
                 if distance_a > tolerance or distance_b > tolerance:
@@ -2036,6 +2849,33 @@ def _match_edge_endpoint_pair(
                 if best is None or score < best[0]:
                     best = (score, marker)
     return best
+
+
+def _match_edge_endpoint_pair_for_faces(
+    a: Vector,
+    b: Vector,
+    tolerance: float,
+    store: _EdgeEndpointStore,
+    possible_target_ids: set[FaceId],
+) -> Literal["no_match", "match", "ambiguous"]:
+    matches: set[tuple[QuantizedCoordinate, int]] = set()
+    for query_first, query_second in ((a, b), (b, a)):
+        first_coord = _coordinate_tuple(query_first)
+        second_coord = _coordinate_tuple(query_second)
+        for bin_key in _iter_quantized_neighborhood(query_first, tolerance):
+            for entry_index, (_marker, stored_a, stored_b, face_ids) in enumerate(store.get(bin_key, ())):
+                if face_ids is None or not face_ids.intersection(possible_target_ids):
+                    continue
+                if _chebyshev_distance_3d(first_coord, stored_a) > tolerance:
+                    continue
+                if _chebyshev_distance_3d(second_coord, stored_b) > tolerance:
+                    continue
+                matches.add((bin_key, entry_index))
+    if not matches:
+        return "no_match"
+    if len(matches) > 1:
+        return "ambiguous"
+    return "match"
 
 
 def _edge_coordinate_key_matches(
