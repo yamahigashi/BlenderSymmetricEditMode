@@ -192,6 +192,11 @@ native, while the X / Del / Ctrl+X routes (and direct calls to the
   self-intersecting stroke would produce. Loop cuts on rings that cross the
   plane come out symmetric; a ring left partial by hidden edges declines the
   mirror step with a warning.
+- When a mirrored cut segment crosses a cut made on the other side of the
+  plane inside the same face — common with freehand strokes across the
+  plane — a vertex is inserted at the crossing point and both cuts are
+  split there, on both sides symmetrically. Cuts that partially overlap
+  their mirror along the same line decline the mirror step with a warning.
 - UVs and other CustomData are interpolated on the target side and kept finite,
   but exact parity with every native **Correct UVs** case is not guaranteed.
 

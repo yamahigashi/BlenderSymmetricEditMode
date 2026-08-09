@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "ydd_symmetric_edit"
-version = "0.8.0"
+version = "0.9.0"
 name = "ydd Symmetric Edit"
 tagline = "Make native cut, connect, and merge tools symmetry-aware"
 maintainer = "yamahigashi"

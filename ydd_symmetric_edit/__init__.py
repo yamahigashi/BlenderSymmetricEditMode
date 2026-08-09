@@ -3,7 +3,7 @@
 bl_info = {
     "name": "ydd Symmetric Edit",
     "author": "yamahigashi dot dev",
-    "version": (0, 8, 0),
+    "version": (0, 9, 0),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Edit Mode > Edit tab",
     "description": "Mirror native Knife and Loop Cut topology without a modifier",
