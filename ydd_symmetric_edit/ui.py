@@ -108,6 +108,11 @@ class VIEW3D_PT_ydd_symmetric_edit(bpy.types.Panel):
     def poll(cls, context):
         return context.mode == "EDIT_MESH"
 
+    def draw_header(self, context):
+        preferences = get_addon_preferences(context)
+        if preferences is not None:
+            self.layout.prop(preferences, "enabled", text="")
+
     def draw(self, context):
         layout = self.layout
         if layout is None:
@@ -118,31 +123,23 @@ class VIEW3D_PT_ydd_symmetric_edit(bpy.types.Panel):
         axes = tuple(axis for axis, _index in core.enabled_mesh_symmetry_axes(obj))
 
         enabled = preferences is not None and preferences.enabled
-        if preferences is not None:
-            layout.prop(
-                preferences,
-                "enabled",
-                text="Symmetric Edit Mode",
-                icon="MOD_MIRROR",
-                toggle=True,
-            )
-            if enabled and not keymaps.has_delete_routes():
-                layout.label(text="No Delete key binding found", icon="ERROR")
-        else:
+        if preferences is None:
             layout.label(text="Persistent setting unavailable", icon="ERROR")
+        elif enabled and not keymaps.has_delete_routes():
+            layout.label(text="No Delete key binding found", icon="ERROR")
 
         body = layout.column()
         body.active = enabled
-        body.use_property_split = True
-        body.use_property_decorate = False
 
-        row = body.row(heading="Symmetry", align=True)
+        body.label(text="Symmetry:")
+        row = body.row(align=True)
         for axis, _index, property_name in core.MESH_SYMMETRY_PROPERTIES:
             row.prop(obj, property_name, text=axis, toggle=True)
         if len(axes) != 1:
             body.label(text="Enable exactly one axis", icon="ERROR")
 
-        body.prop(settings, "source_side", text="Source")
+        body.label(text="Source:")
+        body.prop(settings, "source_side", text="")
         body.prop(settings, "select_mirrored")
         body.prop(settings, "tolerance", text="Tolerance")
 
