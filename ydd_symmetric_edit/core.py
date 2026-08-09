@@ -54,7 +54,7 @@ EDGE_HIDDEN_LAYER = ".yse_edge_hidden"
 VERT_BACKUP_ID_LAYER = ".yse_backup_vertex_id"
 VERT_RIP_ID_LAYER = ".yse_rip_vertex_id"
 VERT_MERGE_GROUP_LAYER = ".yse_merge_group"
-VERT_COLLAPSE_GROUP_LAYER = "yse_collapse_group"
+VERT_COLLAPSE_GROUP_LAYER = ".yse_collapse_group"
 
 TEMP_LAYER_NAMES = (
     EDGE_ORIGINAL_LAYER,

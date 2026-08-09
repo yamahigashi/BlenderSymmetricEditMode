@@ -392,6 +392,45 @@ def case_e_fault_rollback(window, area, region) -> None:
         yse_delete._native_edge_collapse_call = original
 
 
+def case_j_cascade_decline(window, area, region) -> None:
+    """Structural survivor mismatch (two survivors in one group) must decline."""
+
+    obj, before = replace_with_edge_pairs(window, area, region)
+    bm = ensure_edit(window, area, region, obj)
+    before_verts = vertex_coord_multiset(bm)
+    select_plus_edge(bm)
+    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+
+    original = yse_delete._native_edge_collapse_call
+
+    def _faulty():
+        result = original()
+        edit_obj = bpy.context.edit_object
+        assert edit_obj is not None
+        live = bmesh.from_edit_mesh(edit_obj.data)
+        layer = live.verts.layers.int.get(core.VERT_COLLAPSE_GROUP_LAYER)
+        assert layer is not None
+        survivor = next(vertex for vertex in live.verts if int(vertex[layer]) > 0)
+        extra = live.verts.new((survivor.co.x + 0.25, survivor.co.y, survivor.co.z))
+        extra[layer] = int(survivor[layer])
+        bmesh.update_edit_mesh(edit_obj.data, loop_triangles=False, destructive=True)
+        return result
+
+    yse_delete._native_edge_collapse_call = _faulty
+    try:
+        yse_delete._DELETE_REPORTS.clear()
+        with bpy.context.temp_override(window=window, area=area, region=region):
+            result = bpy.ops.mesh.ydd_symmetric_edit_edge_collapse()
+        assert result == {"FINISHED"}, result
+        assert any("rolled back" in message for message in warnings()), warnings()
+        bm = bmesh.from_edit_mesh(obj.data)
+        assert topology_counts(bm) == before
+        assert vertex_coord_multiset(bm) == before_verts
+        print("YSE_COLLAPSE_J_OK", flush=True)
+    finally:
+        yse_delete._native_edge_collapse_call = original
+
+
 def case_f_delete_edgeloop(window, area, region) -> tuple[int, int, int]:
     # Timer-driven harnesses cannot verify deep undo-oneness: operator undo
     # pushes issued from a timer do not land, so ed.undo always returns to the
@@ -441,7 +480,7 @@ def case_g_delete_edgeloop_undo(window, area, region, baseline: tuple[int, int, 
     bm = ensure_edit(window, area, region, obj)
     assert topology_counts(bm) == (8, 12, 6), topology_counts(bm)
     assert_x_symmetric(bm, label="g delete edgeloop undo")
-    print("YSE_COLLAPSE_G_OK", flush=True)
+    print("YSE_COLLAPSE_G_OK (session-start reset only; deep undo-oneness not verifiable in timer harness)", flush=True)
 
 
 def case_i_passthrough(window, area, region) -> None:
@@ -474,6 +513,7 @@ def run_all() -> None:
     case_c_bowtie(window, area, region)
     case_d_hidden(window, area, region)
     case_e_fault_rollback(window, area, region)
+    case_j_cascade_decline(window, area, region)
     case_i_passthrough(window, area, region)
 
 
