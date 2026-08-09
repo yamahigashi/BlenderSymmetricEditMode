@@ -62,6 +62,7 @@ def get_addon_preferences(context):
 class YSE_PG_settings(bpy.types.PropertyGroup):
     if TYPE_CHECKING:
         source_side: str
+        select_mirrored: bool
         tolerance: float
     else:
         source_side: EnumProperty(
@@ -75,6 +76,15 @@ class YSE_PG_settings(bpy.types.PropertyGroup):
                 ("POSITIVE", "Positive", "Mirror cuts drawn on the positive half"),
             ),
             default="AUTO",
+        )
+        select_mirrored: BoolProperty(
+            name="Select Mirrored",
+            description=(
+                "Also select the mirror counterparts of the elements the tool leaves "
+                "selected. Selection-driven tools (Connect, Delete) will then act on "
+                "both sides"
+            ),
+            default=False,
         )
         tolerance: FloatProperty(
             name="Match Tolerance",
@@ -133,6 +143,7 @@ class VIEW3D_PT_ydd_symmetric_edit(bpy.types.Panel):
             body.label(text="Enable exactly one axis", icon="ERROR")
 
         body.prop(settings, "source_side", text="Source")
+        body.prop(settings, "select_mirrored")
         body.prop(settings, "tolerance", text="Tolerance")
 
 

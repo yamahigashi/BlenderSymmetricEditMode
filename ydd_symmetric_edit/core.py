@@ -2382,6 +2382,111 @@ def _selection_element_coordinate(element) -> Vector:
     return element.calc_center_median()
 
 
+def extend_selection_to_mirror(
+    bm: bmesh.types.BMesh,
+    axis_index: int,
+    tolerance: float,
+) -> int:
+    """Add-select mirror counterparts of currently selected mesh elements.
+
+    Contract: Select Mirrored. Never deselects. Never mutates
+    ``select_history`` or the active element. Unresolved counterparts are
+    skipped silently. On-plane / self-mirrored elements are no-ops.
+
+    Vertex pairing reuses :func:`build_vertex_pair_table` (floor-bin +
+    neighbourhood probe, involutive). Edges and faces resolve when every
+    constituent vertex has a pair and some element owns exactly that partner
+    vertex set.
+
+    Returns the number of elements that transitioned from unselected to
+    selected. Does not call ``select_flush_mode``; callers that need a mode
+    flush may do so after this returns. Selecting an edge or face may later
+    cascade to lower elements if the caller flushes — that is allowed.
+    """
+
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    # Pair tables are keyed by enumerate(bm.verts) order; .index must match.
+    bm.verts.index_update()
+    bm.edges.index_update()
+    bm.faces.index_update()
+
+    coords = [vertex.co.copy() for vertex in bm.verts]
+    pairs = build_vertex_pair_table(coords, axis_index, tolerance)
+    if not pairs:
+        return 0
+
+    # Snapshot first: newly selected counterparts must not seed further
+    # expansion in the same call (contract is one-shot add of ρ(S), not a
+    # fixed point).
+    selected_verts = [vertex for vertex in bm.verts if vertex.select]
+    selected_edges = [edge for edge in bm.edges if edge.select]
+    selected_faces = [face for face in bm.faces if face.select]
+
+    edge_by_verts = {
+        frozenset((edge.verts[0].index, edge.verts[1].index)): edge for edge in bm.edges if edge.is_valid
+    }
+    face_by_verts = {frozenset(vertex.index for vertex in face.verts): face for face in bm.faces if face.is_valid}
+
+    added = 0
+
+    for vertex in selected_verts:
+        partner_index = pairs.get(vertex.index)
+        if partner_index is None or partner_index == vertex.index:
+            continue
+        if partner_index < 0 or partner_index >= len(bm.verts):
+            continue
+        partner = bm.verts[partner_index]
+        if partner.is_valid and not partner.select:
+            partner.select = True
+            added += 1
+
+    for edge in selected_edges:
+        if not edge.is_valid:
+            continue
+        source_indices = (edge.verts[0].index, edge.verts[1].index)
+        partner_indices = []
+        for index in source_indices:
+            partner = pairs.get(index)
+            if partner is None:
+                partner_indices = None
+                break
+            partner_indices.append(partner)
+        if partner_indices is None:
+            continue
+        partner_set = frozenset(partner_indices)
+        if partner_set == frozenset(source_indices):
+            continue
+        partner_edge = edge_by_verts.get(partner_set)
+        if partner_edge is not None and partner_edge.is_valid and not partner_edge.select:
+            partner_edge.select = True
+            added += 1
+
+    for face in selected_faces:
+        if not face.is_valid:
+            continue
+        source_indices = tuple(vertex.index for vertex in face.verts)
+        partner_indices = []
+        for index in source_indices:
+            partner = pairs.get(index)
+            if partner is None:
+                partner_indices = None
+                break
+            partner_indices.append(partner)
+        if partner_indices is None:
+            continue
+        partner_set = frozenset(partner_indices)
+        if partner_set == frozenset(source_indices):
+            continue
+        partner_face = face_by_verts.get(partner_set)
+        if partner_face is not None and partner_face.is_valid and not partner_face.select:
+            partner_face.select = True
+            added += 1
+
+    return added
+
+
 def reserve_source_path_marker(bm: bmesh.types.BMesh) -> int:
     """Move source path edges away from zero before Knife Project runs.
 

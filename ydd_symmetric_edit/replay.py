@@ -277,6 +277,23 @@ def _connect_report(operator, level: set[str], message: str) -> None:
     operator.report(level, message)
 
 
+def _maybe_extend_selection_to_mirror(mesh, axis_index: int, tolerance: float) -> None:
+    """When Scene ``select_mirrored`` is on, add-select ρ(S) after success.
+
+    Best-effort.  Does not touch ``select_history`` (core contract).
+    """
+
+    try:
+        settings = getattr(bpy.context.scene, "ydd_symmetric_edit", None)
+        if settings is None or not bool(getattr(settings, "select_mirrored", False)):
+            return
+        bm = bmesh.from_edit_mesh(mesh)
+        core.extend_selection_to_mirror(bm, axis_index, tolerance)
+        bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+    except Exception:
+        traceback.print_exc()
+
+
 def _merge_report(operator, level: set[str], message: str) -> None:
     """Report and record for Merge tests."""
 
@@ -902,6 +919,7 @@ class MESH_OT_ydd_symmetric_edit_connect(bpy.types.Operator):
             # + edge attributes, 1:1 cancellation).
             if _connect_effect_is_self_mirrored(r_records, face_id_pairs, axis_index, tolerance):
                 _report_self_mirrored(self)
+                _maybe_extend_selection_to_mirror(mesh, axis_index, tolerance)
                 return result
 
             # Counterpart missing → legitimate decline (native kept + WARNING).
@@ -1004,6 +1022,11 @@ class MESH_OT_ydd_symmetric_edit_connect(bpy.types.Operator):
                 if backup_creation_failed or rollback_failed:
                     mirror_level = "ERROR"
                 _connect_report(self, {mirror_level}, mirror_warning)
+            else:
+                # Mirror stage completed (or was a pure no-op success path).
+                # Selection was restored to the native source path above; extend
+                # now so ρ(S) is add-selected without touching select_history.
+                _maybe_extend_selection_to_mirror(mesh, axis_index, tolerance)
         except Exception:
             traceback.print_exc()
         return result
@@ -1077,7 +1100,10 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
             for index in snapshot.mirrors:
                 bm.verts[index].select = True
             bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
-            return self._native()
+            result = self._native()
+            if "FINISHED" in result:
+                _maybe_extend_selection_to_mirror(mesh, axis_index, tolerance)
+            return result
 
         if self.mode not in _MERGE_MODES:
             return self._native()
@@ -1111,7 +1137,10 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
                 # CENTER's centroid lies on the plane; COLLAPSE's islands come
                 # in symmetric pairs.  One native run is already symmetric.
                 _report_self_mirrored(self, _merge_report)
-                return self._native()
+                result = self._native()
+                if "FINISHED" in result:
+                    _maybe_extend_selection_to_mirror(mesh, axis_index, tolerance)
+                return result
             # PARTIAL (complete): symmetrize the selection to reduce it to the
             # self-mirrored case, then run the native merge once.
             added = self._symmetrize_selection(bm, mesh, snapshot)
@@ -1120,7 +1149,10 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
                 {"INFO"},
                 f"Added {added} mirrored vertex(es) to the selection to keep the merge symmetric",
             )
-            return self._native()
+            result = self._native()
+            if "FINISHED" in result:
+                _maybe_extend_selection_to_mirror(mesh, axis_index, tolerance)
+            return result
 
         return self._execute_side_split_merge(
             mesh,
@@ -1232,6 +1264,9 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
         # The native mesh is mutated: every path below returns `result`.
         backup_mesh = None
         mirror_warning = None
+        # Contract §3.2: any cluster-level mirror decline (WARNING skip) makes
+        # the whole op a partial failure → do not run Select Mirrored extend.
+        cluster_declined = False
         try:
             bm = bmesh.from_edit_mesh(mesh)
             backup_mesh = backup.create_topology_backup(bm)
@@ -1269,6 +1304,7 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
                                 {"WARNING"},
                                 "native merged this cluster only partially; its mirror was skipped",
                             )
+                            cluster_declined = True
                         continue
                     mirrors = [vertex for vertex in mirror_verts_by_cluster.get(cluster_number, ()) if vertex.is_valid]
                     if not mirrors:
@@ -1278,6 +1314,7 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
                                 {"WARNING"},
                                 "Mirror merge skipped for one cluster: its mirrored vertices could not be re-identified",
                             )
+                            cluster_declined = True
                         continue
                     if abs(target[axis_index]) <= tolerance:
                         # A merge landing on the plane welds the mirrored
@@ -1290,6 +1327,7 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
                                 {"WARNING"},
                                 "Mirror merge skipped for one cluster: the on-plane survivor could not be identified",
                             )
+                            cluster_declined = True
                             continue
                         mirrors.append(survivor)
                         merge_co = target
@@ -1319,6 +1357,8 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
         try:
             if mirror_warning:
                 _merge_report(self, {"WARNING"}, mirror_warning)
+            elif "FINISHED" in result and not cluster_declined:
+                _maybe_extend_selection_to_mirror(mesh, axis_index, tolerance)
         except Exception:
             traceback.print_exc()
         return result
@@ -1370,7 +1410,10 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
                     f"Added {added} mirrored vertex(es) to the selection to keep the merge symmetric",
                 )
             _report_self_mirrored(self, _merge_report)
-            return self._native()
+            result = self._native()
+            if "FINISHED" in result:
+                _maybe_extend_selection_to_mirror(mesh, axis_index, tolerance)
+            return result
 
         # Step 2: side partition.  Off-plane verts go to the half-space of
         # their X sign; on-plane verts are shared (kept, not side-merged).
@@ -1543,6 +1586,11 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
                     {"INFO"},
                     f"Merged each side to its own {side_label} vertex",
                 )
+                if "FINISHED" in result:
+                    # Side-split already selects both survivors; this still
+                    # covers any leftover selected non-survivor elements and is
+                    # a no-op for already-selected mirror survivors.
+                    _maybe_extend_selection_to_mirror(mesh, axis_index, tolerance)
         except Exception:
             traceback.print_exc()
         return result

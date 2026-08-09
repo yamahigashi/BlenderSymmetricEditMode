@@ -641,6 +641,7 @@ def _finish_rip_session(
         _finish_report(operator, level, f"ydd Symmetric Edit: Rip was not mirrored: {reason}")
     else:
         _finish_report(operator, {"INFO"}, f"Mirrored Rip across {mirrored_count} seam edge(s)")
+        _maybe_extend_selection_to_mirror(obj, session.axis_index, session.tolerance)
     return {"FINISHED"}
 
 
@@ -650,6 +651,27 @@ def _finish_report(operator, level: set[str], message: str) -> None:
     kind = "WARNING" if "WARNING" in level else "ERROR" if "ERROR" in level else "INFO"
     _FINISH_REPORTS.append((kind, message))
     operator.report(level, message)
+
+
+def _maybe_extend_selection_to_mirror(obj, axis_index: int, tolerance: float) -> None:
+    """When Scene ``select_mirrored`` is on, add-select ρ(S) after a success.
+
+    Best-effort: selection restore / layer cleanup must not fail because of
+    this.  Never mutates ``select_history`` (delegated to core).
+    """
+
+    try:
+        scene = bpy.context.scene
+        settings = getattr(scene, "ydd_symmetric_edit", None)
+        if settings is None or not bool(getattr(settings, "select_mirrored", False)):
+            return
+        if obj is None or obj.mode != "EDIT":
+            return
+        bm = bmesh.from_edit_mesh(obj.data)
+        core.extend_selection_to_mirror(bm, axis_index, tolerance)
+        bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+    except Exception:
+        traceback.print_exc()
 
 
 class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
@@ -1195,6 +1217,20 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                                 face_id = FaceId(int(face[face_layer]))
                                 face.hide = bool(session.hidden_by_face_id.get(face_id, False))
                     core.remove_temporary_layers(bm)
+                    # Select Mirrored runs after selection restore + layer cleanup
+                    # so it sees the final native selection and permanent topology.
+                    # Early returns still execute this finally (Python semantics).
+                    if mirror_failure is None:
+                        try:
+                            settings = getattr(context.scene, "ydd_symmetric_edit", None)
+                            if settings is not None and bool(getattr(settings, "select_mirrored", False)):
+                                core.extend_selection_to_mirror(
+                                    bm,
+                                    session.axis_index,
+                                    session.tolerance,
+                                )
+                        except Exception:
+                            traceback.print_exc()
                     bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=True)
                 except Exception:
                     traceback.print_exc()
