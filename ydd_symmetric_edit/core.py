@@ -999,6 +999,27 @@ def _is_path_edge_by_markers(edge: bmesh.types.BMEdge, edge_layer, face_layer) -
     )
 
 
+def native_path_edge_state(bm: bmesh.types.BMesh) -> Literal["PRESENT", "ABSENT", "UNKNOWN"]:
+    """Classify whether *bm* carries evidence of an unprocessed native cut.
+
+    ABSENT is only returned when both marker layers exist and a full scan
+    found no path edge, so callers can treat missing layers or read failures
+    as indeterminate rather than as a clean prepared baseline.
+    """
+
+    try:
+        edge_layer = bm.edges.layers.int.get(EDGE_ORIGINAL_LAYER)
+        face_layer = bm.faces.layers.int.get(FACE_ID_LAYER)
+        if edge_layer is None or face_layer is None:
+            return "UNKNOWN"
+        for edge in bm.edges:
+            if _is_path_edge_by_markers(edge, edge_layer, face_layer):
+                return "PRESENT"
+        return "ABSENT"
+    except (AttributeError, ReferenceError, RuntimeError):
+        return "UNKNOWN"
+
+
 def _discover_path_edges(
     bm: bmesh.types.BMesh,
     *,

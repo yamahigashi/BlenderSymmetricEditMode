@@ -1543,20 +1543,26 @@ def _schedule_passthrough_watcher(
     bpy.app.timers.register(callback, first_interval=0.02)
 
 
-def _object_history_tokens(obj) -> set[int]:
+def _read_history_tokens(obj) -> set[int]:
+    """Read raw history tokens; read failures propagate to the caller."""
+
     if obj.type != "MESH":
         return set()
-    try:
-        if obj.mode == "EDIT":
-            bm = bmesh.from_edit_mesh(obj.data)
-            layer = bm.faces.layers.int.get(core.HISTORY_TOKEN_LAYER)
-            if layer is None:
-                return set()
-            return {int(face[layer]) for face in bm.faces if int(face[layer])}
-        attribute = obj.data.attributes.get(core.HISTORY_TOKEN_LAYER)
-        if attribute is None:
+    if obj.mode == "EDIT":
+        bm = bmesh.from_edit_mesh(obj.data)
+        layer = bm.faces.layers.int.get(core.HISTORY_TOKEN_LAYER)
+        if layer is None:
             return set()
-        return {int(item.value) for item in attribute.data if int(item.value)}
+        return {int(face[layer]) for face in bm.faces if int(face[layer])}
+    attribute = obj.data.attributes.get(core.HISTORY_TOKEN_LAYER)
+    if attribute is None:
+        return set()
+    return {int(item.value) for item in attribute.data if int(item.value)}
+
+
+def _object_history_tokens(obj) -> set[int]:
+    try:
+        return _read_history_tokens(obj)
     except (AttributeError, ReferenceError, RuntimeError):
         return set()
 
@@ -1663,12 +1669,18 @@ def _repair_history_state():
 
     candidates = []
     for obj, tokens in repairable_marker_objects:
-        if len(tokens) != 1:
+        # Stale debris tokens may coexist with the repairable one; only a
+        # unique COMMITTED token is authoritative.  Finish removes every
+        # temporary layer, so foreign leftovers are swept by the repair itself.
+        committed_tokens = [
+            (token, _HISTORY_RECORDS[token])
+            for token in tokens
+            if token in _HISTORY_RECORDS and _HISTORY_RECORDS[token].status == "COMMITTED"
+        ]
+        if len(committed_tokens) != 1:
             continue
-        token = next(iter(tokens))
-        record = _HISTORY_RECORDS.get(token)
-        if record is not None and record.status == "COMMITTED":
-            candidates.append((obj, token, record))
+        token, record = committed_tokens[0]
+        candidates.append((obj, token, record))
 
     # A native Knife Undo/Redo exposes exactly one recognized raw snapshot.
     # Ambiguous or unknown marker states are cleaned rather than projected.
@@ -1791,14 +1803,22 @@ def _prepare_adjust_last_operation_repeat() -> bool:
     )
     if prior_record is None:
         return False
-    # The F9 baseline is the clean post-finish state, so its mesh carries no
-    # history tokens.  A plain Undo instead lands on a raw marker-bearing
-    # snapshot; wm-level operator state cannot tell these apart, but the mesh
-    # datablock (which Undo does roll back) can.  Any token present therefore
-    # means "repair this snapshot", never "re-execute for Adjust Last
-    # Operation".
-    if _object_history_tokens(obj):
+    # Token presence alone cannot separate a raw snapshot from a baseline
+    # poisoned by lazy undo encoding; only path-edge evidence can.  Read
+    # failures and indeterminate layer states must stay on the repair side.
+    try:
+        tokens = _read_history_tokens(obj)
+    except Exception:
         return False
+    if tokens:
+        try:
+            bm = bmesh.from_edit_mesh(obj.data)
+            path_state = core.native_path_edge_state(bm)
+        except Exception:
+            return False
+        if path_state != "ABSENT":
+            return False
+        _queue_history_repair()
 
     profile = TOOL_PROFILES.get(tool_kind)
     if profile is not None and profile.supports_nested_offset:
