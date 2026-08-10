@@ -85,12 +85,21 @@ def prepare_guard_reason(context, bm: bmesh.types.BMesh, axis_index: int, tolera
     return None
 
 
-def build_snapshot(bm: bmesh.types.BMesh, axis_index: int, tolerance: float) -> RipSnapshot | None:
+def build_snapshot(
+    bm: bmesh.types.BMesh,
+    axis_index: int,
+    tolerance: float,
+    *,
+    lookup: core.VertexMirrorLookup | None = None,
+) -> RipSnapshot | None:
     """Capture the selection and its one-ring before the native Rip runs.
 
     Requires ``prepare_topology(..., mark_vertex_ids=True)`` to have assigned
     the unique vertex IDs and face IDs already.
     """
+
+    if lookup is not None and not _lookup_matches_mesh(lookup, bm, axis_index, tolerance):
+        lookup = core.build_vertex_mirror_lookup([vertex.co for vertex in bm.verts], axis_index, tolerance)
 
     vertex_id_layer = bm.verts.layers.int.get(core.VERT_RIP_ID_LAYER)
     face_id_layer = bm.faces.layers.int.get(core.FACE_ID_LAYER)
@@ -108,7 +117,8 @@ def build_snapshot(bm: bmesh.types.BMesh, axis_index: int, tolerance: float) -> 
     if not region:
         return None
 
-    lookup = core.build_vertex_mirror_lookup([vertex.co for vertex in bm.verts], axis_index, tolerance)
+    if lookup is None:
+        lookup = core.build_vertex_mirror_lookup([vertex.co for vertex in bm.verts], axis_index, tolerance)
     ids_by_index = [int(vertex[vertex_id_layer]) for vertex in bm.verts]
 
     # Injective batch resolution: no two region vertices can claim the same
@@ -136,6 +146,32 @@ def build_snapshot(bm: bmesh.types.BMesh, axis_index: int, tolerance: float) -> 
         tolerance=tolerance,
         vertices=tuple(sorted(records, key=lambda record: record.vertex_id)),
     )
+
+
+def _lookup_matches_mesh(
+    lookup: core.VertexMirrorLookup,
+    bm: bmesh.types.BMesh,
+    axis_index: int,
+    tolerance: float,
+) -> bool:
+    if not isinstance(lookup, core.VertexMirrorLookup):
+        return False
+    try:
+        bm.verts.ensure_lookup_table()
+        if len(lookup._coords) != len(bm.verts):
+            return False
+        if lookup._axis_index != axis_index or lookup._tolerance != tolerance:
+            return False
+        if len(bm.verts) == 0:
+            return True
+        first = bm.verts[0].co
+        last = bm.verts[len(bm.verts) - 1].co
+        return (
+            lookup._coords[0] == core._coordinate_3d(first).as_tuple()
+            and lookup._coords[-1] == core._coordinate_3d(last).as_tuple()
+        )
+    except (ReferenceError, RuntimeError, IndexError):
+        return False
 
 
 # ---------------------------------------------------------------------------

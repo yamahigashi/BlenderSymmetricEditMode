@@ -8,6 +8,7 @@ add runtime dependencies or create import cycles.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, NewType, Protocol, TypeAlias
@@ -16,6 +17,8 @@ if TYPE_CHECKING:
     import bpy
     from bpy.stub_internal.rna_enums import OperatorReturnItems
     from mathutils import Quaternion, Vector
+
+    from .core import VertexMirrorLookup
 
 
 FaceId = NewType("FaceId", int)
@@ -69,7 +72,7 @@ class CarrierFrameSnapshot:
     deviation: float
 
 
-CarrierFrameMap: TypeAlias = dict[FaceId, CarrierFrameSnapshot]
+CarrierFrameMap: TypeAlias = Mapping[FaceId, CarrierFrameSnapshot]
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -196,6 +199,7 @@ class TopologyPreparation:
     mirror_face_ids: MirrorFaceMap
     hidden_by_face_id: HiddenFaceMap
     carrier_frames: CarrierFrameMap
+    vertex_lookup: VertexMirrorLookup
     matched_faces: int
     total_faces: int
 

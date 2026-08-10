@@ -449,7 +449,12 @@ def _prepare_session(
 
     rip_snapshot = None
     if tool_kind == "RIP":
-        rip_snapshot = rip.build_snapshot(bm, axis_index, settings.tolerance)
+        rip_snapshot = rip.build_snapshot(
+            bm,
+            axis_index,
+            settings.tolerance,
+            lookup=topology.vertex_lookup,
+        )
         if rip_snapshot is None:
             core.remove_temporary_layers(bm)
             bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)

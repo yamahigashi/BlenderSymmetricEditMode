@@ -183,8 +183,8 @@ def coordinates_match(first, second, tolerance: float) -> bool:
 class VertexMirrorLookup:
     """Index of registered coordinates for mirror-plane counterpart lookup.
 
-    Built by :func:`build_vertex_mirror_lookup`. Matching reuses the shared
-    floor-bin neighborhood and Chebyshev verification.
+    Built by :func:`build_vertex_mirror_lookup`. KDTree supplies candidates;
+    stored double-precision tuples decide acceptance and ordering.
     """
 
     def __init__(
@@ -192,11 +192,13 @@ class VertexMirrorLookup:
         *,
         axis_index: int,
         tolerance: float,
-        bins: dict[QuantizedCoordinate, list[tuple[int, tuple[float, float, float]]]],
+        coords: list[tuple[float, float, float]],
+        tree: KDTree,
     ) -> None:
         self._axis_index = axis_index
         self._tolerance = tolerance
-        self._bins = bins
+        self._coords = coords
+        self._tree = tree
         self._on_plane_indices: frozenset[int] | None = None
 
     def _on_plane_registered(self) -> frozenset[int]:
@@ -207,10 +209,7 @@ class VertexMirrorLookup:
             axis_index = self._axis_index
             tolerance = self._tolerance
             cached = frozenset(
-                index
-                for entries in self._bins.values()
-                for index, stored in entries
-                if abs(stored[axis_index]) <= tolerance
+                index for index, stored in enumerate(self._coords) if abs(stored[axis_index]) <= tolerance
             )
             self._on_plane_indices = cached
         return cached
@@ -218,25 +217,14 @@ class VertexMirrorLookup:
     def find(self, co: Vector) -> int | None:
         """Return the index of the registered coord matching ``mirror(co)``.
 
-        Probes the 27-bin neighborhood of the reflected point. Accepts only
-        candidates whose Chebyshev distance is at most *tolerance*. When several
-        qualify, returns the nearest (minimum max-axis distance).
+        Accepts only candidates whose Chebyshev distance is at most
+        *tolerance*. When several qualify, returns the nearest candidate.
         """
 
         expected = mirror_coordinate(co, self._axis_index)
         expected_coord = (float(expected[0]), float(expected[1]), float(expected[2]))
-        tolerance = self._tolerance
-        best: tuple[float, int] | None = None
-        for bin_key in _iter_quantized_neighborhood(expected, tolerance):
-            for index, stored in self._bins.get(bin_key, ()):
-                # Acceptance is coordinates_match (Chebyshev <= tolerance);
-                # the same distance doubles as the nearest-first ranking key.
-                distance = _chebyshev_distance_3d(expected_coord, stored)
-                if distance > tolerance:
-                    continue
-                if best is None or distance < best[0]:
-                    best = (distance, index)
-        return None if best is None else best[1]
+        candidates = self._candidates_for(expected_coord)
+        return None if not candidates else candidates[0][1]
 
     def is_on_plane(self, co: Vector) -> bool:
         """True when *co* lies on the mirror plane within *tolerance*."""
@@ -299,12 +287,12 @@ class VertexMirrorLookup:
 
         position_coord = (float(position[0]), float(position[1]), float(position[2]))
         tolerance = self._tolerance
+        radius = math.sqrt(3.0) * tolerance * (1.0 + 1.0e-3)
         found = []
-        for bin_key in _iter_quantized_neighborhood(position, tolerance):
-            for index, stored in self._bins.get(bin_key, ()):
-                distance = _chebyshev_distance_3d(position_coord, stored)
-                if distance > tolerance:
-                    continue
+        for _coordinate, index, _distance in self._tree.find_range(Vector(position_coord), radius):
+            stored = self._coords[index]
+            distance = _chebyshev_distance_3d(position_coord, stored)
+            if distance <= tolerance:
                 found.append((distance, index))
         found.sort()
         return found
@@ -479,16 +467,32 @@ def build_vertex_mirror_lookup(
 ) -> VertexMirrorLookup:
     """Build a :class:`VertexMirrorLookup` over *coords*.
 
-    Each coordinate is stored under its primary floor bin. ``find`` probes the
-    27-bin neighborhood and verifies Chebyshev distance ≤ *tolerance* against
-    ``mirror_coordinate(co, axis_index)``.
+    Coordinates are stored in registration order and indexed by a KDTree.
+    Chebyshev verification remains against the stored coordinate tuples.
     """
 
-    bins: dict[QuantizedCoordinate, list[tuple[int, tuple[float, float, float]]]] = defaultdict(list)
+    stored_coords: list[tuple[float, float, float]] = []
+    tree = KDTree(len(coords))
     for index, co in enumerate(coords):
-        primary = _quantized_coordinate(co, tolerance)
-        bins[primary].append((index, (float(co[0]), float(co[1]), float(co[2]))))
-    return VertexMirrorLookup(axis_index=axis_index, tolerance=tolerance, bins=bins)
+        stored = (float(co[0]), float(co[1]), float(co[2]))
+        stored_coords.append(stored)
+        tree.insert(Vector(stored), index)
+    tree.balance()
+    return VertexMirrorLookup(axis_index=axis_index, tolerance=tolerance, coords=stored_coords, tree=tree)
+
+
+def _vertex_pair_table_from_lookup(
+    lookup: VertexMirrorLookup,
+    coords: Sequence[Vector],
+) -> dict[int, int]:
+    assigned = lookup.find_all_mirrored(coords)
+    pairs: dict[int, int] = {}
+    for source, target in enumerate(assigned):
+        if target is None:
+            continue
+        if target == source or assigned[target] == source:
+            pairs[source] = target
+    return pairs
 
 
 def build_vertex_pair_table(
@@ -504,15 +508,7 @@ def build_vertex_pair_table(
     pair with themselves.
     """
 
-    lookup = build_vertex_mirror_lookup(coords, axis_index, tolerance)
-    assigned = lookup.find_all_mirrored(coords)
-    pairs: dict[int, int] = {}
-    for source, target in enumerate(assigned):
-        if target is None:
-            continue
-        if target == source or assigned[target] == source:
-            pairs[source] = target
-    return pairs
+    return _vertex_pair_table_from_lookup(build_vertex_mirror_lookup(coords, axis_index, tolerance), coords)
 
 
 def classify_selection_overlap(
@@ -663,8 +659,40 @@ def remove_temporary_mesh_attributes(mesh) -> bool:
     return removed
 
 
-def _carrier_frame_snapshot(face: bmesh.types.BMFace) -> CarrierFrameSnapshot:
-    vertices = tuple(_coordinate_3d(vertex.co) for vertex in face.verts)
+class LazyCarrierFrameMap:
+    def __init__(self, raw: dict[FaceId, tuple[Coordinate3D, ...]]) -> None:
+        self._raw = raw
+        self._cache: dict[FaceId, CarrierFrameSnapshot] = {}
+
+    def get(self, key: FaceId, default=None):
+        if key not in self._raw:
+            return default
+        return self[key]
+
+    def __getitem__(self, key: FaceId) -> CarrierFrameSnapshot:
+        cached = self._cache.get(key)
+        if cached is None:
+            cached = _carrier_frame_from_coords(self._raw[key])
+            self._cache[key] = cached
+        return cached
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._raw
+
+    def __len__(self) -> int:
+        return len(self._raw)
+
+    def __iter__(self) -> Iterator[FaceId]:
+        return iter(self._raw)
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, LazyCarrierFrameMap) and self._raw == other._raw
+
+    def __ne__(self, other) -> bool:
+        return not self == other
+
+
+def _carrier_frame_from_coords(vertices: tuple[Coordinate3D, ...]) -> CarrierFrameSnapshot:
     if not vertices:
         zero = Coordinate3D(0.0, 0.0, 0.0)
         return CarrierFrameSnapshot(vertices, zero, None, None, 0.0)
@@ -707,6 +735,10 @@ def _carrier_frame_snapshot(face: bmesh.types.BMFace) -> CarrierFrameSnapshot:
         basis_u=_coordinate_3d(basis_u),
         deviation=float(deviation),
     )
+
+
+def _carrier_frame_snapshot(face: bmesh.types.BMFace) -> CarrierFrameSnapshot:
+    return _carrier_frame_from_coords(tuple(_coordinate_3d(vertex.co) for vertex in face.verts))
 
 
 def prepare_topology(
@@ -753,19 +785,18 @@ def prepare_topology(
     # faces with unpaired vertices.
     bm.verts.ensure_lookup_table()
     bm.verts.index_update()
-    vertex_pairs = build_vertex_pair_table(
-        tuple(vertex.co.copy() for vertex in bm.verts),
-        axis_index,
-        tolerance,
-    )
+    vertex_coords = tuple(vertex.co.copy() for vertex in bm.verts)
+    vertex_lookup = build_vertex_mirror_lookup(vertex_coords, axis_index, tolerance)
+    vertex_pairs = _vertex_pair_table_from_lookup(vertex_lookup, vertex_coords)
 
     hidden_by_face_id: HiddenFaceMap = {}
     key_to_face_ids: dict[FaceKey, list[FaceId]] = defaultdict(list)
     face_records: dict[FaceId, FaceMatchRecord] = {}
-    carrier_frames: CarrierFrameMap = {}
+    carrier_raw: dict[FaceId, tuple[Coordinate3D, ...]] = {}
     face_vertex_ids: dict[FaceId, tuple[int, ...]] = {}
     face_ids_by_vertex_set: dict[frozenset[int], list[FaceId]] = defaultdict(list)
-    # Lazy fallback index (contract R2-3): only materialize on first exact miss.
+    total_faces = 0
+    # Build the fallback index only after an exact lookup miss.
     face_coords: dict[FaceId, tuple[tuple[float, float, float], ...]] = {}
     faces_by_count_centroid: dict[tuple[int, QuantizedCoordinate], list[FaceId]] = defaultdict(list)
     fallback_index_ready = False
@@ -776,20 +807,11 @@ def prepare_topology(
         face[face_hidden_layer] = int(face.hide)
         face[history_token_layer] = history_token
         hidden_by_face_id[face_id] = bool(face.hide)
-        key = _face_key(face, axis_index, tolerance, mirrored=False)
-        mirrored_key = _face_key(face, axis_index, tolerance, mirrored=True)
-        centroid_vector = face.calc_center_median()
-        record = FaceMatchRecord(
-            key=key,
-            mirrored_key=mirrored_key,
-            centroid=_coordinate_3d(centroid_vector),
-        )
-        face_records[face_id] = record
-        carrier_frames[face_id] = _carrier_frame_snapshot(face)
-        key_to_face_ids[record.key].append(face_id)
+        carrier_raw[face_id] = tuple(_coordinate_3d(vertex.co) for vertex in face.verts)
         vertex_ids = tuple(vertex.index for vertex in face.verts)
         face_vertex_ids[face_id] = vertex_ids
         face_ids_by_vertex_set[frozenset(vertex_ids)].append(face_id)
+        total_faces += 1
 
     def _ensure_fallback_face_index() -> None:
         nonlocal fallback_index_ready
@@ -799,10 +821,23 @@ def prepare_topology(
             face_id = FaceId(int(face[face_layer]))
             coords = tuple((float(vertex.co[0]), float(vertex.co[1]), float(vertex.co[2])) for vertex in face.verts)
             face_coords[face_id] = coords
-            # Primary centroid bin only; lookup probes the neighborhood (contract E).
+            # Store only the primary centroid bin.
             centroid_vector = Vector(face_records[face_id].centroid.as_tuple())
             faces_by_count_centroid[(len(coords), _quantized_coordinate(centroid_vector, tolerance))].append(face_id)
         fallback_index_ready = True
+
+    def _build_face_records() -> None:
+        for face in bm.faces:
+            face_id = FaceId(int(face[face_layer]))
+            key = _face_key(face, axis_index, tolerance, mirrored=False)
+            mirrored_key = _face_key(face, axis_index, tolerance, mirrored=True)
+            record = FaceMatchRecord(
+                key=key,
+                mirrored_key=mirrored_key,
+                centroid=_coordinate_3d(face.calc_center_median()),
+            )
+            face_records[face_id] = record
+            key_to_face_ids[record.key].append(face_id)
 
     def _mirror_candidates(face_id: FaceId, record: FaceMatchRecord) -> list[FaceId]:
         exact = key_to_face_ids.get(record.mirrored_key)
@@ -844,9 +879,8 @@ def prepare_topology(
         return found
 
     mirror_face_ids: MirrorFaceMap = {}
-    geometric_fallback: list[tuple[FaceId, FaceMatchRecord]] = []
-    for face_id, record in face_records.items():
-        vertex_ids = face_vertex_ids[face_id]
+    geometric_fallback: list[FaceId] = []
+    for face_id, vertex_ids in face_vertex_ids.items():
         mapped = []
         for vertex_id in vertex_ids:
             partner = vertex_pairs.get(vertex_id)
@@ -863,10 +897,13 @@ def prepare_topology(
             if len(own_faces) == 1 and len(counterparts) == 1:
                 mirror_face_ids[face_id] = counterparts[0]
                 continue
-        geometric_fallback.append((face_id, record))
+        geometric_fallback.append(face_id)
 
     fallback_assignments: dict[FaceId, FaceId] = {}
-    for face_id, record in geometric_fallback:
+    if geometric_fallback:
+        _build_face_records()
+    for face_id in geometric_fallback:
+        record = face_records[face_id]
         candidates = _mirror_candidates(face_id, record)
         if not candidates:
             continue
@@ -915,9 +952,10 @@ def prepare_topology(
     return TopologyPreparation(
         mirror_face_ids=mirror_face_ids,
         hidden_by_face_id=hidden_by_face_id,
-        carrier_frames=carrier_frames,
+        carrier_frames=cast(CarrierFrameMap, LazyCarrierFrameMap(carrier_raw)),
+        vertex_lookup=vertex_lookup,
         matched_faces=len(mirror_face_ids),
-        total_faces=len(face_records),
+        total_faces=total_faces,
     )
 
 
@@ -3254,10 +3292,10 @@ def extend_selection_to_mirror(
     ``select_history`` or the active element. Unresolved counterparts are
     skipped silently. On-plane / self-mirrored elements are no-ops.
 
-    Vertex pairing reuses :func:`build_vertex_pair_table` (floor-bin +
-    neighbourhood probe, involutive). Edges and faces resolve when every
-    constituent vertex has a pair and some element owns exactly that partner
-    vertex set.
+    Vertex pairing reuses :func:`build_vertex_pair_table` (KDTree candidates,
+    double-precision Chebyshev verification, involutive). Edges and faces
+    resolve when every constituent vertex has a pair and some element owns
+    exactly that partner vertex set.
 
     Returns the number of elements that transitioned from unselected to
     selected. Does not call ``select_flush_mode``; callers that need a mode
@@ -3285,9 +3323,7 @@ def extend_selection_to_mirror(
     selected_edges = [edge for edge in bm.edges if edge.select]
     selected_faces = [face for face in bm.faces if face.select]
 
-    edge_by_verts = {
-        frozenset((edge.verts[0].index, edge.verts[1].index)): edge for edge in bm.edges if edge.is_valid
-    }
+    edge_by_verts = {frozenset((edge.verts[0].index, edge.verts[1].index)): edge for edge in bm.edges if edge.is_valid}
     face_by_verts = {frozenset(vertex.index for vertex in face.verts): face for face in bm.faces if face.is_valid}
 
     added = 0
