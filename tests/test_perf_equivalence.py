@@ -780,6 +780,7 @@ def _check_extend_selection_lazy_indices():
             for sequence in (vertex_sequence, edge_sequence, face_sequence):
                 setattr(cast(Any, sequence), "ensure_lookup_table", lambda: None)
                 setattr(cast(Any, sequence), "index_update", lambda: None)
+            # Compat path (mesh_object=None): domain maps stay lazy.
             cast(Any, core.extend_selection_to_mirror)(bm, 0, TOLERANCE)
             assert edge_sequence.iterations == (2 if selection_mode == "edge" else 1)
             assert face_sequence.iterations == (2 if selection_mode == "face" else 1)
@@ -826,9 +827,9 @@ def _check_extend_selection_wrapper_matrix():
             calls = []
             updates = []
 
-            def spy_extend(mesh, axis_index, tolerance):
-                calls.append((mesh, axis_index, tolerance))
-                return original_extend(mesh, axis_index, tolerance)
+            def spy_extend(mesh, axis_index, tolerance, *, mesh_object=None):
+                calls.append((mesh, axis_index, tolerance, mesh_object))
+                return original_extend(mesh, axis_index, tolerance, mesh_object=mesh_object)
 
             setattr(core, "extend_selection_to_mirror", spy_extend)
             settings = SimpleNamespace(select_mirrored=True)
@@ -845,10 +846,11 @@ def _check_extend_selection_wrapper_matrix():
                 if wrapper_name == "operator":
                     wrapper_module._maybe_extend_selection_to_mirror(obj, 0, TOLERANCE)
                 else:
-                    wrapper_module._maybe_extend_selection_to_mirror(obj.data, 0, TOLERANCE)
+                    wrapper_module._maybe_extend_selection_to_mirror(obj.data, 0, TOLERANCE, mesh_object=obj)
                 assert len(calls) == 1, (wrapper_name, selection_mode)
                 assert calls[0][0] is bm
-                assert calls[0][1:] == (0, TOLERANCE)
+                assert calls[0][1:3] == (0, TOLERANCE)
+                assert calls[0][3] is obj, (wrapper_name, selection_mode)
                 assert len(updates) == 1, (wrapper_name, selection_mode)
                 assert tuple(cast(Any, bm.select_history)) == history_before, (wrapper_name, selection_mode)
                 if selection_mode == "empty":
@@ -1497,13 +1499,21 @@ def _check_rip_lookup_validation():
 
 
 class _BulkCollection:
-    def __init__(self, values):
+    def __init__(self, values, *, by_name=None):
         self._values = values
+        self._by_name = by_name or {}
 
     def __len__(self):
         return len(self._values)
 
     def foreach_get(self, name, target):
+        if name in self._by_name:
+            data = self._by_name[name]
+            if name == "co":
+                target[:] = numpy.asarray(data, dtype=numpy.float32).reshape(-1)
+            else:
+                target[:] = numpy.asarray(data, dtype=target.dtype).reshape(-1)
+            return
         if name == "co":
             target[:] = numpy.asarray(self._values, dtype=numpy.float32).reshape(-1)
             return
@@ -1512,8 +1522,39 @@ class _BulkCollection:
 
 class _BulkVertexCollection(_BulkCollection):
     def foreach_get(self, name, target):
-        if name == "hide":
+        if name == "hide" and "hide" not in self._by_name:
             target[:] = False
+            return
+        super().foreach_get(name, target)
+
+
+class _BulkLoopCollection(_BulkCollection):
+    """Loop domain: foreach_get vertex_index + single-element .vertex_index."""
+
+    def __getitem__(self, index):
+        return SimpleNamespace(vertex_index=int(self._values[index]))
+
+
+class _BulkPolygonCollection(_BulkCollection):
+    """Polygon domain with loop_start/loop_total for §L-3 single-element guards."""
+
+    def __init__(self, hides, starts, totals, *, by_name=None):
+        super().__init__(hides, by_name=by_name)
+        self._starts = starts
+        self._totals = totals
+
+    def __getitem__(self, index):
+        return SimpleNamespace(
+            loop_start=int(self._starts[index]),
+            loop_total=int(self._totals[index]),
+        )
+
+    def foreach_get(self, name, target):
+        if name == "loop_start":
+            target[:] = numpy.asarray(self._starts, dtype=target.dtype)
+            return
+        if name == "loop_total":
+            target[:] = numpy.asarray(self._totals, dtype=target.dtype)
             return
         super().foreach_get(name, target)
 
@@ -1521,6 +1562,7 @@ class _BulkVertexCollection(_BulkCollection):
 class _BulkMeshData:
     def __init__(self, bm):
         bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
         bm.faces.ensure_lookup_table()
         starts = []
         totals = []
@@ -1532,13 +1574,33 @@ class _BulkMeshData:
             starts.append(offset)
             totals.append(len(values))
             offset += len(values)
+        cos = [tuple(float(value) for value in vertex.co) for vertex in bm.verts]
+        vert_select = [bool(vertex.select) for vertex in bm.verts]
+        edge_select = [bool(edge.select) for edge in bm.edges]
+        edge_hide = [bool(edge.hide) for edge in bm.edges]
+        face_select = [bool(face.select) for face in bm.faces]
+        face_hide = [bool(face.hide) for face in bm.faces]
         self.shape_keys = None
-        self.vertices = _BulkVertexCollection([tuple(float(value) for value in vertex.co) for vertex in bm.verts])
-        self.edges = _BulkCollection([bool(edge.hide) for edge in bm.edges])
-        self.polygons = _BulkCollection([bool(face.hide) for face in bm.faces])
-        self.loops = _BulkCollection(loops)
-        self._starts = _BulkCollection(starts)
-        self._totals = _BulkCollection(totals)
+        # vertices: co lives in _values (guard tests mutate length); hide stays
+        # the default all-False path; select is optional by_name.
+        self.vertices = _BulkVertexCollection(cos, by_name={"select": vert_select})
+        # edges/polygons: hide stays on _values for existing topology tests;
+        # select is optional by_name for §S bulk selection capture.
+        self.edges = _BulkCollection(edge_hide, by_name={"select": edge_select})
+        # Mutable lists so guard tests can corrupt loop order / totals in place.
+        self._starts = starts
+        self._totals = totals
+        self.polygons = _BulkPolygonCollection(
+            face_hide, self._starts, self._totals, by_name={"select": face_select}
+        )
+        self.loops = _BulkLoopCollection(loops)
+
+    def sync_selection_from(self, bm):
+        """Refresh select flags after free-BMesh mutations (test-only)."""
+
+        self.vertices._by_name["select"] = [bool(vertex.select) for vertex in bm.verts]
+        self.edges._by_name["select"] = [bool(edge.select) for edge in bm.edges]
+        self.polygons._by_name["select"] = [bool(face.select) for face in bm.faces]
 
     def polygon_starts(self, name):
         return self._starts if name == "loop_start" else self._totals
@@ -1553,18 +1615,162 @@ class _BulkMeshObject:
         self.update_calls += 1
 
 
+def _install_bulk_polygon_loop_hooks(bulk_data):
+    """No-op compatibility shim: polygons now expose loop_start/loop_total natively.
+
+    Returns a restore callable so existing try/finally sites keep working.
+    """
+
+    return _BulkCollection.foreach_get
+
+
+def _clone_bmesh(source):
+    clone = bmesh.new()
+    for vertex in source.verts:
+        clone.verts.new(tuple(vertex.co))
+    clone.verts.ensure_lookup_table()
+    clone.verts.index_update()
+    for edge in source.edges:
+        clone.edges.new((clone.verts[edge.verts[0].index], clone.verts[edge.verts[1].index]))
+    clone.edges.ensure_lookup_table()
+    for face in source.faces:
+        clone.faces.new([clone.verts[vertex.index] for vertex in face.verts])
+    clone.faces.ensure_lookup_table()
+    for source_vertex, clone_vertex in zip(source.verts, clone.verts, strict=True):
+        clone_vertex.select = bool(source_vertex.select)
+        clone_vertex.hide = bool(source_vertex.hide)
+    for source_edge, clone_edge in zip(source.edges, clone.edges, strict=True):
+        clone_edge.select = bool(source_edge.select)
+        clone_edge.hide = bool(source_edge.hide)
+    for source_face, clone_face in zip(source.faces, clone.faces, strict=True):
+        clone_face.select = bool(source_face.select)
+        clone_face.hide = bool(source_face.hide)
+    return clone
+
+
+def _selection_state(bm):
+    return (
+        tuple(bool(vertex.select) for vertex in bm.verts),
+        tuple(bool(edge.select) for edge in bm.edges),
+        tuple(bool(face.select) for face in bm.faces),
+    )
+
+
+def _check_selection_snapshot_bulk_equivalence():
+    """capture_selection_snapshot bulk and BMesh paths agree bit-for-bit."""
+
+    from ydd_symmetric_edit import delete_dissolve
+
+    bm = bmesh.new()
+    try:
+        left = [bm.verts.new(co) for co in ((-1.0, 0.0, 0.0), (-1.0, 1.0, 0.0), (-1.0, 0.0, 1.0))]
+        right = [bm.verts.new(co) for co in ((1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (1.0, 0.0, 1.0))]
+        left_face = bm.faces.new(left)
+        right_face = bm.faces.new(right)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        bm.verts.index_update()
+        bm.edges.index_update()
+        bm.faces.index_update()
+        left_edge = next(edge for edge in bm.edges if set(edge.verts) == {left[0], left[1]})
+        left[0].select = True
+        left_edge.select = True
+        left_face.select = True
+        bm.select_history.clear()
+        bm.select_history.add(left[0])
+        bm.select_history.add(left_edge)
+
+        bulk = _clone_bmesh(bm)
+        bulk.select_history.clear()
+        bulk.select_history.add(bulk.verts[left[0].index])
+        bulk.select_history.add(bulk.edges[left_edge.index])
+        bulk_data = _BulkMeshData(bulk)
+        mesh_object = _BulkMeshObject(bulk_data)
+        original_foreach = _install_bulk_polygon_loop_hooks(bulk_data)
+        try:
+            compat = core.capture_selection_snapshot(
+                bm, domains=("VERT", "EDGE", "FACE"), include_history=True
+            )
+            captured = core.capture_selection_snapshot(
+                bulk,
+                mesh_object=mesh_object,
+                domains=("VERT", "EDGE", "FACE"),
+                include_history=True,
+            )
+            assert mesh_object.update_calls == 1
+            assert captured.coords.dtype == numpy.float64
+            assert captured.coords.shape == (len(bm.verts), 3)
+            # Bulk promotes Mesh float32; compare at capture precision.
+            assert numpy.array_equal(
+                compat.coords.astype(numpy.float32),
+                captured.coords.astype(numpy.float32),
+            )
+            assert tuple(int(value) for value in compat.selected_verts) == tuple(
+                int(value) for value in captured.selected_verts
+            )
+            assert tuple(int(value) for value in compat.selected_edges) == tuple(
+                int(value) for value in captured.selected_edges
+            )
+            assert tuple(int(value) for value in compat.selected_faces) == tuple(
+                int(value) for value in captured.selected_faces
+            )
+            assert compat.history_indices == captured.history_indices
+            assert len(compat.history_coords) == len(captured.history_coords) == 1
+            assert tuple(float(value) for value in compat.history_coords[0]) == tuple(
+                float(value) for value in captured.history_coords[0]
+            )
+
+            # extend_selection_to_mirror: bulk vs compat selection outcomes match.
+            for source in (bm, bulk):
+                for element in (*source.verts, *source.edges, *source.faces):
+                    element.select = False
+                source.verts[left[0].index].select = True
+                source.edges[left_edge.index].select = True
+                source.faces[left_face.index].select = True
+            bulk_data.sync_selection_from(bulk)
+            added_compat = core.extend_selection_to_mirror(bm, 0, TOLERANCE, mesh_object=None)
+            added_bulk = core.extend_selection_to_mirror(bulk, 0, TOLERANCE, mesh_object=mesh_object)
+            assert added_compat == added_bulk
+            assert _selection_state(bm) == _selection_state(bulk)
+            assert right[0].select and right_face.select
+
+            # build_element_pair_maps: vert/edge/face pair tables match.
+            maps_compat = delete_dissolve.build_element_pair_maps(bm, 0, TOLERANCE, mesh_object=None)
+            maps_bulk = delete_dissolve.build_element_pair_maps(
+                bulk, 0, TOLERANCE, mesh_object=mesh_object
+            )
+            assert maps_compat.vert_pairs == maps_bulk.vert_pairs
+            assert maps_compat.edge_pair_by_index == maps_bulk.edge_pair_by_index
+            assert maps_compat.face_pair_by_index == maps_bulk.face_pair_by_index
+
+            # classify via _vertex_snapshot bulk/compat agreement.
+            bulk_data.sync_selection_from(bulk)
+            coords_c, selected_c, history_c, history_i_c = replay_module._vertex_snapshot(bm)
+            coords_b, selected_b, history_b, history_i_b = replay_module._vertex_snapshot(
+                bulk, mesh_object=mesh_object
+            )
+            assert selected_c == selected_b
+            assert history_i_c == history_i_b
+            snap_c = replay_module.classify_mirror_selection(
+                coords_c, selected_c, axis_index=0, tolerance=TOLERANCE
+            )
+            snap_b = replay_module.classify_mirror_selection(
+                coords_b, selected_b, axis_index=0, tolerance=TOLERANCE
+            )
+            assert snap_c.selected == snap_b.selected
+            assert snap_c.pairs == snap_b.pairs
+            assert snap_c.mirror_by_source == snap_b.mirror_by_source
+            assert snap_c.overlap == snap_b.overlap
+        finally:
+            _BulkCollection.foreach_get = original_foreach
+            bulk.free()
+    finally:
+        bm.free()
+
+
 def _check_capture_resolve_contract():
     """Bulk and compatibility snapshots agree before/after lazy resolution."""
-
-    original_foreach = _BulkCollection.foreach_get
-
-    def foreach_get(self, name, target):
-        if self is bulk_data.polygons:
-            if name == "loop_start":
-                return bulk_data._starts.foreach_get(name, target)
-            if name == "loop_total":
-                return bulk_data._totals.foreach_get(name, target)
-        return original_foreach(self, name, target)
 
     fixtures = []
     for builder in (_build_deformed_grid, _build_duplicate_faces, _build_loose_ngon_fixture):
@@ -1574,16 +1780,10 @@ def _check_capture_resolve_contract():
         compat = source
         compat.verts.ensure_lookup_table()
         compat.verts.index_update()
-        bulk = bmesh.new()
-        for vertex in compat.verts:
-            bulk.verts.new(tuple(vertex.co))
-        bulk.verts.ensure_lookup_table()
-        bulk.verts.index_update()
-        for face in compat.faces:
-            bulk.faces.new([bulk.verts[vertex.index] for vertex in face.verts])
+        bulk = _clone_bmesh(compat)
         bulk_data = _BulkMeshData(bulk)
         mesh_object = _BulkMeshObject(bulk_data)
-        _BulkCollection.foreach_get = foreach_get
+        original_foreach = _install_bulk_polygon_loop_hooks(bulk_data)
         try:
             compatibility = core.prepare_topology(compat, 0, TOLERANCE)
             captured = core.prepare_topology(bulk, 0, TOLERANCE, mesh_object=mesh_object)
@@ -1761,21 +1961,10 @@ def _check_hide_layer_omission_and_consumers():
 
 
 def _check_bulk_guard_fallbacks():
-    original_foreach = _BulkCollection.foreach_get
     for kind in ("counts", "coordinates", "faces"):
         bm = _build_deformed_grid(2)
         try:
             data = _BulkMeshData(bm)
-
-            def foreach_get(self, name, target):
-                if self is data.polygons:
-                    if name == "loop_start":
-                        return data._starts.foreach_get(name, target)
-                    if name == "loop_total":
-                        return data._totals.foreach_get(name, target)
-                return original_foreach(self, name, target)
-
-            _BulkCollection.foreach_get = foreach_get
             expected = core.prepare_topology(bm, 0, TOLERANCE)
             expected_map = expected.mirror_face_ids
             if kind == "counts":
@@ -1785,7 +1974,14 @@ def _check_bulk_guard_fallbacks():
                 first[0] += 0.5
                 data.vertices._values[0] = tuple(first)
             else:
-                data._starts._values[0] = 1
+                # Corrupt first-face loop vertex_index order (starts alone are
+                # recomputed from loop_total and never trigger fallback).
+                assert data._totals and data._totals[0] >= 2
+                start = int(data._starts[0])
+                data.loops._values[start], data.loops._values[start + 1] = (
+                    data.loops._values[start + 1],
+                    data.loops._values[start],
+                )
             obj = _BulkMeshObject(data)
             topology = core.prepare_topology(bm, 0, TOLERANCE, mesh_object=obj)
             assert obj.update_calls == 1
@@ -1799,7 +1995,75 @@ def _check_bulk_guard_fallbacks():
             assert numpy.array_equal(actual_resolution.loop_starts, expected_resolution.loop_starts)
             assert numpy.array_equal(actual_resolution.loop_totals, expected_resolution.loop_totals)
         finally:
-            _BulkCollection.foreach_get = original_foreach
+            bm.free()
+
+
+def _assert_selection_capture_equals(actual, expected):
+    assert numpy.array_equal(actual.coords, expected.coords)
+    assert numpy.array_equal(actual.selected_verts, expected.selected_verts)
+    assert numpy.array_equal(actual.selected_edges, expected.selected_edges)
+    assert numpy.array_equal(actual.selected_faces, expected.selected_faces)
+    assert actual.history_indices == expected.history_indices
+    assert len(actual.history_coords) == len(expected.history_coords)
+    for left, right in zip(actual.history_coords, expected.history_coords, strict=True):
+        assert tuple(float(value) for value in left) == tuple(float(value) for value in right)
+
+
+def _check_selection_bulk_guard_fallbacks():
+    """_capture_mesh_selection falls back to BMesh for each §L-3 integrity failure."""
+
+    domains = ("VERT", "EDGE", "FACE")
+    for kind in ("shape_keys", "counts", "coordinates", "faces"):
+        bm = _build_deformed_grid(2)
+        try:
+            bm.verts.ensure_lookup_table()
+            bm.edges.ensure_lookup_table()
+            bm.faces.ensure_lookup_table()
+            bm.verts.index_update()
+            bm.edges.index_update()
+            bm.faces.index_update()
+            for index, vertex in enumerate(bm.verts):
+                vertex.select = index % 3 == 0
+            for index, edge in enumerate(bm.edges):
+                edge.select = index % 4 == 0
+            for index, face in enumerate(bm.faces):
+                face.select = index % 2 == 0
+            if bm.verts:
+                bm.select_history.clear()
+                bm.select_history.add(bm.verts[0])
+
+            expected = core.capture_selection_snapshot(
+                bm, domains=domains, include_history=True
+            )
+            data = _BulkMeshData(bm)
+            if kind == "shape_keys":
+                data.shape_keys = object()
+            elif kind == "counts":
+                data.vertices._values.append((9.0, 9.0, 9.0))
+            elif kind == "coordinates":
+                first = list(data.vertices._values[0])
+                first[0] += 0.5
+                data.vertices._values[0] = tuple(first)
+            else:
+                assert data._totals and data._totals[0] >= 2
+                start = int(data._starts[0])
+                data.loops._values[start], data.loops._values[start + 1] = (
+                    data.loops._values[start + 1],
+                    data.loops._values[start],
+                )
+            obj = _BulkMeshObject(data)
+            captured = core.capture_selection_snapshot(
+                bm,
+                mesh_object=obj,
+                domains=domains,
+                include_history=True,
+            )
+            if kind == "shape_keys":
+                assert obj.update_calls == 0
+            else:
+                assert obj.update_calls == 1
+            _assert_selection_capture_equals(captured, expected)
+        finally:
             bm.free()
 
 
@@ -2619,6 +2883,7 @@ def run():
     _check_extend_selection_matrix()
     _check_extend_selection_lazy_indices()
     _check_extend_selection_wrapper_matrix()
+    _check_selection_snapshot_bulk_equivalence()
     _check_topology_equivalence()
     _check_carrier_frame_lifecycle()
     _check_history_and_single_object_guard()
@@ -2629,6 +2894,7 @@ def run():
     _check_finish_zero_match_decline()
     _check_hide_layer_omission_and_consumers()
     _check_bulk_guard_fallbacks()
+    _check_selection_bulk_guard_fallbacks()
     _check_nonfinite_one_sided_fallback()
     _check_one_sided_candidate_arrays_contract()
     _check_phase4_u2_dependency_direction()

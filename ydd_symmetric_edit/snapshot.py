@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator, Sequence
+from dataclasses import dataclass
 from typing import cast
 
 import bmesh
@@ -533,6 +534,39 @@ class LazyTopologyResolution:
             face[mirror_layer] = int(values.get(face_id, FaceId(0)))
 
 
+def _face_loop_vertex_indices_match(mesh_vertex_indices: Sequence[int], bm_face) -> bool:
+    """True when Mesh loop ``vertex_index`` order equals BMesh ``face.verts`` index order (§L-3)."""
+
+    return [int(index) for index in mesh_vertex_indices] == [int(vertex.index) for vertex in bm_face.verts]
+
+
+def _first_last_face_loop_order_matches(
+    first_mesh_indices: Sequence[int],
+    last_mesh_indices: Sequence[int],
+    bm: bmesh.types.BMesh,
+) -> bool:
+    """§L-3 first/last face order guard via index columns (not coordinates)."""
+
+    return _face_loop_vertex_indices_match(first_mesh_indices, bm.faces[0]) and _face_loop_vertex_indices_match(
+        last_mesh_indices, bm.faces[-1]
+    )
+
+
+def _read_polygon_loop_vertex_indices(polygons, loops, face_index: int) -> list[int] | None:
+    """Read one polygon's loop ``vertex_index`` column via single-element access.
+
+    Used by selection bulk capture so guards do not ``foreach_get`` every loop.
+    """
+
+    try:
+        polygon = polygons[face_index]
+        start = int(polygon.loop_start)
+        total = int(polygon.loop_total)
+        return [int(loops[offset].vertex_index) for offset in range(start, start + total)]
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return None
+
+
 def _capture_bmesh_snapshot(bm: bmesh.types.BMesh):
     bm.verts.ensure_lookup_table()
     bm.edges.ensure_lookup_table()
@@ -603,23 +637,9 @@ def _capture_mesh_snapshot(mesh_object, bm: bmesh.types.BMesh):
         return None
     if count_faces:
         first_start, last_start = int(loop_starts[0]), int(loop_starts[-1])
-        first = [
-            tuple(coords32[3 * int(value) : 3 * int(value) + 3])
-            for value in loop_verts[first_start : first_start + int(loop_totals[0])]
-        ]
-        last = [
-            tuple(coords32[3 * int(value) : 3 * int(value) + 3])
-            for value in loop_verts[last_start : last_start + int(loop_totals[-1])]
-        ]
-        first_bm = [
-            tuple(numpy.asarray(tuple(float(component) for component in vertex.co), dtype=numpy.float32))
-            for vertex in bm.faces[0].verts
-        ]
-        last_bm = [
-            tuple(numpy.asarray(tuple(float(component) for component in vertex.co), dtype=numpy.float32))
-            for vertex in bm.faces[-1].verts
-        ]
-        if first != first_bm or last != last_bm:
+        first_mesh = [int(value) for value in loop_verts[first_start : first_start + int(loop_totals[0])]]
+        last_mesh = [int(value) for value in loop_verts[last_start : last_start + int(loop_totals[-1])]]
+        if not _first_last_face_loop_order_matches(first_mesh, last_mesh, bm):
             return None
     return (
         coords32.reshape(count_vertices, 3).astype(numpy.float64),
@@ -733,4 +753,200 @@ def get_required_layers(bm: bmesh.types.BMesh):
     return (
         bm.edges.layers.int.get(EDGE_ORIGINAL_LAYER),
         bm.faces.layers.int.get(FACE_ID_LAYER),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class SelectionCapture:
+    """Bulk or BMesh-compatible capture of coordinates and selection indices.
+
+    ``coords`` is always float64 shaped ``(N, 3)``. Selected-index arrays are
+    empty when their domain was not requested. History is populated only when
+    ``include_history=True`` was passed to :func:`capture_selection_snapshot`.
+    """
+
+    coords: numpy.ndarray
+    selected_verts: numpy.ndarray
+    selected_edges: numpy.ndarray
+    selected_faces: numpy.ndarray
+    history_coords: tuple[Vector, ...] = ()
+    history_indices: tuple[int, ...] = ()
+
+
+def _empty_selected() -> numpy.ndarray:
+    return numpy.empty(0, dtype=numpy.int64)
+
+
+def _selected_indices_from_flags(flags: numpy.ndarray) -> numpy.ndarray:
+    if flags.size == 0:
+        return _empty_selected()
+    return numpy.flatnonzero(flags).astype(numpy.int64, copy=False)
+
+
+def _capture_bmesh_selection(
+    bm: bmesh.types.BMesh,
+    domain_set: frozenset[str],
+) -> SelectionCapture:
+    """Compatibility path: read coordinates and selection flags from BMesh."""
+
+    coords = numpy.asarray(
+        [(float(vertex.co[0]), float(vertex.co[1]), float(vertex.co[2])) for vertex in bm.verts],
+        dtype=numpy.float64,
+    ).reshape((-1, 3))
+    selected_verts = (
+        _selected_indices_from_flags(numpy.asarray([bool(vertex.select) for vertex in bm.verts], dtype=bool))
+        if "VERT" in domain_set
+        else _empty_selected()
+    )
+    selected_edges = (
+        _selected_indices_from_flags(numpy.asarray([bool(edge.select) for edge in bm.edges], dtype=bool))
+        if "EDGE" in domain_set
+        else _empty_selected()
+    )
+    selected_faces = (
+        _selected_indices_from_flags(numpy.asarray([bool(face.select) for face in bm.faces], dtype=bool))
+        if "FACE" in domain_set
+        else _empty_selected()
+    )
+    return SelectionCapture(
+        coords=coords,
+        selected_verts=selected_verts,
+        selected_edges=selected_edges,
+        selected_faces=selected_faces,
+    )
+
+
+def _capture_mesh_selection(
+    mesh_object,
+    bm: bmesh.types.BMesh,
+    domain_set: frozenset[str],
+) -> SelectionCapture | None:
+    """Mesh bulk path with the same integrity guards as ``_capture_mesh_snapshot``.
+
+    Returns ``None`` when bulk is unsafe (shape keys, missing hooks, order
+    mismatch) so callers fall back to the BMesh path.
+    """
+
+    data = getattr(mesh_object, "data", None)
+    if data is None:
+        return None
+    if getattr(data, "shape_keys", None) is not None:
+        return None
+    update = getattr(mesh_object, "update_from_editmode", None)
+    if not callable(update):
+        return None
+    vertices = getattr(data, "vertices", None)
+    edges = getattr(data, "edges", None)
+    polygons = getattr(data, "polygons", None)
+    loops = getattr(data, "loops", None)
+    if vertices is None or edges is None or polygons is None or loops is None:
+        return None
+    if not all(callable(getattr(domain, "foreach_get", None)) for domain in (vertices, edges, polygons, loops)):
+        return None
+
+    bm.verts.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    update()
+    count_vertices, count_edges, count_faces = len(vertices), len(edges), len(polygons)
+    if len(bm.verts) != count_vertices or len(bm.edges) != count_edges or len(bm.faces) != count_faces:
+        return None
+
+    coords32 = numpy.empty(count_vertices * 3, dtype=numpy.float32)
+    vertices.foreach_get("co", coords32)
+    if count_vertices and (
+        numpy.asarray(tuple(float(value) for value in bm.verts[0].co), dtype=numpy.float32).tobytes()
+        != coords32[:3].tobytes()
+        or numpy.asarray(
+            tuple(float(value) for value in bm.verts[count_vertices - 1].co), dtype=numpy.float32
+        ).tobytes()
+        != coords32[-3:].tobytes()
+    ):
+        return None
+
+    # §L-3 first/last face order: index columns only (no full-loop foreach_get).
+    if count_faces:
+        first_mesh = _read_polygon_loop_vertex_indices(polygons, loops, 0)
+        last_mesh = _read_polygon_loop_vertex_indices(polygons, loops, -1)
+        if first_mesh is None or last_mesh is None:
+            return None
+        if not _first_last_face_loop_order_matches(first_mesh, last_mesh, bm):
+            return None
+
+    coords = coords32.reshape(count_vertices, 3).astype(numpy.float64)
+
+    selected_verts = _empty_selected()
+    selected_edges = _empty_selected()
+    selected_faces = _empty_selected()
+    if "VERT" in domain_set:
+        flags = numpy.empty(count_vertices, dtype=bool)
+        vertices.foreach_get("select", flags)
+        selected_verts = _selected_indices_from_flags(flags)
+    if "EDGE" in domain_set:
+        flags = numpy.empty(count_edges, dtype=bool)
+        edges.foreach_get("select", flags)
+        selected_edges = _selected_indices_from_flags(flags)
+    if "FACE" in domain_set:
+        flags = numpy.empty(count_faces, dtype=bool)
+        polygons.foreach_get("select", flags)
+        selected_faces = _selected_indices_from_flags(flags)
+
+    return SelectionCapture(
+        coords=coords,
+        selected_verts=selected_verts,
+        selected_edges=selected_edges,
+        selected_faces=selected_faces,
+    )
+
+
+def capture_selection_snapshot(
+    bm: bmesh.types.BMesh,
+    *,
+    mesh_object=None,
+    domains: Sequence[str] = ("VERT", "EDGE", "FACE"),
+    include_history: bool = False,
+) -> SelectionCapture:
+    """Capture vertex coordinates and selected indices for bulk consumers.
+
+    When *mesh_object* is provided, coordinates and selection flags are read via
+    Mesh ``foreach_get`` after the same integrity guards as topology bulk
+    capture (shape keys, element counts, first/last co bytes, loop order).
+    Guard failure or a free BMesh (``mesh_object is None``) falls back to the
+    BMesh path. Select history is always read from BMesh after index refresh,
+    and only when *include_history* is true (BMVert filter matches
+    ``replay._vertex_snapshot``).
+    """
+
+    domain_set = frozenset(domains)
+    bm.verts.ensure_lookup_table()
+    bm.verts.index_update()
+    if "EDGE" in domain_set:
+        bm.edges.ensure_lookup_table()
+        bm.edges.index_update()
+    if "FACE" in domain_set:
+        bm.faces.ensure_lookup_table()
+        bm.faces.index_update()
+
+    captured: SelectionCapture | None = None
+    if mesh_object is not None:
+        captured = _capture_mesh_selection(mesh_object, bm, domain_set)
+    if captured is None:
+        captured = _capture_bmesh_selection(bm, domain_set)
+
+    if not include_history:
+        return captured
+
+    history = cast(
+        Iterable[bmesh.types.BMVert | bmesh.types.BMEdge | bmesh.types.BMFace],
+        bm.select_history,
+    )
+    history_vertices = [element for element in history if isinstance(element, bmesh.types.BMVert)]
+    history_coords = tuple(element.co.copy() for element in history_vertices)
+    history_indices = tuple(element.index for element in history_vertices)
+    return SelectionCapture(
+        coords=captured.coords,
+        selected_verts=captured.selected_verts,
+        selected_edges=captured.selected_edges,
+        selected_faces=captured.selected_faces,
+        history_coords=history_coords,
+        history_indices=history_indices,
     )

@@ -16,6 +16,7 @@ from bpy.props import BoolProperty, EnumProperty, FloatProperty
 
 from . import backup, core
 from .replay import _symmetry_parameters
+from .snapshot import capture_selection_snapshot
 
 _DeleteType = Literal["VERT", "EDGE", "FACE", "EDGE_FACE", "ONLY_FACE"]
 _DissolveMode = Literal["VERTS", "EDGES", "FACES"]
@@ -62,8 +63,14 @@ def build_element_pair_maps(
     bm: bmesh.types.BMesh,
     axis_index: int,
     tolerance: float,
+    *,
+    mesh_object=None,
 ) -> ElementPairMaps:
-    """Resolve vertex / edge / face counterparts for selection expansion."""
+    """Resolve vertex / edge / face counterparts for selection expansion.
+
+    Vertex coordinates are bulk-captured when *mesh_object* is provided
+    (:func:`capture_selection_snapshot`). Edge/face pair logic is unchanged.
+    """
 
     bm.verts.ensure_lookup_table()
     bm.edges.ensure_lookup_table()
@@ -72,8 +79,13 @@ def build_element_pair_maps(
     bm.edges.index_update()
     bm.faces.index_update()
 
-    coords = [vertex.co for vertex in bm.verts]
-    vert_pairs = core.build_vertex_pair_table(coords, axis_index, tolerance)
+    capture = capture_selection_snapshot(
+        bm,
+        mesh_object=mesh_object,
+        domains=(),
+        include_history=False,
+    )
+    vert_pairs = core.build_vertex_pair_table(capture.coords, axis_index, tolerance)
 
     endpoint_to_edges: dict[frozenset[int], list[int]] = defaultdict(list)
     for edge in bm.edges:
@@ -661,7 +673,7 @@ class MESH_OT_ydd_symmetric_edit_delete(bpy.types.Operator):
         obj, axis_index, tolerance = symmetry
         mesh = cast(bpy.types.Mesh, obj.data)
         bm = bmesh.from_edit_mesh(mesh)
-        pair_maps = build_element_pair_maps(bm, axis_index, tolerance)
+        pair_maps = build_element_pair_maps(bm, axis_index, tolerance, mesh_object=obj)
         plan = plan_leading_domain_expansion(
             bm,
             pair_maps,
@@ -838,7 +850,7 @@ class MESH_OT_ydd_symmetric_edit_dissolve(bpy.types.Operator):
         obj, axis_index, tolerance = symmetry
         mesh = cast(bpy.types.Mesh, obj.data)
         bm = bmesh.from_edit_mesh(mesh)
-        pair_maps = build_element_pair_maps(bm, axis_index, tolerance)
+        pair_maps = build_element_pair_maps(bm, axis_index, tolerance, mesh_object=obj)
         plan = plan_leading_domain_expansion(
             bm,
             pair_maps,
@@ -884,7 +896,7 @@ class MESH_OT_ydd_symmetric_edit_dissolve(bpy.types.Operator):
 
                 if plan.unmatched_count == 0:
                     bm = bmesh.from_edit_mesh(mesh)
-                    pair_maps_after = build_element_pair_maps(bm, axis_index, tolerance)
+                    pair_maps_after = build_element_pair_maps(bm, axis_index, tolerance, mesh_object=obj)
                     census_after = _symmetry_census(pair_maps_after, bm, tolerance)
                     if census_before != census_after:
                         try:
@@ -970,7 +982,7 @@ class MESH_OT_ydd_symmetric_edit_edge_collapse(bpy.types.Operator):
         obj, axis_index, tolerance = symmetry
         mesh = cast(bpy.types.Mesh, obj.data)
         bm = bmesh.from_edit_mesh(mesh)
-        pair_maps = build_element_pair_maps(bm, axis_index, tolerance)
+        pair_maps = build_element_pair_maps(bm, axis_index, tolerance, mesh_object=obj)
         plan = plan_leading_domain_expansion(bm, pair_maps, domains=("EDGE",))
 
         if plan.hidden_counterpart_count > 0:
@@ -1021,7 +1033,7 @@ class MESH_OT_ydd_symmetric_edit_edge_collapse(bpy.types.Operator):
 
                 if plan.unmatched_count == 0:
                     bm = bmesh.from_edit_mesh(mesh)
-                    pair_maps_after = build_element_pair_maps(bm, axis_index, tolerance)
+                    pair_maps_after = build_element_pair_maps(bm, axis_index, tolerance, mesh_object=obj)
                     census_after = _symmetry_census(pair_maps_after, bm, tolerance)
                     if census_before != census_after:
                         return _rollback_with_report(
@@ -1099,7 +1111,7 @@ class MESH_OT_ydd_symmetric_edit_delete_edgeloop(bpy.types.Operator):
         obj, axis_index, tolerance = symmetry
         mesh = cast(bpy.types.Mesh, obj.data)
         bm = bmesh.from_edit_mesh(mesh)
-        pair_maps = build_element_pair_maps(bm, axis_index, tolerance)
+        pair_maps = build_element_pair_maps(bm, axis_index, tolerance, mesh_object=obj)
         plan = plan_leading_domain_expansion(bm, pair_maps, domains=("EDGE",))
 
         if plan.hidden_counterpart_count > 0:
@@ -1138,7 +1150,7 @@ class MESH_OT_ydd_symmetric_edit_delete_edgeloop(bpy.types.Operator):
 
                 if plan.unmatched_count == 0:
                     bm = bmesh.from_edit_mesh(mesh)
-                    pair_maps_after = build_element_pair_maps(bm, axis_index, tolerance)
+                    pair_maps_after = build_element_pair_maps(bm, axis_index, tolerance, mesh_object=obj)
                     census_after = _symmetry_census(pair_maps_after, bm, tolerance)
                     if census_before != census_after:
                         return _rollback_with_report(

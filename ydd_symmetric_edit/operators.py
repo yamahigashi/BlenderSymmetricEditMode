@@ -294,7 +294,7 @@ def _maybe_extend_selection_to_mirror(obj, axis_index: int, tolerance: float) ->
         if obj is None or obj.mode != "EDIT":
             return
         bm = bmesh.from_edit_mesh(obj.data)
-        core.extend_selection_to_mirror(bm, axis_index, tolerance)
+        core.extend_selection_to_mirror(bm, axis_index, tolerance, mesh_object=obj)
         bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
     except Exception:
         traceback.print_exc()
@@ -970,6 +970,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                                     bm,
                                     session.axis_index,
                                     session.tolerance,
+                                    mesh_object=obj,
                                 )
                         except Exception:
                             traceback.print_exc()

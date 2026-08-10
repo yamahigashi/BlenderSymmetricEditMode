@@ -6,19 +6,24 @@ from __future__ import annotations
 
 import traceback
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 import bmesh
 import bpy
+import numpy  # type: ignore
 from bpy.props import EnumProperty, FloatProperty
 from mathutils import Vector
 
 from . import backup, core
 from ._types import MirrorOverlap
+from .snapshot import capture_selection_snapshot
 
 _MERGE_MODES = frozenset({"CENTER", "COLLAPSE", "FIRST", "LAST"})
+
+# float64 shaped (N, 3) coordinate matrix from capture_selection_snapshot / _vertex_snapshot.
+VertexCoordArray = numpy.ndarray
 
 
 @dataclass(frozen=True)
@@ -45,7 +50,7 @@ class MirrorSelection:
 
 
 def classify_mirror_selection(
-    coords: Sequence[Vector],
+    coords: VertexCoordArray,
     selected_indices: Sequence[int],
     *,
     axis_index: int,
@@ -123,7 +128,7 @@ def split_merge_clusters(
 
 def calculate_merge_target(
     cluster: Sequence[int],
-    coords: Sequence[Vector],
+    coords: VertexCoordArray,
     mode: str,
     *,
     history_coords: Sequence[Vector] = (),
@@ -145,7 +150,8 @@ def calculate_merge_target(
 
     target = Vector((0.0, 0.0, 0.0))
     for index in cluster:
-        target += coords[index]
+        row = coords[index]
+        target += Vector((float(row[0]), float(row[1]), float(row[2])))
     return target / len(cluster)
 
 
@@ -173,19 +179,24 @@ def _map_history_via_pairs(
 
 def _vertex_snapshot(
     bm: bmesh.types.BMesh,
-) -> tuple[tuple[Vector, ...], tuple[int, ...], tuple[Vector, ...], tuple[int, ...]]:
-    bm.verts.ensure_lookup_table()
-    bm.verts.index_update()
-    coords = tuple(vertex.co.copy() for vertex in bm.verts)
-    selected = tuple(vertex.index for vertex in bm.verts if vertex.select)
-    history = cast(
-        Iterable[bmesh.types.BMVert | bmesh.types.BMEdge | bmesh.types.BMFace],
-        bm.select_history,
+    *,
+    mesh_object=None,
+) -> tuple[VertexCoordArray, tuple[int, ...], tuple[Vector, ...], tuple[int, ...]]:
+    """Capture vertex coords / selection / BMVert history for classify paths.
+
+    Coordinates are float64 ``(N, 3)`` from :func:`capture_selection_snapshot`
+    (Mesh bulk when *mesh_object* is set). Downstream consumers index rows and
+    call ``.copy()``; numpy rows satisfy both.
+    """
+
+    capture = capture_selection_snapshot(
+        bm,
+        mesh_object=mesh_object,
+        domains=("VERT",),
+        include_history=True,
     )
-    history_vertices = [element for element in history if isinstance(element, bmesh.types.BMVert)]
-    history_coords = tuple(element.co.copy() for element in history_vertices)
-    history_indices = tuple(element.index for element in history_vertices)
-    return coords, selected, history_coords, history_indices
+    selected = tuple(int(index) for index in capture.selected_verts)
+    return capture.coords, selected, capture.history_coords, capture.history_indices
 
 
 def _symmetry_parameters(context) -> tuple[bpy.types.Object, int, float] | None:
@@ -277,10 +288,11 @@ def _connect_report(operator, level: set[str], message: str) -> None:
     operator.report(level, message)
 
 
-def _maybe_extend_selection_to_mirror(mesh, axis_index: int, tolerance: float) -> None:
+def _maybe_extend_selection_to_mirror(mesh, axis_index: int, tolerance: float, *, mesh_object=None) -> None:
     """When Scene ``select_mirrored`` is on, add-select ρ(S) after success.
 
     Best-effort.  Does not touch ``select_history`` (core contract).
+    *mesh_object* enables Mesh bulk capture inside extend when provided.
     """
 
     try:
@@ -288,7 +300,7 @@ def _maybe_extend_selection_to_mirror(mesh, axis_index: int, tolerance: float) -
         if settings is None or not bool(getattr(settings, "select_mirrored", False)):
             return
         bm = bmesh.from_edit_mesh(mesh)
-        core.extend_selection_to_mirror(bm, axis_index, tolerance)
+        core.extend_selection_to_mirror(bm, axis_index, tolerance, mesh_object=mesh_object)
         bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
     except Exception:
         traceback.print_exc()
@@ -862,7 +874,7 @@ class MESH_OT_ydd_symmetric_edit_connect(bpy.types.Operator):
             return _native_vert_connect_path()
 
         bm = bmesh.from_edit_mesh(mesh)
-        coords, selected_indices, history_coords, history_indices = _vertex_snapshot(bm)
+        coords, selected_indices, history_coords, history_indices = _vertex_snapshot(bm, mesh_object=obj)
         snapshot = classify_mirror_selection(
             coords,
             selected_indices,
@@ -919,7 +931,7 @@ class MESH_OT_ydd_symmetric_edit_connect(bpy.types.Operator):
             # + edge attributes, 1:1 cancellation).
             if _connect_effect_is_self_mirrored(r_records, face_id_pairs, axis_index, tolerance):
                 _report_self_mirrored(self)
-                _maybe_extend_selection_to_mirror(mesh, axis_index, tolerance)
+                _maybe_extend_selection_to_mirror(mesh, axis_index, tolerance, mesh_object=obj)
                 return result
 
             # Counterpart missing → legitimate decline (native kept + WARNING).
@@ -927,8 +939,14 @@ class MESH_OT_ydd_symmetric_edit_connect(bpy.types.Operator):
                 _report_missing(self, max(1, len(snapshot.missing)), partial=False)
                 return result
 
-            mirrored_history_coords = tuple(coords[index].copy() for index in mirrored_history)
-            selected_coords = tuple(coords[index].copy() for index in selected_indices)
+            mirrored_history_coords = tuple(
+                Vector((float(coords[index][0]), float(coords[index][1]), float(coords[index][2])))
+                for index in mirrored_history
+            )
+            selected_coords = tuple(
+                Vector((float(coords[index][0]), float(coords[index][1]), float(coords[index][2])))
+                for index in selected_indices
+            )
 
             try:
                 backup_mesh = backup.create_topology_backup(bm)
@@ -1026,7 +1044,7 @@ class MESH_OT_ydd_symmetric_edit_connect(bpy.types.Operator):
                 # Mirror stage completed (or was a pure no-op success path).
                 # Selection was restored to the native source path above; extend
                 # now so ρ(S) is add-selected without touching select_history.
-                _maybe_extend_selection_to_mirror(mesh, axis_index, tolerance)
+                _maybe_extend_selection_to_mirror(mesh, axis_index, tolerance, mesh_object=obj)
         except Exception:
             traceback.print_exc()
         return result
@@ -1087,7 +1105,7 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
         obj, axis_index, tolerance = symmetry
         mesh = cast(bpy.types.Mesh, obj.data)
         bm = bmesh.from_edit_mesh(mesh)
-        coords, selected_indices, history_coords, history_indices = _vertex_snapshot(bm)
+        coords, selected_indices, history_coords, history_indices = _vertex_snapshot(bm, mesh_object=obj)
         snapshot = classify_mirror_selection(
             coords,
             selected_indices,
@@ -1102,7 +1120,7 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
             bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
             result = self._native()
             if "FINISHED" in result:
-                _maybe_extend_selection_to_mirror(mesh, axis_index, tolerance)
+                _maybe_extend_selection_to_mirror(mesh, axis_index, tolerance, mesh_object=obj)
             return result
 
         if self.mode not in _MERGE_MODES:
@@ -1122,6 +1140,7 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
                 coords,
                 selected_indices,
                 history_coords,
+                mesh_object=obj,
             )
 
         if not snapshot.complete:
@@ -1139,7 +1158,7 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
                 _report_self_mirrored(self, _merge_report)
                 result = self._native()
                 if "FINISHED" in result:
-                    _maybe_extend_selection_to_mirror(mesh, axis_index, tolerance)
+                    _maybe_extend_selection_to_mirror(mesh, axis_index, tolerance, mesh_object=obj)
                 return result
             # PARTIAL (complete): symmetrize the selection to reduce it to the
             # self-mirrored case, then run the native merge once.
@@ -1151,7 +1170,7 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
             )
             result = self._native()
             if "FINISHED" in result:
-                _maybe_extend_selection_to_mirror(mesh, axis_index, tolerance)
+                _maybe_extend_selection_to_mirror(mesh, axis_index, tolerance, mesh_object=obj)
             return result
 
         return self._execute_side_split_merge(
@@ -1162,6 +1181,7 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
             snapshot,
             coords,
             history_indices,
+            mesh_object=obj,
         )
 
     def _symmetrize_selection(self, bm: bmesh.types.BMesh, mesh, snapshot: MirrorSelection) -> int:
@@ -1207,9 +1227,11 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
         axis_index: int,
         tolerance: float,
         snapshot: MirrorSelection,
-        coords: tuple[Vector, ...],
+        coords: VertexCoordArray,
         selected_indices: tuple[int, ...],
         history_coords: tuple[Vector, ...],
+        *,
+        mesh_object=None,
     ) -> set[str]:
         _report_missing(self, len(snapshot.missing), partial=True)
 
@@ -1358,7 +1380,7 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
             if mirror_warning:
                 _merge_report(self, {"WARNING"}, mirror_warning)
             elif "FINISHED" in result and not cluster_declined:
-                _maybe_extend_selection_to_mirror(mesh, axis_index, tolerance)
+                _maybe_extend_selection_to_mirror(mesh, axis_index, tolerance, mesh_object=mesh_object)
         except Exception:
             traceback.print_exc()
         return result
@@ -1370,8 +1392,10 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
         axis_index: int,
         tolerance: float,
         snapshot: MirrorSelection,
-        coords: tuple[Vector, ...],
+        coords: VertexCoordArray,
         history_indices: tuple[int, ...],
+        *,
+        mesh_object=None,
     ) -> set[str]:
         """FIRST/LAST on a self-mirrored selection: merge each side to its own
         endpoint (5-2).  One native run would drag both sides to one point.
@@ -1388,7 +1412,8 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
         # Step 1: fix the merge target from the ORIGINAL history, before any
         # selection changes; it must not move for the rest of the procedure.
         target_index = history_indices[0] if self.mode == "FIRST" else history_indices[-1]
-        target_co = coords[target_index].copy()
+        target_row = coords[target_index]
+        target_co = Vector((float(target_row[0]), float(target_row[1]), float(target_row[2])))
 
         extended_selection = set(snapshot.selected)
         if snapshot.overlap is MirrorOverlap.PARTIAL:
@@ -1412,7 +1437,7 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
             _report_self_mirrored(self, _merge_report)
             result = self._native()
             if "FINISHED" in result:
-                _maybe_extend_selection_to_mirror(mesh, axis_index, tolerance)
+                _maybe_extend_selection_to_mirror(mesh, axis_index, tolerance, mesh_object=mesh_object)
             return result
 
         # Step 2: side partition.  Off-plane verts go to the half-space of
@@ -1590,7 +1615,7 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
                     # Side-split already selects both survivors; this still
                     # covers any leftover selected non-survivor elements and is
                     # a no-op for already-selected mirror survivors.
-                    _maybe_extend_selection_to_mirror(mesh, axis_index, tolerance)
+                    _maybe_extend_selection_to_mirror(mesh, axis_index, tolerance, mesh_object=mesh_object)
         except Exception:
             traceback.print_exc()
         return result

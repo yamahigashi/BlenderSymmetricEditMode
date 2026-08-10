@@ -25,6 +25,7 @@ from .snapshot import (
     FACE_SELECTION_LAYER,
     VERT_HIDDEN_LAYER,
     VERT_SELECTION_LAYER,
+    capture_selection_snapshot,
 )
 
 
@@ -206,6 +207,8 @@ def extend_selection_to_mirror(
     bm: bmesh.types.BMesh,
     axis_index: int,
     tolerance: float,
+    *,
+    mesh_object=None,
 ) -> int:
     """Add-select mirror counterparts of currently selected mesh elements.
 
@@ -217,6 +220,9 @@ def extend_selection_to_mirror(
     double-precision Chebyshev verification, involutive). Edges and faces
     resolve when every constituent vertex has a pair and some element owns
     exactly that partner vertex set.
+
+    Coordinates and selection flags are captured via
+    :func:`capture_selection_snapshot` (Mesh bulk when *mesh_object* is set).
 
     Returns the number of elements that transitioned from unselected to
     selected. Does not call ``select_flush_mode``; callers that need a mode
@@ -232,17 +238,24 @@ def extend_selection_to_mirror(
     bm.edges.index_update()
     bm.faces.index_update()
 
-    coords = [vertex.co.copy() for vertex in bm.verts]
-    pairs = build_vertex_pair_table(coords, axis_index, tolerance)
+    capture = capture_selection_snapshot(
+        bm,
+        mesh_object=mesh_object,
+        domains=("VERT", "EDGE", "FACE"),
+        include_history=False,
+    )
+    # numpy float64 rows are accepted by build_vertex_pair_table (float(co[i])).
+    pairs = build_vertex_pair_table(capture.coords, axis_index, tolerance)
     if not pairs:
         return 0
 
     # Snapshot first: newly selected counterparts must not seed further
     # expansion in the same call (contract is one-shot add of ρ(S), not a
-    # fixed point).
-    selected_verts = [vertex for vertex in bm.verts if vertex.select]
-    selected_edges = [edge for edge in bm.edges if edge.select]
-    selected_faces = [face for face in bm.faces if face.select]
+    # fixed point). Indices come from the capture; element wrappers are
+    # resolved only for selected members.
+    selected_verts = [bm.verts[int(index)] for index in capture.selected_verts]
+    selected_edges = [bm.edges[int(index)] for index in capture.selected_edges]
+    selected_faces = [bm.faces[int(index)] for index in capture.selected_faces]
 
     edge_by_verts = (
         {frozenset((edge.verts[0].index, edge.verts[1].index)): edge for edge in bm.edges if edge.is_valid}
