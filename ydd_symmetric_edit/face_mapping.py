@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import cast
 
 import bmesh
@@ -30,6 +30,311 @@ from .matching import (
 )
 
 
+class _SnapshotVertex:
+    def __init__(self, coordinate) -> None:
+        self.co = Vector(coordinate)
+
+
+class _SnapshotFace:
+    def __init__(self, values) -> None:
+        self.verts = tuple(_SnapshotVertex(value) for value in values)
+
+
+class _FaceRowGroup:
+    def __init__(
+        self,
+        unique_keys: numpy.ndarray,
+        counts: numpy.ndarray,
+        member_starts: numpy.ndarray,
+        members: numpy.ndarray,
+        first_face_ids: numpy.ndarray,
+    ) -> None:
+        self.unique_keys = unique_keys
+        self.counts = counts
+        self.member_starts = member_starts
+        self.members = members
+        self.first_face_ids = first_face_ids
+
+
+class FaceRegistry:
+    """Resolution-free face topology and geometry indices."""
+
+    def __init__(
+        self,
+        coords64: numpy.ndarray,
+        loop_verts: numpy.ndarray,
+        loop_starts: numpy.ndarray,
+        loop_totals: numpy.ndarray,
+        axis_index: int,
+        tolerance: float,
+    ) -> None:
+        self.coords64 = numpy.asarray(coords64, dtype=numpy.float64)
+        self.loop_verts = numpy.asarray(loop_verts, dtype=numpy.int64)
+        self.loop_starts = numpy.asarray(loop_starts, dtype=numpy.int64)
+        self.loop_totals = numpy.asarray(loop_totals, dtype=numpy.int64)
+        self.axis_index = int(axis_index)
+        self.tolerance = float(tolerance)
+        self.face_count = int(len(self.loop_starts))
+        self._row_groups, self._row_unique_indices = self._build_row_index()
+        self._row_buckets: dict[tuple[int, tuple[int, ...]], tuple[FaceId, ...]] | None = None
+        self._vertex_face_ids, self._vertex_face_starts = self._build_vertex_face_index()
+        self._coordinates: tuple[tuple[float, float, float], ...] | None = None
+        self._face_key_buckets: dict[FaceKey, tuple[FaceId, ...]] | None = None
+        self._centroid_buckets: dict[tuple[int, QuantizedCoordinate], tuple[FaceId, ...]] | None = None
+        self._centroids: tuple[Coordinate3D, ...] | None = None
+
+    def _build_row_index(self):
+        groups: dict[int, _FaceRowGroup] = {}
+        row_unique_indices = numpy.empty(self.face_count, dtype=numpy.int64)
+        for raw_total in numpy.unique(self.loop_totals):
+            total = int(raw_total)
+            face_indices = numpy.flatnonzero(self.loop_totals == total)
+            if total == 0:
+                inverse = numpy.zeros(len(face_indices), dtype=numpy.int64)
+                counts = numpy.asarray((len(face_indices),), dtype=numpy.int64)
+                unique_keys = numpy.empty(0, dtype=numpy.void)
+                first_rows = numpy.asarray((0,), dtype=numpy.int64)
+            else:
+                positions = self.loop_starts[face_indices, None] + numpy.arange(total, dtype=numpy.int64)
+                rows = numpy.sort(self.loop_verts[positions], axis=1)
+                row_dtype = numpy.dtype((numpy.void, rows.dtype.itemsize * total))
+                row_keys = numpy.ascontiguousarray(rows).view(row_dtype).reshape(-1)
+                unique_keys, first_rows, inverse, counts = numpy.unique(
+                    row_keys,
+                    return_index=True,
+                    return_inverse=True,
+                    return_counts=True,
+                )
+            member_order = numpy.argsort(inverse, kind="stable")
+            members = face_indices[member_order] + 1
+            member_starts = numpy.concatenate(
+                (numpy.asarray((0,), dtype=numpy.int64), numpy.cumsum(counts, dtype=numpy.int64))
+            )
+            first_face_ids = face_indices[first_rows] + 1
+            groups[total] = _FaceRowGroup(unique_keys, counts, member_starts, members, first_face_ids)
+            row_unique_indices[face_indices] = inverse
+        return groups, row_unique_indices
+
+    def _build_vertex_face_index(self):
+        vertex_count = len(self.coords64)
+        if len(self.loop_verts) == 0:
+            return numpy.empty(0, dtype=numpy.int64), numpy.zeros(vertex_count + 1, dtype=numpy.int64)
+        loop_face_ids = numpy.repeat(
+            numpy.arange(1, self.face_count + 1, dtype=numpy.int64),
+            self.loop_totals,
+        )
+        order = numpy.lexsort((loop_face_ids, self.loop_verts))
+        vertices = self.loop_verts[order]
+        face_ids = loop_face_ids[order]
+        keep = numpy.ones(len(vertices), dtype=bool)
+        keep[1:] = (vertices[1:] != vertices[:-1]) | (face_ids[1:] != face_ids[:-1])
+        vertices = vertices[keep]
+        face_ids = face_ids[keep]
+        if len(vertices) and (numpy.any(vertices < 0) or numpy.any(vertices >= vertex_count)):
+            raise IndexError("face loop vertex index out of range")
+        counts = numpy.bincount(vertices, minlength=vertex_count)
+        starts = numpy.concatenate((numpy.asarray((0,), dtype=numpy.int64), numpy.cumsum(counts, dtype=numpy.int64)))
+        return face_ids, starts
+
+    def row_key(self, face_id: FaceId):
+        face_index = int(face_id) - 1
+        start = int(self.loop_starts[face_index])
+        total = int(self.loop_totals[face_index])
+        vertices = numpy.sort(self.loop_verts[start : start + total])
+        return total, tuple(int(vertex_id) for vertex_id in vertices.tolist())
+
+    def vertices(self, face_id: FaceId):
+        face_index = int(face_id) - 1
+        start = int(self.loop_starts[face_index])
+        total = int(self.loop_totals[face_index])
+        return tuple(int(vertex_id) for vertex_id in self.loop_verts[start : start + total].tolist())
+
+    def _row_bucket(self, face_id: FaceId) -> tuple[FaceId, ...]:
+        face_index = int(face_id) - 1
+        total = int(self.loop_totals[face_index])
+        group = self._row_groups[total]
+        unique_index = int(self._row_unique_indices[face_index])
+        start = int(group.member_starts[unique_index])
+        end = int(group.member_starts[unique_index + 1])
+        return tuple(FaceId(int(member)) for member in group.members[start:end].tolist())
+
+    @property
+    def row_buckets(self):
+        if self._row_buckets is None:
+            buckets: dict[tuple[int, tuple[int, ...]], tuple[FaceId, ...]] = {}
+            for total, group in self._row_groups.items():
+                if total == 0:
+                    rows = ((),)
+                else:
+                    rows = group.unique_keys.view(numpy.int64).reshape(-1, total).tolist()
+                for unique_index, row in enumerate(rows):
+                    start = int(group.member_starts[unique_index])
+                    end = int(group.member_starts[unique_index + 1])
+                    buckets[(total, tuple(int(vertex_id) for vertex_id in row))] = tuple(
+                        FaceId(int(member)) for member in group.members[start:end].tolist()
+                    )
+            self._row_buckets = buckets
+        return self._row_buckets
+
+    def faces_for_vertex(self, vertex_id: int):
+        if vertex_id < 0 or vertex_id >= len(self.coords64):
+            raise IndexError("vertex query index out of range")
+        start = int(self._vertex_face_starts[vertex_id])
+        end = int(self._vertex_face_starts[vertex_id + 1])
+        return tuple(FaceId(int(face_id)) for face_id in self._vertex_face_ids[start:end].tolist())
+
+    def primary_target(self, face_id: FaceId, pairs: Mapping[int, int]) -> FaceId | None:
+        vertices = self.vertices(face_id)
+        if not vertices:
+            return None
+        face_index = int(face_id) - 1
+        total = int(self.loop_totals[face_index])
+        group = self._row_groups[total]
+        own_unique_index = int(self._row_unique_indices[face_index])
+        if int(group.counts[own_unique_index]) != 1 or any(vertex_id not in pairs for vertex_id in vertices):
+            return None
+        mapped = numpy.fromiter((pairs[vertex_id] for vertex_id in vertices), dtype=numpy.int64, count=total)
+        mapped.sort()
+        mapped_key = mapped.view(group.unique_keys.dtype).reshape(-1)[0]
+        destination = int(numpy.searchsorted(group.unique_keys, mapped_key))
+        if (
+            destination >= len(group.unique_keys)
+            or group.unique_keys[destination] != mapped_key
+            or int(group.counts[destination]) != 1
+        ):
+            return None
+        return FaceId(int(group.first_face_ids[destination]))
+
+    def _exact_claimants(
+        self,
+        target_id: FaceId,
+        pairs: Mapping[int, int],
+        pair_sources: Mapping[int, tuple[int, ...]],
+        memo: dict[FaceId, FaceId | None],
+    ) -> set[FaceId]:
+        candidate_faces: set[FaceId] = set()
+        for target_vertex in self.vertices(target_id):
+            for source_vertex in pair_sources.get(target_vertex, ()):
+                candidate_faces.update(self.faces_for_vertex(source_vertex))
+        return {face_id for face_id in candidate_faces if self._memoized_target(face_id, pairs, memo) == target_id}
+
+    def _memoized_target(
+        self,
+        face_id: FaceId,
+        pairs: Mapping[int, int],
+        memo: dict[FaceId, FaceId | None],
+    ) -> FaceId | None:
+        if face_id in memo:
+            return memo[face_id]
+        target = self.primary_target(face_id, pairs)
+        memo[face_id] = target
+        return target
+
+    def resolve_primary_closure(self, face_ids, pairs: Mapping[int, int]):
+        """Resolve exact row-key closure, reporting whether fallback is required."""
+
+        closure = {FaceId(int(face_id)) for face_id in face_ids}
+        if any(int(face_id) < 1 or int(face_id) > self.face_count for face_id in closure):
+            raise IndexError("face query index out of range")
+        pair_source_lists: dict[int, list[int]] = defaultdict(list)
+        for source, target in pairs.items():
+            pair_source_lists[target].append(source)
+        pair_sources = {target: tuple(sources) for target, sources in pair_source_lists.items()}
+        # Memo is valid only within one call: primary_target is pure in
+        # (face_id, pairs) and pairs is fixed for the whole closure pass.
+        memo: dict[FaceId, FaceId | None] = {}
+        targets: dict[FaceId, FaceId | None] = {}
+        frontier = set(closure)
+        while frontier:
+            additions: set[FaceId] = set()
+            for face_id in frontier:
+                additions.update(self._row_bucket(face_id))
+                target = self._memoized_target(face_id, pairs, memo)
+                if target is None:
+                    closure.update(additions)
+                    return tuple(sorted(closure)), targets, True
+                targets[face_id] = target
+                additions.update(self._row_bucket(target))
+                additions.update(self._exact_claimants(target, pairs, pair_sources, memo))
+            additions.difference_update(closure)
+            closure.update(additions)
+            frontier = additions
+
+        target_counts: dict[FaceId, int] = defaultdict(int)
+        for target in targets.values():
+            if target is not None:
+                target_counts[target] += 1
+        conflicts = {target for target, count in target_counts.items() if count > 1}
+        if conflicts:
+            targets = {face_id: None if target in conflicts else target for face_id, target in targets.items()}
+        return tuple(sorted(closure)), targets, bool(conflicts)
+
+    @property
+    def geometry_ready(self) -> bool:
+        return self._face_key_buckets is not None
+
+    def _ensure_geometry(self) -> None:
+        if self.geometry_ready:
+            return
+        coordinates = tuple((float(row[0]), float(row[1]), float(row[2])) for row in self.coords64.tolist())
+        key_buckets: dict[FaceKey, list[FaceId]] = defaultdict(list)
+        centroid_buckets: dict[tuple[int, QuantizedCoordinate], list[FaceId]] = defaultdict(list)
+        centroids: list[Coordinate3D] = []
+        for face_index in range(1, self.face_count + 1):
+            face_id = FaceId(face_index)
+            vertex_ids = self.vertices(face_id)
+            values = tuple(coordinates[vertex_id] for vertex_id in vertex_ids)
+            snapshot_face = cast(bmesh.types.BMFace, _SnapshotFace(values))
+            key_buckets[_face_key(snapshot_face, self.axis_index, self.tolerance, mirrored=False)].append(face_id)
+            center = Vector((0.0, 0.0, 0.0))
+            for value in values:
+                center += Vector(value)
+            if values:
+                center /= len(values)
+            centroid = _coordinate_3d(center)
+            centroids.append(centroid)
+            centroid_buckets[
+                (len(vertex_ids), _quantized_coordinate(Vector(centroid.as_tuple()), self.tolerance))
+            ].append(face_id)
+        self._coordinates = coordinates
+        self._face_key_buckets = {key: tuple(face_ids) for key, face_ids in key_buckets.items()}
+        self._centroid_buckets = {key: tuple(face_ids) for key, face_ids in centroid_buckets.items()}
+        self._centroids = tuple(centroids)
+
+    @property
+    def face_key_buckets(self):
+        self._ensure_geometry()
+        return cast(dict[FaceKey, tuple[FaceId, ...]], self._face_key_buckets)
+
+    @property
+    def centroid_buckets(self):
+        self._ensure_geometry()
+        return cast(
+            dict[tuple[int, QuantizedCoordinate], tuple[FaceId, ...]],
+            self._centroid_buckets,
+        )
+
+    def face_coordinates(self, face_id: FaceId, *, mirrored: bool = False):
+        self._ensure_geometry()
+        coordinates = cast(tuple[tuple[float, float, float], ...], self._coordinates)
+        values = tuple(coordinates[vertex_id] for vertex_id in self.vertices(face_id))
+        if not mirrored:
+            return values
+        return tuple(
+            tuple(-value if axis == self.axis_index else value for axis, value in enumerate(coordinate))
+            for coordinate in values
+        )
+
+    def mirrored_face_key(self, face_id: FaceId):
+        values = self.face_coordinates(face_id)
+        snapshot_face = cast(bmesh.types.BMFace, _SnapshotFace(values))
+        return _face_key(snapshot_face, self.axis_index, self.tolerance, mirrored=True)
+
+    def centroid(self, face_id: FaceId):
+        self._ensure_geometry()
+        return cast(tuple[Coordinate3D, ...], self._centroids)[int(face_id) - 1]
+
+
 def _snapshot_face_map(
     coords64: numpy.ndarray,
     loop_verts: numpy.ndarray,
@@ -38,6 +343,7 @@ def _snapshot_face_map(
     axis_index: int,
     tolerance: float,
     vertex_pairs: dict[int, int] | None = None,
+    face_registry: FaceRegistry | None = None,
 ):
     vertex_pairs = _one_sided_pair_table(coords64, axis_index, tolerance) if vertex_pairs is None else vertex_pairs
     if vertex_pairs is None:
@@ -90,75 +396,91 @@ def _snapshot_face_map(
     if not fallback:
         return mirror_face_ids
 
-    coordinates = tuple(tuple(float(value) for value in row) for row in coords64.tolist())
-    face_vertex_ids = {
-        FaceId(face_index + 1): tuple(int(vertex_id) for vertex_id in loop_verts[int(start) : int(start) + int(total)])
-        for face_index, (start, total) in enumerate(zip(loop_starts, loop_totals, strict=True))
-    }
-
-    def face_coords(face_id: FaceId, mirrored: bool = False):
-        values = tuple(coordinates[index] for index in face_vertex_ids[face_id])
-        if mirrored:
-            values = tuple(
-                tuple(-value if axis == axis_index else value for axis, value in enumerate(coordinate))
-                for coordinate in values
+    if face_registry is None:
+        coordinates = tuple(tuple(float(value) for value in row) for row in coords64.tolist())
+        face_vertex_ids = {
+            FaceId(face_index + 1): tuple(
+                int(vertex_id) for vertex_id in loop_verts[int(start) : int(start) + int(total)]
             )
-        return values
+            for face_index, (start, total) in enumerate(zip(loop_starts, loop_totals, strict=True))
+        }
 
-    class _SnapshotVertex:
-        def __init__(self, coordinate):
-            self.co = Vector(coordinate)
+        def face_coords(face_id: FaceId, mirrored: bool = False):
+            values = tuple(coordinates[index] for index in face_vertex_ids[face_id])
+            if mirrored:
+                values = tuple(
+                    tuple(-value if axis == axis_index else value for axis, value in enumerate(coordinate))
+                    for coordinate in values
+                )
+            return values
 
-    class _SnapshotFace:
-        def __init__(self, values):
-            self.verts = tuple(_SnapshotVertex(value) for value in values)
+        def face_key_for(face_id: FaceId):
+            return _face_key(
+                cast(bmesh.types.BMFace, _SnapshotFace(face_coords(face_id))),
+                axis_index,
+                tolerance,
+                mirrored=False,
+            )
 
-    def face_key(values):
-        return _face_key(cast(bmesh.types.BMFace, _SnapshotFace(values)), axis_index, tolerance, mirrored=False)
+        def mirrored_face_key_for(face_id: FaceId):
+            return _face_key(
+                cast(bmesh.types.BMFace, _SnapshotFace(face_coords(face_id))),
+                axis_index,
+                tolerance,
+                mirrored=True,
+            )
 
-    def mirrored_face_key(values):
-        return _face_key(cast(bmesh.types.BMFace, _SnapshotFace(values)), axis_index, tolerance, mirrored=True)
+        def face_centroid(values) -> Coordinate3D:
+            if not values:
+                return Coordinate3D(0.0, 0.0, 0.0)
+            center = Vector((0.0, 0.0, 0.0))
+            for value in values:
+                center += Vector(value)
+            center /= len(values)
+            return _coordinate_3d(center)
 
-    def face_centroid(values) -> Coordinate3D:
-        if not values:
-            return Coordinate3D(0.0, 0.0, 0.0)
-        center = Vector((0.0, 0.0, 0.0))
-        for value in values:
-            center += Vector(value)
-        center /= len(values)
-        return _coordinate_3d(center)
+        key_to_face_ids: dict[FaceKey, Sequence[FaceId]] = defaultdict(list)
+        faces_by_count_centroid: dict[
+            tuple[int, QuantizedCoordinate],
+            Sequence[FaceId],
+        ] = defaultdict(list)
+        centroids: dict[FaceId, Coordinate3D] = {}
+        for face_id in face_vertex_ids:
+            cast(list[FaceId], key_to_face_ids[face_key_for(face_id)]).append(face_id)
 
-    key_to_face_ids: dict[tuple, list[FaceId]] = defaultdict(list)
-    faces_by_count_centroid: dict[tuple[int, QuantizedCoordinate], list[FaceId]] = defaultdict(list)
-    centroids: dict[FaceId, Coordinate3D] = {}
-    for face_id in face_vertex_ids:
-        values = face_coords(face_id)
-        key_to_face_ids[face_key(values)].append(face_id)
+        def centroid_for(face_id: FaceId) -> Coordinate3D:
+            centroid = centroids.get(face_id)
+            if centroid is None:
+                centroid = face_centroid(face_coords(face_id))
+                centroids[face_id] = centroid
+            return centroid
 
-    def centroid_for(face_id: FaceId) -> Coordinate3D:
-        centroid = centroids.get(face_id)
-        if centroid is None:
-            centroid = face_centroid(face_coords(face_id))
-            centroids[face_id] = centroid
-        return centroid
+        fallback_index_ready = False
 
-    fallback_index_ready = False
+        def ensure_fallback_index() -> None:
+            nonlocal fallback_index_ready
+            if fallback_index_ready:
+                return
+            for candidate_id, vertex_ids in face_vertex_ids.items():
+                centroid = centroid_for(candidate_id)
+                key = (len(vertex_ids), _quantized_coordinate(Vector(centroid.as_tuple()), tolerance))
+                cast(list[FaceId], faces_by_count_centroid[key]).append(candidate_id)
+            fallback_index_ready = True
 
-    def ensure_fallback_index() -> None:
-        nonlocal fallback_index_ready
-        if fallback_index_ready:
+    else:
+        key_to_face_ids = face_registry.face_key_buckets
+        faces_by_count_centroid = face_registry.centroid_buckets
+        face_coords = face_registry.face_coordinates
+        mirrored_face_key_for = face_registry.mirrored_face_key
+        centroid_for = face_registry.centroid
+
+        def ensure_fallback_index() -> None:
             return
-        for candidate_id, vertex_ids in face_vertex_ids.items():
-            centroid = centroid_for(candidate_id)
-            faces_by_count_centroid[
-                (len(vertex_ids), _quantized_coordinate(Vector(centroid.as_tuple()), tolerance))
-            ].append(candidate_id)
-        fallback_index_ready = True
 
     fallback_assignments: dict[FaceId, FaceId] = {}
     for face_id in fallback:
         values = face_coords(face_id)
-        mirrored_key = mirrored_face_key(values)
+        mirrored_key = mirrored_face_key_for(face_id)
         candidates = key_to_face_ids.get(mirrored_key)
         if candidates is None:
             ensure_fallback_index()
@@ -174,7 +496,11 @@ def _snapshot_face_map(
                     if candidate_id in seen:
                         continue
                     seen.add(candidate_id)
-                    if not _coords_match_chebyshev(mirrored_values, face_coords(candidate_id), tolerance):
+                    if not _coords_match_chebyshev(
+                        mirrored_values,
+                        face_coords(candidate_id),
+                        tolerance,
+                    ):
                         continue
                     found.append(candidate_id)
                     if candidate_id == face_id:

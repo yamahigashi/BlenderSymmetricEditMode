@@ -16,7 +16,7 @@ from ._types import (
     MirrorFaceMap,
     TopologyPreparation,
 )
-from .face_mapping import _snapshot_face_map
+from .face_mapping import FaceRegistry, _snapshot_face_map
 from .layer_names import (
     EDGE_HIDDEN_LAYER,
     EDGE_ORIGINAL_LAYER,
@@ -269,6 +269,10 @@ class LazyTopologyResolution:
         self._vertex_resolved = numpy.zeros(self.vertex_count, dtype=bool)
         self._vertex_cache: dict[int, int | None] = {}
         self._partial_resolve_count = 0
+        self._face_registry: FaceRegistry | None = None
+        self._face_resolved = numpy.zeros(self.face_count, dtype=bool)
+        self._face_cache: dict[FaceId, FaceId | None] = {}
+        self._partial_face_resolve_count = 0
 
     @property
     def resolve_count(self) -> int:
@@ -277,6 +281,10 @@ class LazyTopologyResolution:
     @property
     def partial_resolve_count(self) -> int:
         return self._partial_resolve_count
+
+    @property
+    def partial_face_resolve_count(self) -> int:
+        return self._partial_face_resolve_count
 
     def __eq__(self, other) -> bool:
         if not isinstance(other, LazyTopologyResolution):
@@ -337,7 +345,11 @@ class LazyTopologyResolution:
             self.axis_index,
             self.tolerance,
             self._pairs,
+            self._face_registry,
         )
+        for face_id, cached in self._face_cache.items():
+            if mirror_face_ids.get(face_id) != cached:
+                raise RuntimeError("partial face resolution disagrees with full resolution")
         self._mirror_face_ids = mirror_face_ids
         self._carrier_frames = LazyCarrierFrameMap.from_snapshot(
             self.coords64,
@@ -346,8 +358,23 @@ class LazyTopologyResolution:
             self.loop_totals,
         )
         self._vertex_resolved[:] = True
+        self._face_resolved[:] = True
         self._resolved = True
         return self
+
+    def _resolve_vertex_closure(self, vertex_ids):
+        if self._vertex_registry is None:
+            self._vertex_registry = VertexRegistry(self.coords64, self.axis_index, self.tolerance)
+        resolution = self._vertex_registry.resolve_closure(vertex_ids)
+        if resolution is None:
+            return None
+        closure_ids, pairs = resolution
+        unresolved = closure_ids[~self._vertex_resolved[closure_ids]]
+        if len(unresolved):
+            self._vertex_cache.update({int(vertex_id): pairs.get(int(vertex_id)) for vertex_id in closure_ids.tolist()})
+            self._vertex_resolved[closure_ids] = True
+            self._partial_resolve_count += 1
+        return closure_ids, pairs
 
     def resolve_vertices(self, vertex_ids) -> dict[int, int | None]:
         requested = numpy.unique(numpy.asarray(tuple(vertex_ids), dtype=numpy.int64).reshape(-1))
@@ -358,18 +385,53 @@ class LazyTopologyResolution:
 
         unresolved = requested[~self._vertex_resolved[requested]]
         if len(unresolved):
-            if self._vertex_registry is None:
-                self._vertex_registry = VertexRegistry(self.coords64, self.axis_index, self.tolerance)
-            resolution = self._vertex_registry.resolve_closure(unresolved)
+            resolution = self._resolve_vertex_closure(unresolved)
             if resolution is None:
                 self.resolve()
                 return {int(vertex_id): self._pairs.get(int(vertex_id)) for vertex_id in requested.tolist()}
-            closure_ids, pairs = resolution
-            updates = {int(vertex_id): pairs.get(int(vertex_id)) for vertex_id in closure_ids.tolist()}
-            self._vertex_cache.update(updates)
-            self._vertex_resolved[closure_ids] = True
-            self._partial_resolve_count += 1
         return {int(vertex_id): self._vertex_cache[int(vertex_id)] for vertex_id in requested.tolist()}
+
+    def resolve_faces(self, face_ids) -> dict[FaceId, FaceId | None]:
+        requested = numpy.unique(numpy.asarray(tuple(face_ids), dtype=numpy.int64).reshape(-1))
+        if len(requested) and (numpy.any(requested < 1) or numpy.any(requested > self.face_count)):
+            raise IndexError("face query index out of range")
+        requested_ids = tuple(FaceId(int(face_id)) for face_id in requested.tolist())
+        if self._resolved:
+            return {face_id: self._mirror_face_ids.get(face_id) for face_id in requested_ids}
+
+        requested_indices = requested - 1
+        unresolved = requested[~self._face_resolved[requested_indices]]
+        if len(unresolved):
+            if self._face_registry is None:
+                self._face_registry = FaceRegistry(
+                    self.coords64,
+                    self.loop_verts,
+                    self.loop_starts,
+                    self.loop_totals,
+                    self.axis_index,
+                    self.tolerance,
+                )
+            unresolved_ids = tuple(FaceId(int(face_id)) for face_id in unresolved.tolist())
+            vertex_ids = tuple(
+                sorted({vertex_id for face_id in unresolved_ids for vertex_id in self._face_registry.vertices(face_id)})
+            )
+            vertex_resolution = self._resolve_vertex_closure(vertex_ids)
+            if vertex_resolution is None:
+                self.resolve()
+                return {face_id: self._mirror_face_ids.get(face_id) for face_id in requested_ids}
+            _closure_vertex_ids, pairs = vertex_resolution
+            closure, targets, needs_fallback = self._face_registry.resolve_primary_closure(
+                unresolved_ids,
+                pairs,
+            )
+            if needs_fallback:
+                self.resolve()
+                return {face_id: self._mirror_face_ids.get(face_id) for face_id in requested_ids}
+            self._face_cache.update(targets)
+            closure_indices = numpy.asarray([int(face_id) - 1 for face_id in closure], dtype=numpy.int64)
+            self._face_resolved[closure_indices] = True
+            self._partial_face_resolve_count += 1
+        return {face_id: self._face_cache[face_id] for face_id in requested_ids}
 
     def __deepcopy__(self, memo):
         clone = type(self).__new__(type(self))
@@ -384,6 +446,7 @@ class LazyTopologyResolution:
             "hide_faces",
             "vertex_select",
             "_vertex_resolved",
+            "_face_resolved",
         ):
             value = getattr(self, name)
             setattr(clone, name, None if value is None else value.copy())
@@ -398,12 +461,15 @@ class LazyTopologyResolution:
             "_resolved",
             "_resolve_count",
             "_partial_resolve_count",
+            "_partial_face_resolve_count",
         ):
             setattr(clone, name, getattr(self, name))
         clone._pairs = dict(self._pairs)
         clone._mirror_face_ids = dict(self._mirror_face_ids)
         clone._vertex_cache = dict(self._vertex_cache)
         clone._vertex_registry = None
+        clone._face_cache = dict(self._face_cache)
+        clone._face_registry = None
         if self._carrier_frames is None:
             clone._carrier_frames = None
         else:

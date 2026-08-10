@@ -2400,6 +2400,219 @@ def _check_prepare_session_invoke_does_not_resolve():
         bm.free()
 
 
+def _face_resolution_handle(coords, faces, tolerance=TOLERANCE):
+    coords64 = numpy.asarray(coords, dtype=numpy.float64).reshape((-1, 3))
+    loop_totals = numpy.asarray([len(face) for face in faces], dtype=numpy.int64)
+    loop_starts = (
+        numpy.concatenate((numpy.asarray((0,), dtype=numpy.int64), numpy.cumsum(loop_totals[:-1], dtype=numpy.int64)))
+        if len(loop_totals)
+        else numpy.empty(0, dtype=numpy.int64)
+    )
+    loop_verts = numpy.asarray([vertex_id for face in faces for vertex_id in face], dtype=numpy.int64)
+    empty = numpy.empty(0, dtype=numpy.int64)
+    return core.LazyTopologyResolution(
+        coords64,
+        loop_verts,
+        loop_starts,
+        loop_totals,
+        numpy.zeros(len(coords64), dtype=bool),
+        empty,
+        numpy.zeros(len(faces), dtype=bool),
+        0,
+        tolerance,
+        1,
+    )
+
+
+def _phase4_u4_grid(*, perturb=False, duplicate=False):
+    coords = [(float(x), float(y), 0.0) for y in (-1, 0, 1) for x in (-2, -1, 0, 1, 2)]
+    if perturb:
+        coords[0] = (coords[0][0], coords[0][1] + 0.37, coords[0][2])
+    faces = [
+        (0, 1, 6, 5),
+        (1, 2, 7, 6),
+        (2, 3, 8, 7),
+        (3, 4, 9, 8),
+        (5, 6, 11, 10),
+        (6, 7, 12, 11),
+        (7, 8, 13, 12),
+        (8, 9, 14, 13),
+    ]
+    if duplicate:
+        faces.append(faces[0])
+    return coords, faces
+
+
+def _phase4_u4_duplicate_rows():
+    coords = (
+        (-2.0, -1.0, 0.0),
+        (-2.0, 1.0, 0.0),
+        (-1.0, 0.0, 0.0),
+        (2.0, -1.0, 0.0),
+        (2.0, 1.0, 0.0),
+        (1.0, 0.0, 0.0),
+    )
+    faces = ((0, 1, 2), (3, 5, 4), (3, 5, 4))
+    return coords, faces
+
+
+def _full_face_results(coords, faces):
+    handle = _face_resolution_handle(coords, faces)
+    handle.resolve()
+    return {
+        FaceId(face_id): handle._mirror_face_ids.get(FaceId(face_id)) for face_id in range(1, handle.face_count + 1)
+    }
+
+
+def _restricted_face_results(expected, face_ids):
+    return {FaceId(face_id): expected[FaceId(face_id)] for face_id in sorted(set(face_ids))}
+
+
+def _check_face_registry_preserves_global_rows_and_lazy_geometry():
+    coords, faces = _phase4_u4_grid(duplicate=True)
+    handle = _face_resolution_handle(coords, faces)
+    registry = core.FaceRegistry(
+        handle.coords64,
+        handle.loop_verts,
+        handle.loop_starts,
+        handle.loop_totals,
+        handle.axis_index,
+        handle.tolerance,
+    )
+    duplicate_key = registry.row_key(FaceId(1))
+    assert registry.row_buckets[duplicate_key] == (FaceId(1), FaceId(9))
+    assert set(registry.faces_for_vertex(0)) == {FaceId(1), FaceId(9)}
+    assert not registry.geometry_ready
+    assert registry.face_key_buckets
+    assert registry.centroid_buckets
+    assert registry.geometry_ready
+
+
+def _check_partial_face_resolution_duplicate_row_orderings():
+    coords, faces = _phase4_u4_duplicate_rows()
+    expected = _full_face_results(coords, faces)
+    assert expected[FaceId(2)] is None
+    assert expected[FaceId(3)] is None
+    orderings = (((2,), (3,)), ((2, 3),), ((3,), (2,)))
+    for batches in orderings:
+        handle = _face_resolution_handle(coords, faces)
+        seen = []
+        for batch in batches:
+            seen.extend(batch)
+            assert handle.resolve_faces(batch) == _restricted_face_results(expected, batch)
+        assert handle.resolve_faces(seen) == _restricted_face_results(expected, seen)
+
+
+def _check_partial_face_resolution_randomized_sets():
+    fixtures = (
+        _phase4_u4_grid(),
+        _phase4_u4_grid(perturb=True),
+        _phase4_u4_grid(duplicate=True),
+    )
+    rng = random.Random(904_041)
+    for coords, faces in fixtures:
+        expected = _full_face_results(coords, faces)
+        requested = rng.sample(range(1, len(faces) + 1), min(6, len(faces)))
+
+        sequential = _face_resolution_handle(coords, faces)
+        for face_id in requested:
+            assert sequential.resolve_faces((face_id,)) == _restricted_face_results(expected, (face_id,))
+
+        combined = _face_resolution_handle(coords, faces)
+        assert combined.resolve_faces(requested) == _restricted_face_results(expected, requested)
+        assert sequential.resolve_faces(requested) == combined.resolve_faces(requested)
+
+
+def _check_partial_face_resolution_fallback_preserves_primary_values():
+    coords, faces = _phase4_u4_grid(perturb=True)
+    expected = _full_face_results(coords, faces)
+    handle = _face_resolution_handle(coords, faces)
+
+    primary_before = handle.resolve_faces((2,))
+    assert primary_before == _restricted_face_results(expected, (2,))
+    assert handle.resolve_count == 0
+    assert handle.resolve_faces((1,)) == _restricted_face_results(expected, (1,))
+    assert handle.resolve_count == 1
+    assert handle.resolve_faces((2,)) == primary_before
+
+
+def _check_face_primary_conflict_downgrades_every_claimant():
+    coords = numpy.asarray(
+        [(float(index), 0.0, 0.0) for index in range(9)],
+        dtype=numpy.float64,
+    )
+    faces = ((0, 1, 2), (3, 4, 5), (6, 7, 8))
+    handle = _face_resolution_handle(coords, faces)
+    registry = core.FaceRegistry(
+        handle.coords64,
+        handle.loop_verts,
+        handle.loop_starts,
+        handle.loop_totals,
+        handle.axis_index,
+        handle.tolerance,
+    )
+    pairs = {
+        0: 6,
+        1: 7,
+        2: 8,
+        3: 6,
+        4: 7,
+        5: 8,
+        6: 0,
+        7: 1,
+        8: 2,
+    }
+    closure, targets, needs_fallback = registry.resolve_primary_closure((FaceId(1),), pairs)
+    assert closure == (FaceId(1), FaceId(2), FaceId(3))
+    assert targets[FaceId(1)] is None
+    assert targets[FaceId(2)] is None
+    assert targets[FaceId(3)] == FaceId(1)
+    assert needs_fallback
+
+
+def _check_partial_face_resolution_counter_and_deepcopy():
+    coords, faces = _phase4_u4_grid()
+    expected = _full_face_results(coords, faces)
+    handle = _face_resolution_handle(coords, faces)
+    assert handle.resolve_faces((2,)) == _restricted_face_results(expected, (2,))
+    assert handle.resolve_count == 0
+    assert handle.partial_face_resolve_count == 1
+    assert handle.resolve_faces((2,)) == _restricted_face_results(expected, (2,))
+    assert handle.partial_face_resolve_count == 1
+
+    cloned = copy.deepcopy(handle)
+    assert cloned == handle
+    assert cloned.resolve_count == handle.resolve_count == 0
+    assert cloned._face_cache == handle._face_cache
+    assert cloned._face_cache is not handle._face_cache
+    assert cloned._face_resolved is not handle._face_resolved
+    assert cloned._face_registry is None
+    cloned.resolve_faces((5,))
+    assert cloned._face_resolved[4]
+    assert not handle._face_resolved[4]
+
+
+def _check_partial_face_resolution_vertex_registry_fallback():
+    coords = numpy.asarray(
+        ((numpy.nan, 0.0, 0.0), (1.0, 0.0, 0.0), (-1.0, 0.0, 0.0)),
+        dtype=numpy.float64,
+    )
+    faces = ((0, 1, 2),)
+    full = _face_resolution_handle(coords, faces)
+    partial = _face_resolution_handle(coords, faces)
+
+    def outcome(call):
+        try:
+            return "ok", call()
+        except Exception as exc:
+            return "error", type(exc)
+
+    expected = outcome(lambda: full.resolve()._mirror_face_ids.get(FaceId(1)))
+    actual = outcome(lambda: partial.resolve_faces((1,)).get(FaceId(1)))
+    assert actual == expected
+    assert partial.resolve_count == 1
+
+
 def run():
     _check_vertex_lookup_equivalence()
     _check_batch_candidate_contract_edges()
@@ -2427,6 +2640,13 @@ def run():
     _check_partial_vertex_resolution_deepcopy_and_full_resolve()
     _check_partial_vertex_resolution_non_power_tolerance_boundary()
     _check_partial_vertex_resolution_registry_fallback_and_empty_guard()
+    _check_face_registry_preserves_global_rows_and_lazy_geometry()
+    _check_partial_face_resolution_duplicate_row_orderings()
+    _check_partial_face_resolution_randomized_sets()
+    _check_partial_face_resolution_fallback_preserves_primary_values()
+    _check_face_primary_conflict_downgrades_every_claimant()
+    _check_partial_face_resolution_counter_and_deepcopy()
+    _check_partial_face_resolution_vertex_registry_fallback()
     _check_lazy_restore_state_matrix()
     _check_prepare_session_invoke_does_not_resolve()
     # Duplicate COMMITTED records and F9 ABSENT are exercised by the existing

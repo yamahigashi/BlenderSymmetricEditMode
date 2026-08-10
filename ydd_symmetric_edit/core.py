@@ -33,6 +33,7 @@ from ._types import (
     VertexSelectionHistory,
 )  # noqa: F401
 from .face_mapping import (
+    FaceRegistry,
     _canonical_carrier_frames,
     _face_key,
     _region_allows_orphan_self_map,
