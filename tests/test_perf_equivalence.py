@@ -1504,6 +1504,35 @@ def _check_rip_lookup_validation():
         bm.free()
 
 
+def _check_rip_resolution_free_lookup_equivalence():
+    """RIP's captured-array lookup stays lazy and bit-identical to the eager path."""
+
+    bm = _build_deformed_grid(4)
+    try:
+        bm.verts.ensure_lookup_table()
+        bm.verts.index_update()
+        for vertex in bm.verts:
+            vertex.select = False
+        for index in (1, 2, 3):
+            bm.verts[index].select = True
+
+        topology = core.prepare_topology(bm, 0, TOLERANCE, mark_vertex_ids=True)
+        resolution = topology.topology_resolution
+        lazy_lookup = resolution.vertex_lookup_unresolved
+        assert resolution.resolve_count == 0
+        lazy_snapshot = rip_module.build_snapshot(bm, 0, TOLERANCE, lookup=lazy_lookup)
+        assert lazy_snapshot is not None
+        assert resolution.resolve_count == 0
+
+        eager_lookup = resolution.vertex_lookup
+        assert resolution.resolve_count == 1
+        eager_snapshot = rip_module.build_snapshot(bm, 0, TOLERANCE, lookup=eager_lookup)
+        assert eager_snapshot is not None
+        assert lazy_snapshot == eager_snapshot
+    finally:
+        bm.free()
+
+
 class _BulkCollection:
     def __init__(self, values, *, by_name=None):
         self._values = values
@@ -3108,6 +3137,79 @@ def _check_prepare_session_invoke_does_not_resolve():
         bm.free()
 
 
+def _check_rip_invoke_does_not_resolve():
+    """RIP invoke builds its snapshot without consuming full topology resolution."""
+
+    bm = _build_deformed_grid(2)
+    try:
+        bm.verts.ensure_lookup_table()
+        bm.verts.index_update()
+        for vertex in bm.verts:
+            vertex.select = False
+        assert abs(float(bm.verts[0].co.x)) > TOLERANCE
+        bm.verts[0].select = True
+        obj = SimpleNamespace(
+            name="rip-object",
+            type="MESH",
+            data=SimpleNamespace(name="rip-mesh"),
+            use_mesh_mirror_x=True,
+            use_mesh_mirror_y=False,
+            use_mesh_mirror_z=False,
+        )
+        context = SimpleNamespace(
+            scene=SimpleNamespace(ydd_symmetric_edit=SimpleNamespace(source_side="NEGATIVE", tolerance=TOLERANCE)),
+            edit_object=obj,
+            window=SimpleNamespace(as_pointer=lambda: 21),
+            area=SimpleNamespace(as_pointer=lambda: 22),
+            region=SimpleNamespace(as_pointer=lambda: 23),
+            tool_settings=SimpleNamespace(
+                mesh_select_mode=(True, False, False),
+                use_proportional_edit=False,
+                use_mesh_automerge=False,
+            ),
+            preferences=SimpleNamespace(edit=SimpleNamespace(undo_steps=8)),
+        )
+        original_prepare = core.prepare_topology
+        original_from_edit = session_module.bmesh.from_edit_mesh
+        original_update = session_module.bmesh.update_edit_mesh
+        original_cleanup = session_module.cleanup_session
+        original_suspend = session_module._suspend_mesh_symmetry
+        original_schedule = watcher_module._schedule_passthrough_watcher
+        prepared = []
+
+        def spy_prepare(*args, **kwargs):
+            kwargs["mesh_object"] = None
+            result = original_prepare(*args, **kwargs)
+            prepared.append(result)
+            return result
+
+        setattr(core, "prepare_topology", spy_prepare)
+        setattr(session_module.bmesh, "from_edit_mesh", lambda _data: bm)
+        setattr(session_module.bmesh, "update_edit_mesh", lambda *_args, **_kwargs: None)
+        setattr(session_module, "cleanup_session", lambda *_args, **_kwargs: None)
+        setattr(session_module, "_suspend_mesh_symmetry", lambda *_args, **_kwargs: None)
+        setattr(watcher_module, "_schedule_passthrough_watcher", lambda *_args, **_kwargs: None)
+        try:
+            assert session_module._prepare_session(context, lambda *_args: None, tool_kind="RIP")
+            assert len(prepared) == 1
+            resolution = prepared[0].topology_resolution
+            assert resolution.resolve_count == 0
+            session = session_module.session_state._SESSIONS[21]
+            assert session.rip is not None
+            assert session.topology_resolution is resolution
+        finally:
+            session_module.session_state._SESSIONS.pop(21, None)
+            operators.clear_history_records()
+            setattr(core, "prepare_topology", original_prepare)
+            setattr(session_module.bmesh, "from_edit_mesh", original_from_edit)
+            setattr(session_module.bmesh, "update_edit_mesh", original_update)
+            setattr(session_module, "cleanup_session", original_cleanup)
+            setattr(session_module, "_suspend_mesh_symmetry", original_suspend)
+            setattr(watcher_module, "_schedule_passthrough_watcher", original_schedule)
+    finally:
+        bm.free()
+
+
 def _face_resolution_handle(coords, faces, tolerance=TOLERANCE):
     coords64 = numpy.asarray(coords, dtype=numpy.float64).reshape((-1, 3))
     loop_totals = numpy.asarray([len(face) for face in faces], dtype=numpy.int64)
@@ -3388,6 +3490,7 @@ def run():
     _check_history_and_single_object_guard()
     _check_multi_object_native_passthrough()
     _check_rip_lookup_validation()
+    _check_rip_resolution_free_lookup_equivalence()
     _check_capture_resolve_contract()
     _check_bulk_edit_mesh_order_variants()
     _check_finish_scope_warning_matrix()
@@ -3417,6 +3520,7 @@ def run():
     _check_u7_unselected_topology_bulk_capture()
     _check_lazy_restore_state_matrix()
     _check_prepare_session_invoke_does_not_resolve()
+    _check_rip_invoke_does_not_resolve()
     # Duplicate COMMITTED records and F9 ABSENT are exercised by the existing
     # GUI-only history and discriminator suites.
     print("YSE_PERF_EQUIV_OK", flush=True)

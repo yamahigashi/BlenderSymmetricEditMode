@@ -530,6 +530,29 @@ class LazyTopologyResolution:
         )
 
     @property
+    def vertex_lookup_unresolved(self) -> VertexMirrorLookup:
+        """Build a RIP lookup from captured arrays without resolving topology.
+
+        The registered-side batch index is materialized here so RIP can time
+        registry construction separately from its selected-region resolution.
+        ``coords64`` is already the exact float64 image consumed by the eager
+        lookup, so no per-coordinate Python tuple conversion is required.
+        """
+
+        selected_indices = (
+            None if self.vertex_select is None else numpy.flatnonzero(self.vertex_select).astype(numpy.int64)
+        )
+        lookup = VertexMirrorLookup(
+            axis_index=self.axis_index,
+            tolerance=self.tolerance,
+            coords=self.coords64,
+            selected_indices=selected_indices,
+        )
+        if len(self.coords64):
+            lookup._registered_batch_index()
+        return lookup
+
+    @property
     def matched_faces(self) -> int:
         return len(self.mirror_face_ids)
 

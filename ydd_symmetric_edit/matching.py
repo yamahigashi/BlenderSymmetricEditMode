@@ -124,7 +124,7 @@ class VertexMirrorLookup:
     """Index of registered coordinates for mirror-plane counterpart lookup.
 
     Built by :func:`build_vertex_mirror_lookup`. KDTree supplies candidates;
-    stored double-precision tuples decide acceptance and ordering.
+    stored double-precision coordinates decide acceptance and ordering.
     """
 
     def __init__(
@@ -132,13 +132,15 @@ class VertexMirrorLookup:
         *,
         axis_index: int,
         tolerance: float,
-        coords: tuple[tuple[float, float, float], ...],
+        coords: Sequence[Sequence[float]] | numpy.ndarray,
         tree: KDTree | None = None,
+        selected_indices: numpy.ndarray | None = None,
     ) -> None:
         self._axis_index = axis_index
         self._tolerance = tolerance
         self._coords = coords
         self._tree = tree
+        self._selected_indices = selected_indices
         self._on_plane_indices: frozenset[int] | None = None
         self._batch_index: dict | Literal[False] | None = None
         self._batch_path_count = 0
@@ -401,7 +403,7 @@ class VertexMirrorLookup:
         cached = self._batch_index
         if cached is not None:
             return cached
-        matrix = numpy.array(self._coords, dtype=numpy.float64).reshape(len(self._coords), 3)
+        matrix = numpy.asarray(self._coords, dtype=numpy.float64).reshape(len(self._coords), 3)
         inverse = 1.0 / max(self._tolerance, 1.0e-12)
         scaled = matrix * inverse
         if not numpy.isfinite(scaled).all() or numpy.any(numpy.abs(scaled) >= 2**62):

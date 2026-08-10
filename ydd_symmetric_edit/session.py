@@ -345,7 +345,7 @@ def _prepare_session(
             bm,
             axis_index,
             settings.tolerance,
-            lookup=topology.vertex_lookup,
+            lookup=topology.topology_resolution.vertex_lookup_unresolved,
         )
         if rip_snapshot is None:
             core.remove_temporary_layers(bm)

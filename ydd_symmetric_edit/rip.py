@@ -98,6 +98,10 @@ def build_snapshot(
     the unique vertex IDs and face IDs already.
     """
 
+    # Snapshot records index into bm.verts; the table must be valid on every
+    # path, including lookup=None where no later guard rebuilds it.
+    bm.verts.ensure_lookup_table()
+
     if lookup is not None and not _lookup_matches_mesh(lookup, bm, axis_index, tolerance):
         lookup = core.build_vertex_mirror_lookup([vertex.co for vertex in bm.verts], axis_index, tolerance)
 
@@ -106,25 +110,69 @@ def build_snapshot(
     if vertex_id_layer is None or face_id_layer is None:
         return None
 
-    region = {}
-    for vertex in bm.verts:
-        if vertex.select and not vertex.hide:
-            region[vertex.index] = vertex
+    if lookup is None:
+        region_vertices = _snapshot_region_vertices(bm, None)
+        if not region_vertices:
+            return None
+        lookup = core.build_vertex_mirror_lookup([vertex.co for vertex in bm.verts], axis_index, tolerance)
+        mirror_indices = lookup.find_all_mirrored([vertex.co for vertex in region_vertices])
+    else:
+        region_vertices, mirror_indices = _resolve_snapshot_region(bm, lookup)
+        if not region_vertices:
+            return None
+
+    return _build_snapshot_records(
+        bm,
+        axis_index,
+        tolerance,
+        vertex_id_layer,
+        face_id_layer,
+        region_vertices,
+        mirror_indices,
+    )
+
+
+def _snapshot_region_vertices(
+    bm: bmesh.types.BMesh,
+    lookup: core.VertexMirrorLookup | None,
+) -> tuple[bmesh.types.BMVert, ...]:
+    """Return selected vertices plus their edge one-ring in legacy order."""
+
+    selected_indices = None if lookup is None else lookup._selected_indices
+    if selected_indices is None:
+        selected = (vertex for vertex in bm.verts if vertex.select and not vertex.hide)
+    else:
+        candidates = (bm.verts[int(index)] for index in selected_indices.tolist())
+        selected = (vertex for vertex in candidates if vertex.select and not vertex.hide)
+    region = {vertex.index: vertex for vertex in selected}
     for vertex in tuple(region.values()):
         for edge in vertex.link_edges:
             other = edge.other_vert(vertex)
             region.setdefault(other.index, other)
-    if not region:
-        return None
+    return tuple(region.values())
 
-    if lookup is None:
-        lookup = core.build_vertex_mirror_lookup([vertex.co for vertex in bm.verts], axis_index, tolerance)
-    ids_by_index = [int(vertex[vertex_id_layer]) for vertex in bm.verts]
 
-    # Injective batch resolution: no two region vertices can claim the same
-    # mirrored counterpart.
-    region_vertices = tuple(region.values())
+def _resolve_snapshot_region(
+    bm: bmesh.types.BMesh,
+    lookup: core.VertexMirrorLookup,
+) -> tuple[tuple[bmesh.types.BMVert, ...], tuple[int | None, ...]]:
+    """Resolve only the selected RIP region and its edge one-ring."""
+
+    region_vertices = _snapshot_region_vertices(bm, lookup)
     mirror_indices = lookup.find_all_mirrored([vertex.co for vertex in region_vertices])
+    return region_vertices, mirror_indices
+
+
+def _build_snapshot_records(
+    bm: bmesh.types.BMesh,
+    axis_index: int,
+    tolerance: float,
+    vertex_id_layer,
+    face_id_layer,
+    region_vertices: tuple[bmesh.types.BMVert, ...],
+    mirror_indices: tuple[int | None, ...],
+) -> RipSnapshot:
+    """Build the immutable RIP snapshot from an already-resolved region."""
 
     records = []
     for vertex, mirror_index in zip(region_vertices, mirror_indices, strict=True):
@@ -136,7 +184,7 @@ def build_snapshot(
                     y=float(vertex.co[1]),
                     z=float(vertex.co[2]),
                 ),
-                mirror_vertex_id=None if mirror_index is None else ids_by_index[mirror_index],
+                mirror_vertex_id=(None if mirror_index is None else int(bm.verts[int(mirror_index)][vertex_id_layer])),
                 face_ids=tuple(sorted(int(face[face_id_layer]) for face in vertex.link_faces)),
                 selected=bool(vertex.select),
             )
@@ -167,8 +215,8 @@ def _lookup_matches_mesh(
         first = bm.verts[0].co
         last = bm.verts[len(bm.verts) - 1].co
         return (
-            lookup._coords[0] == core._coordinate_3d(first).as_tuple()
-            and lookup._coords[-1] == core._coordinate_3d(last).as_tuple()
+            tuple(float(value) for value in lookup._coords[0]) == core._coordinate_3d(first).as_tuple()
+            and tuple(float(value) for value in lookup._coords[-1]) == core._coordinate_3d(last).as_tuple()
         )
     except (ReferenceError, RuntimeError, IndexError):
         return False
