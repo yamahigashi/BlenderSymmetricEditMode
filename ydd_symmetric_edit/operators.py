@@ -1,12 +1,7 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
-
+# ruff: noqa: F401
 from __future__ import annotations
 
-import copy
-import time
 import traceback
-from collections import OrderedDict
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 import bmesh
@@ -14,7 +9,7 @@ import bpy
 from bpy.app.handlers import persistent
 from bpy.props import StringProperty
 
-from . import backup, core, rip
+from . import backup, core, rip, session_state
 from ._types import (
     Coordinate3D,
     FaceId,
@@ -31,311 +26,81 @@ from ._types import (
     ViewState,
     WindowContext,
 )
+from .history import (
+    _cleanup_object_temporary_layers,
+    _history_marker_objects,
+    _object_has_temporary_layers,
+    _object_history_tokens,
+    _prepare_adjust_last_operation_repeat,
+    _queue_history_repair,
+    _read_history_tokens,
+    _remember_history_session,
+    _repair_history_state,
+    _restore_session_face_maps,
+    clear_history_records,
+    register_history_handlers,
+    repair_after_redo,
+    repair_after_undo,
+    unregister_history_handlers,
+)  # noqa: F401
+from .session import (
+    _PASSTHROUGH_HANDOFF_GRACE,
+    _PASSTHROUGH_STABLE_TICKS,
+    _WM_OPERATOR_TO_TOOL,
+    MODAL_IDENTIFIER_TOKENS,
+    TOOL_LABELS,
+    TOOL_PROFILES,
+    SymmetricKnifeError,
+    ToolProfile,
+    _apply_view_state,
+    _capture_view_state,
+    _cleanup_object_layers,
+    _cleanup_repair_session,
+    _find_saved_view,
+    _find_window,
+    _prepare_session,
+    _restore_mesh_symmetry,
+    _single_edit_mesh_poll,
+    _suspend_mesh_symmetry,
+    _teardown_session_state,
+    _window_key,
+    cleanup_all_sessions,
+    cleanup_session,
+)  # noqa: F401
+from .watcher import (
+    _capture_native_result_options,
+    _capture_projection_view,
+    _modal_operator_identifiers,
+    _native_tool_is_active,
+    _schedule_passthrough_watcher,
+    _session_has_new_path,
+    _session_new_path_signature,
+    _watch_passthrough_session,
+)  # noqa: F401
 
-
-@dataclass(frozen=True)
-class ToolProfile:
-    kind: str
-    label: str
-    wm_operator_names: tuple[str, ...]
-    primary_wm_operator: str
-    tool_idnames: tuple[str, ...]
-    keymap_operator: str
-    passthrough_handoff_grace: float
-    passthrough_stable_ticks: int
-    supports_nested_offset: bool
-    # Adjust Last Operation re-executes the native operator via exec.  Rip's
-    # macro cannot repeat (MESH_OT_rip has no exec), so only tools whose
-    # native repeat is sound take part in the F9 baseline flow.
-    supports_adjust_repeat: bool
-
-
-TOOL_PROFILES: dict[str, ToolProfile] = {
-    "KNIFE": ToolProfile(
-        kind="KNIFE",
-        label="Knife",
-        wm_operator_names=("KNIFE_TOOL",),
-        primary_wm_operator="MESH_OT_KNIFE_TOOL",
-        tool_idnames=("3D View Tool: Edit Mesh, Knife",),
-        keymap_operator="mesh.knife_tool",
-        passthrough_handoff_grace=0.01,
-        passthrough_stable_ticks=2,
-        supports_nested_offset=False,
-        supports_adjust_repeat=False,
-    ),
-    "LOOP_CUT": ToolProfile(
-        kind="LOOP_CUT",
-        label="Loop Cut",
-        wm_operator_names=("LOOPCUT_SLIDE", "MESH_OT_LOOPCUT", "EDGE_SLIDE"),
-        primary_wm_operator="MESH_OT_LOOPCUT_SLIDE",
-        tool_idnames=("3D View Tool: Edit Mesh, Loop Cut",),
-        keymap_operator="mesh.loopcut_slide",
-        passthrough_handoff_grace=0.04,
-        passthrough_stable_ticks=3,
-        supports_nested_offset=False,
-        supports_adjust_repeat=True,
-    ),
-    "OFFSET_LOOP_CUT": ToolProfile(
-        kind="OFFSET_LOOP_CUT",
-        label="Offset Edge Loop Cut",
-        wm_operator_names=("OFFSET_EDGE_LOOPS_SLIDE", "MESH_OT_OFFSET_EDGE_LOOPS", "EDGE_SLIDE"),
-        primary_wm_operator="MESH_OT_OFFSET_EDGE_LOOPS_SLIDE",
-        tool_idnames=("3D View Tool: Edit Mesh, Offset Edge Loop Cut",),
-        keymap_operator="mesh.offset_edge_loops_slide",
-        passthrough_handoff_grace=0.04,
-        passthrough_stable_ticks=3,
-        supports_nested_offset=True,
-        supports_adjust_repeat=True,
-    ),
-    "RIP": ToolProfile(
-        kind="RIP",
-        label="Rip",
-        wm_operator_names=("RIP_MOVE",),
-        primary_wm_operator="MESH_OT_RIP_MOVE",
-        tool_idnames=(),
-        keymap_operator="mesh.rip_move",
-        passthrough_handoff_grace=0.04,
-        passthrough_stable_ticks=3,
-        supports_nested_offset=False,
-        supports_adjust_repeat=False,
-    ),
+_SESSION_STATE_EXPORTS = {
+    "_FINISH_REPORTS",
+    "_HISTORY_RECORDS",
+    "_HISTORY_REPAIR_BUSY",
+    "_HISTORY_REPAIR_QUEUED",
+    "_HISTORY_SEQUENCE",
+    "_MAX_HISTORY_RECORDS",
+    "_NEXT_HISTORY_TOKEN",
+    "_PASSTHROUGH_POLL_INTERVAL",
+    "_PASSTHROUGH_START_GRACE",
+    "_SESSIONS",
+    "_new_history_token",
 }
 
-# Public compatibility views retained for existing imports.
-TOOL_LABELS = {profile.kind: profile.label for profile in TOOL_PROFILES.values()}
-MODAL_IDENTIFIER_TOKENS = {profile.kind: profile.wm_operator_names for profile in TOOL_PROFILES.values()}
-_PASSTHROUGH_HANDOFF_GRACE = {profile.kind: profile.passthrough_handoff_grace for profile in TOOL_PROFILES.values()}
-_PASSTHROUGH_STABLE_TICKS = {profile.kind: profile.passthrough_stable_ticks for profile in TOOL_PROFILES.values()}
-_WM_OPERATOR_TO_TOOL = {
-    profile.primary_wm_operator: profile.kind for profile in TOOL_PROFILES.values() if profile.supports_adjust_repeat
-}
 
-_SESSIONS: dict[int, KnifeSession] = {}
-_HISTORY_RECORDS: OrderedDict[int, HistoryRecord] = OrderedDict()
-_NEXT_HISTORY_TOKEN = max(1, int(time.time_ns() & 0x7FFFFFFF))
-_HISTORY_REPAIR_QUEUED = False
-_HISTORY_REPAIR_BUSY = False
-_MAX_HISTORY_RECORDS = 256
-_HISTORY_SEQUENCE = 0
-# Last WARNING/INFO/ERROR messages recorded via _finish_report (tests inspect;
-# Operator.report is C-bound and not patchable). Instrumentation is intentional
-# and limited to the two call sites that tests assert on today: session-lost
-# ERROR at finish entry, and the post-native decline/fatal classification
-# (mirror-failure WARNING/ERROR after rollback). Other success INFO/WARNING
-# paths still use Operator.report directly.
-_FINISH_REPORTS: list[tuple[str, str]] = []
-
-_PASSTHROUGH_POLL_INTERVAL = 0.01
-_PASSTHROUGH_START_GRACE = 0.75
+def __getattr__(name: str):
+    if name in _SESSION_STATE_EXPORTS:
+        return getattr(session_state, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-class SymmetricKnifeError(RuntimeError):
-    """Expected validation or Blender-context failure shown in the UI."""
-
-
-def _window_key(context: WindowContext) -> int:
-    return context.window.as_pointer() if context.window is not None else 0
-
-
-def _new_history_token() -> int:
-    global _NEXT_HISTORY_TOKEN
-
-    while True:
-        token = _NEXT_HISTORY_TOKEN
-        _NEXT_HISTORY_TOKEN = (_NEXT_HISTORY_TOKEN + 1) & 0x7FFFFFFF
-        if _NEXT_HISTORY_TOKEN == 0:
-            _NEXT_HISTORY_TOKEN = 1
-        if token and token not in _HISTORY_RECORDS:
-            return token
-
-
-def _remember_history_session(session: KnifeSession, context) -> None:
-    global _HISTORY_SEQUENCE
-
-    _HISTORY_SEQUENCE += 1
-    history_session = copy.copy(session)
-    # Native Offset temporarily suspends Mesh Symmetry only while its Edge
-    # Slide is live.  A later Undo/Redo repair must never rewrite user settings.
-    history_session.symmetry_suspended = False
-    _HISTORY_RECORDS[session.history_token] = HistoryRecord(
-        session=history_session,
-        sequence=_HISTORY_SEQUENCE,
-    )
-    _HISTORY_RECORDS.move_to_end(session.history_token)
-    configured_limit = int(getattr(context.preferences.edit, "undo_steps", 32)) + 4
-    history_limit = min(_MAX_HISTORY_RECORDS, max(8, configured_limit))
-    while len(_HISTORY_RECORDS) > history_limit:
-        _HISTORY_RECORDS.popitem(last=False)
-
-
-def clear_history_records() -> None:
-    _HISTORY_RECORDS.clear()
-
-
-def _find_window(pointer: int):
-    window_manager = bpy.context.window_manager
-    if window_manager is None:
-        return None
-    return next(
-        (window for window in window_manager.windows if window.as_pointer() == pointer),
-        None,
-    )
-
-
-def _find_saved_view(session: KnifeSession):
-    window = _find_window(session.window_pointer)
-    area = (
-        next(
-            (candidate for candidate in window.screen.areas if candidate.as_pointer() == session.area_pointer),
-            None,
-        )
-        if window is not None
-        else None
-    )
-    if area is None and window is not None:
-        area = next(
-            (candidate for candidate in window.screen.areas if candidate.type == "VIEW_3D"),
-            None,
-        )
-    region = (
-        next(
-            (candidate for candidate in area.regions if candidate.as_pointer() == session.region_pointer),
-            None,
-        )
-        if area is not None
-        else None
-    )
-    if region is None and area is not None:
-        region = next(
-            (candidate for candidate in area.regions if candidate.type == "WINDOW"),
-            None,
-        )
-    return window, area, region
-
-
-def _capture_view_state(area) -> ViewState | None:
-    if area is None or area.type != "VIEW_3D":
-        return None
-    region_3d = area.spaces.active.region_3d
-    return ViewState(
-        view_rotation=region_3d.view_rotation.copy(),
-        view_location=region_3d.view_location.copy(),
-        view_distance=float(region_3d.view_distance),
-        view_perspective=region_3d.view_perspective,
-        view_camera_offset=tuple(region_3d.view_camera_offset),
-        view_camera_zoom=float(region_3d.view_camera_zoom),
-    )
-
-
-def _apply_view_state(area, state: ViewState) -> None:
-    region_3d = area.spaces.active.region_3d
-    region_3d.view_rotation = state.view_rotation
-    region_3d.view_location = state.view_location
-    region_3d.view_distance = state.view_distance
-    region_3d.view_perspective = state.view_perspective
-    region_3d.view_camera_offset = state.view_camera_offset
-    region_3d.view_camera_zoom = state.view_camera_zoom
-    region_3d.update()
-
-
-def _cleanup_object_layers(session: KnifeSession) -> None:
-    obj = bpy.data.objects.get(session.object_name)
-    if obj is None or obj.type != "MESH" or obj.data.name != session.mesh_name:
-        return
-    try:
-        if obj.mode == "EDIT":
-            bm = bmesh.from_edit_mesh(obj.data)
-            if core.remove_temporary_layers(bm):
-                bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
-        else:
-            core.remove_temporary_mesh_attributes(obj.data)
-    except (ReferenceError, RuntimeError):
-        # The object may be in the middle of an Undo or mode transition.  Stale
-        # layers are also removed before the next session and before saving.
-        pass
-
-
-def _restore_mesh_symmetry(session: KnifeSession) -> None:
-    """Restore axes temporarily suspended for native Offset Edge Slide."""
-
-    if not session.symmetry_suspended:
-        return
-    try:
-        obj = bpy.data.objects.get(session.object_name)
-        if obj is not None and obj.type == "MESH" and obj.data.name == session.mesh_name:
-            for attribute, enabled in zip(
-                ("use_mesh_mirror_x", "use_mesh_mirror_y", "use_mesh_mirror_z"),
-                session.symmetry_flags.as_tuple(),
-                strict=True,
-            ):
-                setattr(obj, attribute, enabled)
-    except (ReferenceError, RuntimeError):
-        # Teardown also runs mid-Undo and during mode transitions; the flag
-        # write must never abort the remaining layer and record cleanup.
-        pass
-    session.symmetry_suspended = False
-
-
-def _suspend_mesh_symmetry(session: KnifeSession, obj) -> None:
-    """Prevent Offset's built-in Edge Slide from moving the target half."""
-
-    profile = TOOL_PROFILES.get(session.tool_kind)
-    if profile is None or not profile.supports_nested_offset:
-        return
-    session.symmetry_suspended = True
-    for attribute in (
-        "use_mesh_mirror_x",
-        "use_mesh_mirror_y",
-        "use_mesh_mirror_z",
-    ):
-        setattr(obj, attribute, False)
-    view_layer = bpy.context.view_layer
-    if view_layer is not None:
-        view_layer.update()
-
-
-def _teardown_session_state(
-    session: KnifeSession,
-    *,
-    keep_history_record: bool,
-) -> None:
-    """Release resources owned by a live or detached session snapshot."""
-
-    _restore_mesh_symmetry(session)
-    _cleanup_object_layers(session)
-    if session.history_token and not keep_history_record:
-        _HISTORY_RECORDS.pop(session.history_token, None)
-
-
-def cleanup_session(
-    window_pointer: int,
-    *,
-    keep_history_record: bool = False,
-) -> None:
-    session = _SESSIONS.pop(window_pointer, None)
-    if session is not None:
-        _teardown_session_state(
-            session,
-            keep_history_record=keep_history_record,
-        )
-
-
-def _cleanup_repair_session(session: KnifeSession) -> None:
-    """Tear down a history-repair session whether or not finish detached it."""
-
-    active = _SESSIONS.get(session.window_pointer)
-    if active is not None and active.history_token == session.history_token:
-        cleanup_session(
-            session.window_pointer,
-            keep_history_record=True,
-        )
-        return
-    _teardown_session_state(session, keep_history_record=True)
-
-
-def cleanup_all_sessions() -> None:
-    for window_pointer in tuple(_SESSIONS):
-        cleanup_session(window_pointer)
+def __dir__():
+    return sorted(set(globals()) | _SESSION_STATE_EXPORTS)
 
 
 @persistent
@@ -354,143 +119,6 @@ def cleanup_stale_attributes(_dummy=None) -> None:
 def cleanup_after_load(_dummy=None) -> None:
     clear_history_records()
     cleanup_stale_attributes()
-
-
-def _modal_operator_identifiers(window) -> set[str]:
-    identifiers = set()
-    for operator in window.modal_operators:
-        for identifier in (
-            getattr(getattr(operator, "bl_rna", None), "identifier", ""),
-            getattr(operator, "bl_idname", ""),
-        ):
-            if identifier:
-                identifiers.add(identifier.upper())
-    return identifiers
-
-
-def _native_tool_is_active(window, tool_kind: str) -> bool:
-    tokens = MODAL_IDENTIFIER_TOKENS.get(tool_kind, ())
-    return any(token in identifier for identifier in _modal_operator_identifiers(window) for token in tokens)
-
-
-def _single_edit_mesh_poll(context) -> bool:
-    obj = context.edit_object
-    if context.area is None or context.area.type != "VIEW_3D":
-        return False
-    if context.region is None or context.region.type != "WINDOW":
-        return False
-    if context.mode != "EDIT_MESH" or obj is None or obj.type != "MESH":
-        return False
-    return len(context.objects_in_mode_unique_data) == 1
-
-
-def _prepare_session(
-    context,
-    report,
-    *,
-    tool_kind: str = "KNIFE",
-) -> bool:
-    if tool_kind not in TOOL_LABELS:
-        raise ValueError(f"Unsupported native tool kind: {tool_kind!r}")
-    settings = context.scene.ydd_symmetric_edit
-    obj = context.edit_object
-    window_pointer = _window_key(context)
-
-    conflicting_session = next(
-        (
-            session
-            for pointer, session in _SESSIONS.items()
-            if pointer != window_pointer and session.mesh_name == obj.data.name
-        ),
-        None,
-    )
-    if conflicting_session is not None:
-        return False
-
-    # A previous cancelled run is harmless, but clean it before reusing the
-    # fixed temporary layer names.
-    cleanup_session(window_pointer)
-    bm = bmesh.from_edit_mesh(obj.data)
-    core.remove_temporary_layers(bm)
-
-    enabled_axes = core.enabled_mesh_symmetry_axes(obj)
-    if len(enabled_axes) != 1:
-        core.remove_temporary_layers(bm)
-        bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
-        return False
-
-    _axis_name, axis_index = enabled_axes[0]
-    if tool_kind == "RIP":
-        guard = rip.prepare_guard_reason(context, bm, axis_index, settings.tolerance)
-        if guard is not None:
-            level, reason = guard
-            bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
-            if level == "WARNING":
-                report({"WARNING"}, f"Rip is not mirrored: {reason}")
-            return False
-
-    history_token = _new_history_token()
-    topology = core.prepare_topology(
-        bm,
-        axis_index,
-        settings.tolerance,
-        history_token,
-        mark_vertex_ids=tool_kind == "RIP",
-        mesh_object=obj,
-    )
-
-    rip_snapshot = None
-    if tool_kind == "RIP":
-        # The bulk capture no longer refreshes BMesh indices, but the rip
-        # snapshot keys its region and one-ring by vertex.index.
-        bm.verts.ensure_lookup_table()
-        bm.verts.index_update()
-        rip_snapshot = rip.build_snapshot(
-            bm,
-            axis_index,
-            settings.tolerance,
-            lookup=topology.vertex_lookup,
-        )
-        if rip_snapshot is None:
-            core.remove_temporary_layers(bm)
-            bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
-            return False
-
-    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
-    session = KnifeSession(
-        window_pointer=window_pointer,
-        area_pointer=context.area.as_pointer(),
-        region_pointer=context.region.as_pointer(),
-        object_name=obj.name,
-        mesh_name=obj.data.name,
-        axis_index=axis_index,
-        source_side=settings.source_side,
-        tolerance=settings.tolerance,
-        mirror_face_ids={},
-        hidden_by_face_id=topology.hidden_by_face_id,
-        carrier_frames={},
-        mesh_select_mode=MeshSelectionMode(
-            vertices=bool(context.tool_settings.mesh_select_mode[0]),
-            edges=bool(context.tool_settings.mesh_select_mode[1]),
-            faces=bool(context.tool_settings.mesh_select_mode[2]),
-        ),
-        started_at=time.monotonic(),
-        tool_kind=tool_kind,
-        history_token=history_token,
-        symmetry_flags=SymmetryAxes(
-            x=bool(obj.use_mesh_mirror_x),
-            y=bool(obj.use_mesh_mirror_y),
-            z=bool(obj.use_mesh_mirror_z),
-        ),
-        rip=rip_snapshot,
-        topology_resolution=topology.topology_resolution,
-    )
-    _SESSIONS[window_pointer] = session
-    _suspend_mesh_symmetry(session, obj)
-    _remember_history_session(session, context)
-    _schedule_passthrough_watcher(window_pointer, history_token)
-
-    return True
 
 
 class MESH_OT_ydd_symmetric_edit_intercept(bpy.types.Operator):
@@ -647,7 +275,7 @@ def _finish_report(operator, level: set[str], message: str) -> None:
     """Report and record for tests (``Operator.report`` itself is not patchable)."""
 
     kind = "WARNING" if "WARNING" in level else "ERROR" if "ERROR" in level else "INFO"
-    _FINISH_REPORTS.append((kind, message))
+    session_state._FINISH_REPORTS.append((kind, message))
     operator.report(level, message)
 
 
@@ -682,9 +310,9 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
         return _single_edit_mesh_poll(context)
 
     def execute(self, context):
-        _FINISH_REPORTS.clear()
+        session_state._FINISH_REPORTS.clear()
         window_pointer = _window_key(context)
-        session = _SESSIONS.get(window_pointer)
+        session = session_state._SESSIONS.get(window_pointer)
         if session is None:
             _finish_report(self, {"ERROR"}, "ydd Symmetric Edit session data was lost")
             return {"CANCELLED"}
@@ -714,7 +342,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                 resolution.materialize(bm)
             except Exception as exc:
                 traceback.print_exc()
-                record = _HISTORY_RECORDS.get(session.history_token)
+                record = session_state._HISTORY_RECORDS.get(session.history_token)
                 if record is not None:
                     record.status = "FAILED"
                 cleanup_session(window_pointer, keep_history_record=True)
@@ -1394,560 +1022,9 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
         return result
 
 
-def _session_new_path_signature(session: KnifeSession) -> PathSignature | RipSignature | None:
-    """Return a stable signature for topology created by the native tool."""
-
-    obj = bpy.data.objects.get(session.object_name)
-    if obj is None or obj.type != "MESH" or obj.data.name != session.mesh_name:
-        return None
-    try:
-        if obj.mode == "EDIT":
-            bm = bmesh.from_edit_mesh(obj.data)
-            if session.tool_kind == "RIP":
-                return rip.rip_result_signature(bm)
-            marker_layer = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
-            if marker_layer is None:
-                return None
-            path = []
-            for edge in bm.edges:
-                if int(edge[marker_layer]) > 0:
-                    continue
-                endpoints = sorted(
-                    Coordinate3D(
-                        x=round(float(vertex.co[0]), 9),
-                        y=round(float(vertex.co[1]), 9),
-                        z=round(float(vertex.co[2]), 9),
-                    )
-                    for vertex in edge.verts
-                )
-                path.append(
-                    PathEdgeSignature(
-                        first=endpoints[0],
-                        second=endpoints[1],
-                    )
-                )
-            return tuple(sorted(path)) if path else None
-    except (ReferenceError, RuntimeError):
-        return None
-    return None
-
-
-def _session_has_new_path(session: KnifeSession) -> bool:
-    """Return as soon as one edge created by the native tool is found."""
-
-    obj = bpy.data.objects.get(session.object_name)
-    if obj is None or obj.type != "MESH" or obj.data.name != session.mesh_name:
-        return False
-    try:
-        if obj.mode == "EDIT":
-            bm = bmesh.from_edit_mesh(obj.data)
-            if session.tool_kind == "RIP":
-                return rip.has_rip_result(bm)
-            marker_layer = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
-            if marker_layer is None:
-                return False
-            return any(int(edge[marker_layer]) <= 0 for edge in bm.edges)
-    except (ReferenceError, RuntimeError):
-        return False
-    return False
-
-
-def _capture_projection_view(session: KnifeSession) -> None:
-    _window, area, _region = _find_saved_view(session)
-    state = _capture_view_state(area)
-    if state is None:
-        return
-    session.projection_view = state
-    record = _HISTORY_RECORDS.get(session.history_token)
-    if record is not None:
-        record.session.projection_view = copy.deepcopy(state)
-
-
-def _capture_native_result_options(session: KnifeSession, context) -> None:
-    """Retain native macro options needed by a topology-only fallback."""
-
-    profile = TOOL_PROFILES.get(session.tool_kind)
-    expected_identifier = profile.primary_wm_operator if profile is not None else ""
-    operator = context.active_operator
-    if operator is None or getattr(operator, "bl_idname", "").upper() != (expected_identifier):
-        operator = next(
-            (
-                candidate
-                for candidate in reversed(context.window_manager.operators)
-                if getattr(candidate, "bl_idname", "").upper() == expected_identifier
-            ),
-            None,
-        )
-    if operator is not None:
-        session.native_operator_pointer = int(operator.as_pointer())
-    record = _HISTORY_RECORDS.get(session.history_token)
-    if record is not None:
-        record.session.native_operator_pointer = session.native_operator_pointer
-
-    if profile is None or not profile.supports_nested_offset:
-        return
-    nested = getattr(operator, "MESH_OT_offset_edge_loops", None)
-    if nested is not None:
-        session.offset_use_cap_endpoint = bool(getattr(nested, "use_cap_endpoint", False))
-    if record is not None:
-        record.session.offset_use_cap_endpoint = session.offset_use_cap_endpoint
-
-
 def _invoke_finish_operator() -> set[str]:
     finish_operator = getattr(bpy.ops.mesh, "ydd_symmetric_edit_finish")
     return cast(set[str], finish_operator("EXEC_DEFAULT"))
-
-
-def _watch_passthrough_session(window_pointer: int, history_token: int):
-    session = _SESSIONS.get(window_pointer)
-    if session is None or session.history_token != history_token:
-        return None
-
-    window = _find_window(window_pointer)
-    if window is None:
-        cleanup_session(window_pointer)
-        return None
-
-    if _native_tool_is_active(window, session.tool_kind):
-        session.saw_modal = True
-        session.modal_absent_since = None
-        session.path_signature = None
-        session.stable_path_ticks = 0
-        return _PASSTHROUGH_POLL_INTERVAL
-
-    now = time.monotonic()
-    if not session.saw_modal and not _session_has_new_path(session):
-        if now - session.started_at < _PASSTHROUGH_START_GRACE:
-            return _PASSTHROUGH_POLL_INTERVAL
-        cleanup_session(window_pointer)
-        return None
-
-    # Loop Cut and Offset are native macros.  Their topology child and Edge
-    # Slide child can leave a brief interval with no relevant modal operator.
-    # Require both a quiet interval and an unchanged result before postprocess.
-    path_signature = _session_new_path_signature(session)
-    if session.modal_absent_since is None:
-        session.modal_absent_since = now
-        session.path_signature = path_signature
-        session.stable_path_ticks = 1
-        return _PASSTHROUGH_POLL_INTERVAL
-    if path_signature == session.path_signature:
-        session.stable_path_ticks += 1
-    else:
-        session.modal_absent_since = now
-        session.path_signature = path_signature
-        session.stable_path_ticks = 1
-    handoff_grace = _PASSTHROUGH_HANDOFF_GRACE.get(session.tool_kind, 0.04)
-    stable_ticks = _PASSTHROUGH_STABLE_TICKS.get(session.tool_kind, 3)
-    if now - session.modal_absent_since < handoff_grace or session.stable_path_ticks < stable_ticks:
-        return _PASSTHROUGH_POLL_INTERVAL
-
-    if path_signature is None:
-        # Knife/Loop Cut cancellation and confirmed no-ops leave no topology.
-        cleanup_session(window_pointer)
-        return None
-
-    record = _HISTORY_RECORDS.get(history_token)
-    _capture_projection_view(session)
-    window, area, region = _find_saved_view(session)
-    if window is None or area is None or region is None:
-        if record is not None:
-            record.status = "FAILED"
-        cleanup_session(window_pointer, keep_history_record=True)
-        return None
-
-    try:
-        with bpy.context.temp_override(window=window, area=area, region=region):
-            _capture_native_result_options(session, bpy.context)
-            result = _invoke_finish_operator()
-    except Exception:
-        traceback.print_exc()
-        result = {"CANCELLED"}
-        cleanup_session(window_pointer, keep_history_record=True)
-
-    if record is not None:
-        record.status = "COMMITTED" if "FINISHED" in result else "FAILED"
-    return None
-
-
-def _schedule_passthrough_watcher(
-    window_pointer: int,
-    history_token: int,
-) -> None:
-    def callback():
-        return _watch_passthrough_session(window_pointer, history_token)
-
-    bpy.app.timers.register(callback, first_interval=0.02)
-
-
-def _read_history_tokens(obj) -> set[int]:
-    """Read raw history tokens; read failures propagate to the caller."""
-
-    if obj.type != "MESH":
-        return set()
-    if obj.mode == "EDIT":
-        bm = bmesh.from_edit_mesh(obj.data)
-        layer = bm.faces.layers.int.get(core.HISTORY_TOKEN_LAYER)
-        if layer is None:
-            return set()
-        return {int(face[layer]) for face in bm.faces if int(face[layer])}
-    attribute = obj.data.attributes.get(core.HISTORY_TOKEN_LAYER)
-    if attribute is None:
-        return set()
-    return {int(item.value) for item in attribute.data if int(item.value)}
-
-
-def _object_history_tokens(obj) -> set[int]:
-    try:
-        return _read_history_tokens(obj)
-    except (AttributeError, ReferenceError, RuntimeError):
-        return set()
-
-
-def _object_has_temporary_layers(obj) -> bool:
-    if obj.type != "MESH":
-        return False
-    try:
-        if obj.mode == "EDIT":
-            bm = bmesh.from_edit_mesh(obj.data)
-            return any(
-                layers.get(name) is not None
-                for layers, name in (
-                    (bm.edges.layers.int, core.EDGE_ORIGINAL_LAYER),
-                    (bm.faces.layers.int, core.FACE_ID_LAYER),
-                    (bm.faces.layers.int, core.HISTORY_TOKEN_LAYER),
-                )
-            )
-        return any(obj.data.attributes.get(name) is not None for name in core.TEMP_LAYER_NAMES)
-    except (ReferenceError, RuntimeError):
-        return False
-
-
-def _restore_session_face_maps(session: KnifeSession, obj) -> bool:
-    if obj.mode != "EDIT":
-        return False
-    try:
-        bm = bmesh.from_edit_mesh(obj.data)
-        face_id_layer = bm.faces.layers.int.get(core.FACE_ID_LAYER)
-        mirror_id_layer = bm.faces.layers.int.get(core.FACE_MIRROR_ID_LAYER)
-        hidden_layer = bm.faces.layers.int.get(core.FACE_HIDDEN_LAYER)
-        history_layer = bm.faces.layers.int.get(core.HISTORY_TOKEN_LAYER)
-        if face_id_layer is None:
-            return False
-
-        mirror_face_ids: MirrorFaceMap = {}
-        hidden_by_face_id: HiddenFaceMap = {}
-        face_ids_valid = True
-        mirror_values_complete = mirror_id_layer is not None
-        mirror_values_consistent = True
-        for face in bm.faces:
-            face_id = FaceId(int(face[face_id_layer]))
-            if face_id <= 0:
-                face_ids_valid = False
-                continue
-            raw_mirror_id = int(face[mirror_id_layer]) if mirror_id_layer is not None else 0
-            if raw_mirror_id > 0:
-                mirror_id = FaceId(raw_mirror_id)
-                previous = mirror_face_ids.setdefault(face_id, mirror_id)
-                if previous != mirror_id:
-                    mirror_values_consistent = False
-            else:
-                mirror_values_complete = False
-            hidden_by_face_id.setdefault(face_id, bool(face[hidden_layer]) if hidden_layer is not None else False)
-        face_id_domain = set(hidden_by_face_id)
-        layer_complete = (
-            face_ids_valid
-            and mirror_values_complete
-            and mirror_values_consistent
-            and bool(face_id_domain)
-            and set(mirror_face_ids) == face_id_domain
-            and set(mirror_face_ids.values()).issubset(face_id_domain)
-            and len(mirror_face_ids) == len(set(mirror_face_ids.values()))
-        )
-        resolution = session.topology_resolution
-        if resolution is not None:
-            tokens = (
-                {int(face[history_layer]) for face in bm.faces if int(face[face_id_layer]) > 0}
-                if history_layer is not None
-                else set()
-            )
-            token_matches = resolution.history_token == session.history_token and session.history_token in tokens
-            handle_domain_matches = face_ids_valid and face_id_domain == set(range(1, resolution.face_count + 1))
-            if token_matches and handle_domain_matches:
-                expected = resolution.resolve().mirror_face_ids
-                session.mirror_face_ids = expected
-                session.carrier_frames = resolution.carrier_frames
-                resolution.materialize(bm)
-            elif layer_complete:
-                session.mirror_face_ids = mirror_face_ids
-            else:
-                return False
-        elif layer_complete:
-            session.mirror_face_ids = mirror_face_ids
-        else:
-            return False
-        session.hidden_by_face_id = hidden_by_face_id
-        return bool(session.mirror_face_ids)
-    except (ReferenceError, RuntimeError):
-        return False
-
-
-def _cleanup_object_temporary_layers(obj) -> None:
-    try:
-        if obj.mode == "EDIT":
-            bm = bmesh.from_edit_mesh(obj.data)
-            if core.remove_temporary_layers(bm):
-                bmesh.update_edit_mesh(
-                    obj.data,
-                    loop_triangles=False,
-                    destructive=False,
-                )
-        else:
-            core.remove_temporary_mesh_attributes(obj.data)
-    except (ReferenceError, RuntimeError):
-        pass
-
-
-def _history_marker_objects():
-    result = []
-    seen_meshes = set()
-    for obj in bpy.data.objects:
-        if obj.type != "MESH":
-            continue
-        mesh = cast(bpy.types.Mesh, obj.data)
-        if mesh.as_pointer() in seen_meshes:
-            continue
-        if not _object_has_temporary_layers(obj):
-            continue
-        seen_meshes.add(mesh.as_pointer())
-        result.append((obj, _object_history_tokens(obj)))
-    return result
-
-
-def _repair_history_state():
-    global _HISTORY_REPAIR_BUSY, _HISTORY_REPAIR_QUEUED
-
-    _HISTORY_REPAIR_QUEUED = False
-    if _HISTORY_REPAIR_BUSY:
-        return None
-
-    marker_objects = _history_marker_objects()
-    if not marker_objects:
-        return None
-
-    live_tokens = {session.history_token for session in _SESSIONS.values() if session.history_token}
-    live_mesh_names = {session.mesh_name for session in _SESSIONS.values()}
-    repairable_marker_objects = [
-        (obj, tokens)
-        for obj, tokens in marker_objects
-        if not tokens.intersection(live_tokens) and obj.data.name not in live_mesh_names
-    ]
-    if not repairable_marker_objects:
-        return None
-
-    candidates = []
-    for obj, tokens in repairable_marker_objects:
-        # Stale debris tokens may coexist with the repairable one; only a
-        # unique COMMITTED token is authoritative.  Finish removes every
-        # temporary layer, so foreign leftovers are swept by the repair itself.
-        committed_tokens = [
-            (token, _HISTORY_RECORDS[token])
-            for token in tokens
-            if token in _HISTORY_RECORDS and _HISTORY_RECORDS[token].status == "COMMITTED"
-        ]
-        if len(committed_tokens) != 1:
-            continue
-        token, record = committed_tokens[0]
-        candidates.append((obj, token, record))
-
-    # A native Knife Undo/Redo exposes exactly one recognized raw snapshot.
-    # Ambiguous or unknown marker states are cleaned rather than projected.
-    if len(candidates) != 1:
-        for obj, _tokens in repairable_marker_objects:
-            _cleanup_object_temporary_layers(obj)
-        return None
-
-    obj, token, record = candidates[0]
-    if obj.mode != "EDIT" or bpy.context.edit_object is not obj:
-        _cleanup_object_temporary_layers(obj)
-        return None
-
-    try:
-        session = copy.deepcopy(record.session)
-        session.object_name = obj.name
-        session.mesh_name = obj.data.name
-        profile = TOOL_PROFILES.get(session.tool_kind)
-        if profile is not None and profile.supports_nested_offset:
-            current_symmetry = SymmetryAxes(
-                x=bool(obj.use_mesh_mirror_x),
-                y=bool(obj.use_mesh_mirror_y),
-                z=bool(obj.use_mesh_mirror_z),
-            )
-            # A raw Offset undo snapshot can contain the deliberately suspended
-            # flags. Treat that state like the tail of the original modal operation
-            # so finish restores the exact native setting captured by the session.
-            session.symmetry_suspended = current_symmetry != session.symmetry_flags
-        restored = _restore_session_face_maps(session, obj)
-    except Exception:
-        traceback.print_exc()
-        record.status = "FAILED"
-        _cleanup_object_temporary_layers(obj)
-        return None
-    if not restored:
-        record.status = "FAILED"
-        _cleanup_repair_session(session)
-        return None
-    window, area, region = _find_saved_view(session)
-    if window is None or area is None or region is None:
-        record.status = "FAILED"
-        _cleanup_repair_session(session)
-        return None
-
-    # A live session may have started in this window between the undo_post
-    # queueing and this timer tick.  Storing the repair session would silently
-    # replace that entry, killing its watcher and leaking its suspended
-    # symmetry flags.  Leave everything untouched; the record stays COMMITTED
-    # so the next undo_post can retry the repair.
-    if session.window_pointer in _SESSIONS:
-        return None
-
-    _HISTORY_REPAIR_BUSY = True
-    try:
-        _SESSIONS[session.window_pointer] = session
-        with bpy.context.temp_override(window=window, area=area, region=region):
-            result = _invoke_finish_operator()
-        if "FINISHED" not in result:
-            record.status = "FAILED"
-            _cleanup_repair_session(session)
-    except Exception:
-        traceback.print_exc()
-        record.status = "FAILED"
-        _cleanup_repair_session(session)
-    finally:
-        _HISTORY_REPAIR_BUSY = False
-    _HISTORY_RECORDS.move_to_end(token)
-    return None
-
-
-def _queue_history_repair(_dummy=None) -> None:
-    global _HISTORY_REPAIR_QUEUED
-
-    if _HISTORY_REPAIR_BUSY or _HISTORY_REPAIR_QUEUED:
-        return
-    _HISTORY_REPAIR_QUEUED = True
-    if not bpy.app.timers.is_registered(_repair_history_state):
-        bpy.app.timers.register(_repair_history_state, first_interval=0.01)
-
-
-@persistent
-def repair_after_undo(_dummy=None) -> None:
-    if _prepare_adjust_last_operation_repeat():
-        return
-    _queue_history_repair()
-
-
-@persistent
-def repair_after_redo(_dummy=None) -> None:
-    _queue_history_repair()
-
-
-def _prepare_adjust_last_operation_repeat() -> bool:
-    """Prepare the native re-execution phase of Adjust Last Operation.
-
-    Blender implements an F9 property change as Undo followed by a direct
-    re-execution of the registered native operator.  That second phase does not
-    traverse a keymap, so its ``undo_post`` is the only point where the baseline
-    can be marked without replacing Blender's own operator or redo panel.
-    """
-
-    context = bpy.context
-    active_operator = context.active_operator
-    if active_operator is None:
-        return False
-    identifier = getattr(active_operator, "bl_idname", "").upper()
-    tool_kind = _WM_OPERATOR_TO_TOOL.get(identifier)
-    if tool_kind is None or not _single_edit_mesh_poll(context):
-        return False
-
-    obj = context.edit_object
-    if obj is None or obj.type != "MESH" or not isinstance(obj.data, bpy.types.Mesh):
-        return False
-    window_pointer = _window_key(context)
-    prior_record = next(
-        (
-            record
-            for record in reversed(tuple(_HISTORY_RECORDS.values()))
-            if record.status == "COMMITTED"
-            and record.session.tool_kind == tool_kind
-            and record.session.window_pointer == window_pointer
-            and record.session.object_name == obj.name
-            and record.session.mesh_name == obj.data.name
-            and record.session.native_operator_pointer == int(active_operator.as_pointer())
-        ),
-        None,
-    )
-    if prior_record is None:
-        return False
-    # Token presence alone cannot separate a raw snapshot from a baseline
-    # poisoned by lazy undo encoding; only path-edge evidence can.  Read
-    # failures and indeterminate layer states must stay on the repair side.
-    try:
-        tokens = _read_history_tokens(obj)
-    except Exception:
-        return False
-    if tokens:
-        try:
-            bm = bmesh.from_edit_mesh(obj.data)
-            path_state = core.native_path_edge_state(bm)
-        except Exception:
-            return False
-        if path_state != "ABSENT":
-            return False
-        _queue_history_repair()
-
-    profile = TOOL_PROFILES.get(tool_kind)
-    if profile is not None and profile.supports_nested_offset:
-        for attribute, enabled in zip(
-            ("use_mesh_mirror_x", "use_mesh_mirror_y", "use_mesh_mirror_z"),
-            prior_record.session.symmetry_flags.as_tuple(),
-            strict=True,
-        ):
-            setattr(obj, attribute, enabled)
-
-    try:
-        return _prepare_session(
-            context,
-            lambda _levels, _message: None,
-            tool_kind=tool_kind,
-        )
-    except Exception:
-        traceback.print_exc()
-        cleanup_session(window_pointer)
-        return False
-
-
-def register_history_handlers() -> None:
-    for handlers, callback in (
-        (bpy.app.handlers.undo_post, repair_after_undo),
-        (bpy.app.handlers.redo_post, repair_after_redo),
-    ):
-        if callback not in handlers:
-            handlers.append(callback)
-
-
-def unregister_history_handlers() -> None:
-    global _HISTORY_REPAIR_QUEUED
-
-    for handlers, callback in (
-        (bpy.app.handlers.undo_post, repair_after_undo),
-        (bpy.app.handlers.redo_post, repair_after_redo),
-    ):
-        if callback in handlers:
-            handlers.remove(callback)
-    if bpy.app.timers.is_registered(_repair_history_state):
-        bpy.app.timers.unregister(_repair_history_state)
-    _HISTORY_REPAIR_QUEUED = False
-    clear_history_records()
 
 
 CLASSES = (

@@ -15,7 +15,7 @@ from mathutils import Vector
 PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
-from ydd_symmetric_edit import core  # noqa: E402
+from ydd_symmetric_edit import core, stitch  # noqa: E402
 
 
 def build_two_symmetric_quads():
@@ -101,9 +101,9 @@ def check_radius_search_is_the_only_candidate_source():
         assert fast_result[2] == ""
         assert coordinate_signature(fast_bm) == tuple(sorted(tuple(coordinate) for coordinate in expected_vertices))
 
-        nearby_candidates = core._nearby_projection_candidates
+        nearby_candidates = stitch._nearby_projection_candidates
         try:
-            core._nearby_projection_candidates = lambda *_args: []
+            stitch._nearby_projection_candidates = lambda *_args: []
             starved_result = core.snap_projected_graph(
                 starved_bm,
                 expected_vertices,
@@ -111,7 +111,7 @@ def check_radius_search_is_the_only_candidate_source():
                 1.0e-5,
             )
         finally:
-            core._nearby_projection_candidates = nearby_candidates
+            stitch._nearby_projection_candidates = nearby_candidates
 
         assert not starved_result[0]
         assert starved_result[2] == "could not match every projected graph vertex"
@@ -257,15 +257,15 @@ def check_projection_backtracking_and_failure_reasons():
 
     # Step limit: with the limit forced to zero, the first real branching
     # trial must fail as ambiguity, not raise.
-    original_limit = core._PROJECTION_STEP_LIMIT
+    original_limit = stitch._PROJECTION_STEP_LIMIT
     try:
-        core._PROJECTION_STEP_LIMIT = 0
+        stitch._PROJECTION_STEP_LIMIT = 0
         _assignment, _distances, reason = core._assign_projection_candidates(
             candidates, 2, destination_pairs, expected_edge_set
         )
         assert reason == "ambiguous projection correspondence", reason
     finally:
-        core._PROJECTION_STEP_LIMIT = original_limit
+        stitch._PROJECTION_STEP_LIMIT = original_limit
 
 
 def check_long_graph_fast_path():

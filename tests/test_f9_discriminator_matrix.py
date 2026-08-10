@@ -35,7 +35,7 @@ PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
 import ydd_symmetric_edit as addon  # noqa: E402
-from ydd_symmetric_edit import core, keymaps, operators  # noqa: E402
+from ydd_symmetric_edit import core, keymaps, operators, session_state  # noqa: E402
 from ydd_symmetric_edit._types import HistoryRecord  # noqa: E402
 
 OBJECT_NAME = "YSE_F9MatrixObject"
@@ -117,10 +117,7 @@ def production_is_busy():
         for token in ("LOOPCUT_SLIDE", "MESH_OT_LOOPCUT", "EDGE_SLIDE")
     )
     return bool(
-        native_modal
-        or operators._SESSIONS
-        or operators._HISTORY_REPAIR_QUEUED
-        or operators._HISTORY_REPAIR_BUSY
+        native_modal or operators._SESSIONS or operators._HISTORY_REPAIR_QUEUED or operators._HISTORY_REPAIR_BUSY
     )
 
 
@@ -229,8 +226,8 @@ def latest_committed_loopcut():
 def cancel_repair_queue() -> None:
     if bpy.app.timers.is_registered(operators._repair_history_state):
         bpy.app.timers.unregister(operators._repair_history_state)
-    operators._HISTORY_REPAIR_QUEUED = False
-    operators._HISTORY_REPAIR_BUSY = False
+    session_state._HISTORY_REPAIR_QUEUED = False
+    session_state._HISTORY_REPAIR_BUSY = False
 
 
 def cleanup_after_case(*, keep_history_record: bool = False) -> None:
@@ -358,10 +355,7 @@ def paint_edge_without_face_id(bm, token: int) -> None:
 
 
 def repair_queue_armed() -> bool:
-    return bool(
-        operators._HISTORY_REPAIR_QUEUED
-        or bpy.app.timers.is_registered(operators._repair_history_state)
-    )
+    return bool(operators._HISTORY_REPAIR_QUEUED or bpy.app.timers.is_registered(operators._repair_history_state))
 
 
 def run_case(name: str, builder, expect_true: bool, *, expect_repair_queue: bool = False) -> None:
@@ -477,10 +471,7 @@ def mesh_is_symmetric(obj, *, decimals=5) -> bool:
     bm = bmesh.from_edit_mesh(obj.data)
     verts = sorted(tuple(round(float(c), decimals) for c in v.co) for v in bm.verts)
     mirrored = sorted((round(-x, decimals), y, z) for x, y, z in verts)
-    edges = sorted(
-        tuple(sorted(tuple(round(float(c), decimals) for c in v.co) for v in e.verts))
-        for e in bm.edges
-    )
+    edges = sorted(tuple(sorted(tuple(round(float(c), decimals) for c in v.co) for v in e.verts)) for e in bm.edges)
     mirrored_edges = sorted(
         tuple(
             sorted(
@@ -709,8 +700,7 @@ def wait_for_loopcut():
         if production_is_busy() or topology() != FINISHED_TOPOLOGY:
             if time.monotonic() > STATE["deadline"]:
                 raise RuntimeError(
-                    f"Timed out waiting for Loop Cut: topology={topology()} "
-                    f"sessions={list(operators._SESSIONS)}"
+                    f"Timed out waiting for Loop Cut: topology={topology()} sessions={list(operators._SESSIONS)}"
                 )
             return 0.05
 

@@ -35,6 +35,7 @@ PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
 import ydd_symmetric_edit as addon  # noqa: E402
+from ydd_symmetric_edit import history as history_module  # noqa: E402
 from ydd_symmetric_edit import keymaps, operators  # noqa: E402
 
 OBJECT_NAME = "Grid"
@@ -117,16 +118,9 @@ def symmetric_state():
     bm = bmesh.from_edit_mesh(bpy.data.objects[OBJECT_NAME].data)
     verts = sorted(tuple(round(float(c), 5) for c in v.co) for v in bm.verts)
     mirrored = sorted((round(-x, 5), y, z) for x, y, z in verts)
-    edges = sorted(
-        tuple(sorted(tuple(round(float(c), 5) for c in v.co) for v in e.verts)) for e in bm.edges
-    )
+    edges = sorted(tuple(sorted(tuple(round(float(c), 5) for c in v.co) for v in e.verts)) for e in bm.edges)
     mirrored_edges = sorted(
-        tuple(
-            sorted(
-                (round(-x, 5), y, z)
-                for x, y, z in (tuple(round(float(c), 5) for c in v.co) for v in e.verts)
-            )
-        )
+        tuple(sorted((round(-x, 5), y, z) for x, y, z in (tuple(round(float(c), 5) for c in v.co) for v in e.verts)))
         for e in bm.edges
     )
     return verts == mirrored and edges == mirrored_edges, len(bm.verts), len(bm.edges)
@@ -135,10 +129,7 @@ def symmetric_state():
 def busy():
     native_modal = any(session.saw_modal for session in operators._SESSIONS.values())
     return bool(
-        native_modal
-        or operators._SESSIONS
-        or operators._HISTORY_REPAIR_QUEUED
-        or operators._HISTORY_REPAIR_BUSY
+        native_modal or operators._SESSIONS or operators._HISTORY_REPAIR_QUEUED or operators._HISTORY_REPAIR_BUSY
     )
 
 
@@ -173,20 +164,19 @@ def active_loopcut_children():
 
 def instrument_f9_prepare():
     """Capture whether F9 discrimination prepared a session (not bare native)."""
-    original = operators._prepare_adjust_last_operation_repeat
+    original = history_module._prepare_adjust_last_operation_repeat
 
     def logged():
         result = original()
         STATE["f9_prepare_result"] = result
         STATE["f9_sessions_after_prepare"] = len(operators._SESSIONS)
         print(
-            f"YSE_F9_DANCE_DISCRIMINATOR result={result} "
-            f"sessions={STATE['f9_sessions_after_prepare']}",
+            f"YSE_F9_DANCE_DISCRIMINATOR result={result} sessions={STATE['f9_sessions_after_prepare']}",
             flush=True,
         )
         return result
 
-    operators._prepare_adjust_last_operation_repeat = logged
+    history_module._prepare_adjust_last_operation_repeat = logged
 
 
 def start():
@@ -307,9 +297,7 @@ def wait_cut():
 
 def do_undo_redo_dance():
     try:
-        with bpy.context.temp_override(
-            window=STATE["window"], area=STATE["area"], region=STATE["region"]
-        ):
+        with bpy.context.temp_override(window=STATE["window"], area=STATE["area"], region=STATE["region"]):
             r1 = bpy.ops.ed.undo()
         print(f"YSE_F9_DANCE_UNDO={r1}", flush=True)
         bpy.app.timers.register(dance_redo, first_interval=1.0)
@@ -322,9 +310,7 @@ def dance_redo():
     try:
         if busy():
             return 0.1
-        with bpy.context.temp_override(
-            window=STATE["window"], area=STATE["area"], region=STATE["region"]
-        ):
+        with bpy.context.temp_override(window=STATE["window"], area=STATE["area"], region=STATE["region"]):
             r2 = bpy.ops.ed.redo()
         print(f"YSE_F9_DANCE_REDO={r2}", flush=True)
         bpy.app.timers.register(dance_settle, first_interval=1.0)
@@ -343,9 +329,7 @@ def dance_settle():
         assert mirror_flags() == (True, False, False), mirror_flags()
         record_case("undo_redo_dance", True)
         STATE["cut2_base"] = nverts
-        with bpy.context.temp_override(
-            window=STATE["window"], area=STATE["area"], region=STATE["region"]
-        ):
+        with bpy.context.temp_override(window=STATE["window"], area=STATE["area"], region=STATE["region"]):
             bpy.ops.ed.undo_push(message="YSE between dance and cut2")
         bpy.app.timers.register(
             lambda: begin_cut((-1.5, -1.0, 0.0), (-1.68, 0.0, 0.0), wait_cut2),
@@ -424,9 +408,7 @@ def wait_adjusted():
 
         prepare_result = STATE.get("f9_prepare_result")
         sessions_after = STATE.get("f9_sessions_after_prepare")
-        assert prepare_result is True, (
-            f"F9 discriminator did not prepare a session (result={prepare_result})"
-        )
+        assert prepare_result is True, f"F9 discriminator did not prepare a session (result={prepare_result})"
         assert sessions_after and sessions_after > 0, (
             f"F9 prepare returned True but no session was created ({sessions_after})"
         )

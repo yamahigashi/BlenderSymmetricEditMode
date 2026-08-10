@@ -43,7 +43,7 @@ PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
 import ydd_symmetric_edit as addon  # noqa: E402
-from ydd_symmetric_edit import core, operators  # noqa: E402
+from ydd_symmetric_edit import core, operators, stitch  # noqa: E402
 
 MARKER_OK = "YSE_KNIFE_CROSS_MIRROR_STITCH_OK"
 MARKER_FAILED = "YSE_KNIFE_CROSS_MIRROR_STITCH_FAILED"
@@ -292,9 +292,7 @@ def has_exact_edge(bm, a, b, tolerance=1.0e-7) -> bool:
 
 def verts_near(bm, co, tolerance: float = 1.0e-3):
     return [
-        vertex
-        for vertex in bm.verts
-        if all(abs(float(vertex.co[i]) - float(co[i])) <= tolerance for i in range(3))
+        vertex for vertex in bm.verts if all(abs(float(vertex.co[i]) - float(co[i])) <= tolerance for i in range(3))
     ]
 
 
@@ -357,7 +355,9 @@ def find_edge_between(bm, a, b, tol: float = 1.0e-6):
     for edge in bm.edges:
         if _edge_has_endpoints(edge, a, b, tol):
             return edge
-    raise AssertionError(f"no edge between {a} and {b}; edges={[(tuple(e.verts[0].co), tuple(e.verts[1].co)) for e in bm.edges]}")
+    raise AssertionError(
+        f"no edge between {a} and {b}; edges={[(tuple(e.verts[0].co), tuple(e.verts[1].co)) for e in bm.edges]}"
+    )
 
 
 def split_edge_at_co(edge, co):
@@ -518,8 +518,7 @@ def simulate_case_b_cuts(obj) -> None:
     )
     assert kind1 == "PROPER" and kind2 == "PROPER", (kind1, kind2, p1, p2)
     print(
-        f"YSE_CROSS_MIRROR_FIXTURE=case_b kind=PROPER×2 "
-        f"q1={p1} t={t1:.6f}/u={u1:.6f} q2={p2} t={t2:.6f}/u={u2:.6f}",
+        f"YSE_CROSS_MIRROR_FIXTURE=case_b kind=PROPER×2 q1={p1} t={t1:.6f}/u={u1:.6f} q2={p2} t={t2:.6f}/u={u2:.6f}",
         flush=True,
     )
 
@@ -564,8 +563,7 @@ def simulate_case_d_cuts(obj) -> None:
     """Partial collinear: L-shaped s on F+, full vertical t on F- at ρ line."""
 
     print(
-        "YSE_CROSS_MIRROR_FIXTURE=case_d kind=PARTIAL_COLLINEAR "
-        "s_vertical=(0.3,-1)→(0.3,0.5) t=(-0.3,-1)→(-0.3,1)",
+        "YSE_CROSS_MIRROR_FIXTURE=case_d kind=PARTIAL_COLLINEAR s_vertical=(0.3,-1)→(0.3,0.5) t=(-0.3,-1)→(-0.3,1)",
         flush=True,
     )
     bm = bmesh.from_edit_mesh(obj.data)
@@ -664,8 +662,7 @@ def simulate_case_i_cuts(obj) -> None:
     """Two POS rays + one NEG horizontal whose mirrored crossings share one cluster."""
 
     print(
-        "YSE_CROSS_MIRROR_FIXTURE=case_i kind=TRIPLE_CLUSTER "
-        "q_plus=(0.5,0) q_minus=(-0.5,0)",
+        "YSE_CROSS_MIRROR_FIXTURE=case_i kind=TRIPLE_CLUSTER q_plus=(0.5,0) q_minus=(-0.5,0)",
         flush=True,
     )
     bm = bmesh.from_edit_mesh(obj.data)
@@ -743,14 +740,18 @@ def _plan_on_edit_object(obj, topology_or_session_frames, mirror_face_ids):
         path_edges=all_edges,
     )
     frames = topology_or_session_frames
-    return core.plan_mirrored_path_crossings(
+    return (
+        core.plan_mirrored_path_crossings(
+            bm,
+            by_side,
+            core.AXIS_INDEX["X"],
+            TOL,
+            live,
+            frames,
+        ),
         bm,
         by_side,
-        core.AXIS_INDEX["X"],
-        TOL,
-        live,
-        frames,
-    ), bm, by_side
+    )
 
 
 def begin_edit_knife(window, area, region, obj):
@@ -1041,8 +1042,8 @@ def case_g_onplane_band(window, area, region) -> None:
     pos_edge = find_edge_between(bm, CASE_G_S0, CASE_G_S1)
     neg_edge = find_edge_between(bm, CASE_G_T0, CASE_G_T1)
 
-    original_carrier_ids = core._edge_carrier_ids
-    original_mirrored_ids = core._mirrored_carrier_ids
+    original_carrier_ids = stitch._edge_carrier_ids
+    original_mirrored_ids = stitch._mirrored_carrier_ids
 
     def _stub_carrier_ids(edge, _face_layer):
         del edge
@@ -1051,8 +1052,8 @@ def case_g_onplane_band(window, area, region) -> None:
     def _stub_mirrored_ids(carrier_ids, _mirror_face_ids):
         return set(carrier_ids)
 
-    core._edge_carrier_ids = _stub_carrier_ids  # type: ignore[assignment]
-    core._mirrored_carrier_ids = _stub_mirrored_ids  # type: ignore[assignment]
+    stitch._edge_carrier_ids = _stub_carrier_ids  # type: ignore[assignment]
+    stitch._mirrored_carrier_ids = _stub_mirrored_ids  # type: ignore[assignment]
     try:
         by_side = {
             "POSITIVE": [pos_edge],
@@ -1088,8 +1089,8 @@ def case_g_onplane_band(window, area, region) -> None:
         assert apply_reason == "", apply_reason
         assert stitched > 0, stitched
     finally:
-        core._edge_carrier_ids = original_carrier_ids  # type: ignore[assignment]
-        core._mirrored_carrier_ids = original_mirrored_ids  # type: ignore[assignment]
+        stitch._edge_carrier_ids = original_carrier_ids  # type: ignore[assignment]
+        stitch._mirrored_carrier_ids = original_mirrored_ids  # type: ignore[assignment]
 
     bm.verts.ensure_lookup_table()
     plane_q = [
@@ -1205,8 +1206,8 @@ def case_j_fixed_self_mirrored(window, area, region) -> None:
     moving_edge = find_edge_between(bm, CASE_J_S0, CASE_J_S1)
     assert core.is_self_mirrored_edge(fixed_edge, core.AXIS_INDEX["X"], TOL)
 
-    original_carrier_ids = core._edge_carrier_ids
-    original_mirrored_ids = core._mirrored_carrier_ids
+    original_carrier_ids = stitch._edge_carrier_ids
+    original_mirrored_ids = stitch._mirrored_carrier_ids
 
     def _stub_carrier_ids(edge, _face_layer):
         del edge
@@ -1215,8 +1216,8 @@ def case_j_fixed_self_mirrored(window, area, region) -> None:
     def _stub_mirrored_ids(carrier_ids, _mirror_face_ids):
         return set(carrier_ids)
 
-    core._edge_carrier_ids = _stub_carrier_ids  # type: ignore[assignment]
-    core._mirrored_carrier_ids = _stub_mirrored_ids  # type: ignore[assignment]
+    stitch._edge_carrier_ids = _stub_carrier_ids  # type: ignore[assignment]
+    stitch._mirrored_carrier_ids = _stub_mirrored_ids  # type: ignore[assignment]
     try:
         by_side = {
             "POSITIVE": [moving_edge],
@@ -1249,8 +1250,8 @@ def case_j_fixed_self_mirrored(window, area, region) -> None:
         assert apply_reason == "", apply_reason
         assert stitched > 0, stitched
     finally:
-        core._edge_carrier_ids = original_carrier_ids  # type: ignore[assignment]
-        core._mirrored_carrier_ids = original_mirrored_ids  # type: ignore[assignment]
+        stitch._edge_carrier_ids = original_carrier_ids  # type: ignore[assignment]
+        stitch._mirrored_carrier_ids = original_mirrored_ids  # type: ignore[assignment]
 
     bm.verts.ensure_lookup_table()
     q_plus = verts_near(bm, CASE_J_Q_PLUS, tolerance=1.0e-3)

@@ -26,9 +26,11 @@ from mathutils import Vector
 PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
-from ydd_symmetric_edit import core, operators  # noqa: E402
+from ydd_symmetric_edit import core, face_mapping, operators, selection, snapshot  # noqa: E402
 from ydd_symmetric_edit import replay as replay_module  # noqa: E402
 from ydd_symmetric_edit import rip as rip_module  # noqa: E402
+from ydd_symmetric_edit import session as session_module  # noqa: E402
+from ydd_symmetric_edit import watcher as watcher_module  # noqa: E402
 from ydd_symmetric_edit._types import (  # noqa: E402
     Coordinate3D,
     FaceId,
@@ -739,9 +741,9 @@ def _check_extend_selection_lazy_indices():
             self.select = False
             self.is_valid = True
 
-    original_builder = core.build_vertex_pair_table
+    original_builder = selection.build_vertex_pair_table
     method_name = "build_vertex_pair_table"
-    setattr(core, method_name, lambda _coords, _axis, _tolerance: {0: 1, 1: 0, 2: 3, 3: 2, 4: 5, 5: 4})
+    setattr(selection, method_name, lambda _coords, _axis, _tolerance: {0: 1, 1: 0, 2: 3, 3: 2, 4: 5, 5: 4})
     try:
         for selection_mode in ("empty", "vertex", "edge", "face"):
             vertices = [
@@ -779,7 +781,7 @@ def _check_extend_selection_lazy_indices():
             assert edge_sequence.iterations == (2 if selection_mode == "edge" else 1)
             assert face_sequence.iterations == (2 if selection_mode == "face" else 1)
     finally:
-        setattr(core, method_name, original_builder)
+        setattr(selection, method_name, original_builder)
 
 
 def _check_extend_selection_wrapper_matrix():
@@ -1073,11 +1075,11 @@ def _build_fallback_bin_order_fixture():
 
 def _check_topology_equivalence():
     bm = _build_deformed_grid(7)
-    original_face_key = core._face_key
+    original_face_key = face_mapping._face_key
     frame_name = (
-        "_carrier_frame_from_coords" if hasattr(core, "_carrier_frame_from_coords") else "_carrier_frame_snapshot"
+        "_carrier_frame_from_coords" if hasattr(snapshot, "_carrier_frame_from_coords") else "_carrier_frame_snapshot"
     )
-    original_frame = getattr(core, frame_name)
+    original_frame = getattr(snapshot, frame_name)
     counters = {"key": 0, "frame": 0}
 
     def count_key(*args, **kwargs):
@@ -1089,13 +1091,13 @@ def _check_topology_equivalence():
         return original_frame(*args, **kwargs)
 
     face_key_name = "_face_key"
-    setattr(core, face_key_name, count_key)
-    setattr(core, frame_name, count_frame)
+    setattr(face_mapping, face_key_name, count_key)
+    setattr(snapshot, frame_name, count_frame)
     try:
         topology = core.prepare_topology(bm, 0, TOLERANCE)
     finally:
-        setattr(core, face_key_name, original_face_key)
-        setattr(core, frame_name, original_frame)
+        setattr(face_mapping, face_key_name, original_face_key)
+        setattr(snapshot, frame_name, original_frame)
     assert topology.mirror_face_ids == _reference_eager_face_map(bm, 0, TOLERANCE)
     assert topology.matched_faces == topology.total_faces
     assert counters == {"key": 0, "frame": 0}, counters
@@ -1106,7 +1108,7 @@ def _check_topology_equivalence():
     perturbed = _build_deformed_grid(7, asymmetric=True)
     perturbed.faces.ensure_lookup_table()
     perturbed.faces[0].hide = True
-    original_face_key = core._face_key
+    original_face_key = face_mapping._face_key
     fallback_calls = 0
 
     def count_fallback_key(*args, **kwargs):
@@ -1116,13 +1118,13 @@ def _check_topology_equivalence():
 
     try:
         face_key_name = "_face_key"
-        setattr(core, face_key_name, count_fallback_key)
+        setattr(face_mapping, face_key_name, count_fallback_key)
         topology = core.prepare_topology(perturbed, 0, TOLERANCE)
         # The geometric fallback runs at lazy resolve time, so force it
         # while the counting patch is still installed.
         _ = topology.mirror_face_ids
     finally:
-        setattr(core, face_key_name, original_face_key)
+        setattr(face_mapping, face_key_name, original_face_key)
     try:
         expected = _reference_eager_face_map(perturbed, 0, TOLERANCE)
         assert fallback_calls > 0
@@ -1267,7 +1269,7 @@ def _check_carrier_frame_lifecycle():
     assert cloned._cache == {}
     partial = lazy_type(vertex_coords, dict(face_vertex_ids))
     partial.get(FaceId(1))
-    original_factory = core._carrier_frame_from_coords
+    original_factory = snapshot._carrier_frame_from_coords
     factory_calls = 0
 
     def count_factory(vertices):
@@ -1275,12 +1277,12 @@ def _check_carrier_frame_lifecycle():
         factory_calls += 1
         return original_factory(vertices)
 
-    setattr(core, "_carrier_frame_from_coords", count_factory)
+    setattr(snapshot, "_carrier_frame_from_coords", count_factory)
     try:
         factory_calls = 0
         partial_clone = copy.deepcopy(partial)
     finally:
-        setattr(core, "_carrier_frame_from_coords", original_factory)
+        setattr(snapshot, "_carrier_frame_from_coords", original_factory)
     assert factory_calls == 0
     assert tuple(partial._cache) == tuple(partial_clone._cache) == (FaceId(1),)
     assert len(partial_clone._cache) < len(face_vertex_ids)
@@ -2067,9 +2069,9 @@ def _check_prepare_session_invoke_does_not_resolve():
         original_from_edit = operators.bmesh.from_edit_mesh
         original_remove = core.remove_temporary_layers
         original_update = operators.bmesh.update_edit_mesh
-        original_cleanup = operators.cleanup_session
-        original_suspend = operators._suspend_mesh_symmetry
-        original_schedule = operators._schedule_passthrough_watcher
+        original_cleanup = session_module.cleanup_session
+        original_suspend = session_module._suspend_mesh_symmetry
+        original_schedule = watcher_module._schedule_passthrough_watcher
         calls = []
 
         def spy_prepare(*args, **kwargs):
@@ -2080,9 +2082,9 @@ def _check_prepare_session_invoke_does_not_resolve():
         setattr(operators.bmesh, "from_edit_mesh", lambda _data: bm)
         setattr(core, "remove_temporary_layers", lambda _bm: None)
         setattr(operators.bmesh, "update_edit_mesh", lambda *_args, **_kwargs: None)
-        setattr(operators, "cleanup_session", lambda *_args, **_kwargs: None)
-        setattr(operators, "_suspend_mesh_symmetry", lambda *_args, **_kwargs: None)
-        setattr(operators, "_schedule_passthrough_watcher", lambda *_args, **_kwargs: None)
+        setattr(session_module, "cleanup_session", lambda *_args, **_kwargs: None)
+        setattr(session_module, "_suspend_mesh_symmetry", lambda *_args, **_kwargs: None)
+        setattr(watcher_module, "_schedule_passthrough_watcher", lambda *_args, **_kwargs: None)
         try:
             assert operators._prepare_session(context, lambda *_args: None)
             assert calls == [obj]
@@ -2096,9 +2098,9 @@ def _check_prepare_session_invoke_does_not_resolve():
             setattr(operators.bmesh, "from_edit_mesh", original_from_edit)
             setattr(core, "remove_temporary_layers", original_remove)
             setattr(operators.bmesh, "update_edit_mesh", original_update)
-            setattr(operators, "cleanup_session", original_cleanup)
-            setattr(operators, "_suspend_mesh_symmetry", original_suspend)
-            setattr(operators, "_schedule_passthrough_watcher", original_schedule)
+            setattr(session_module, "cleanup_session", original_cleanup)
+            setattr(session_module, "_suspend_mesh_symmetry", original_suspend)
+            setattr(watcher_module, "_schedule_passthrough_watcher", original_schedule)
     finally:
         bm.free()
 

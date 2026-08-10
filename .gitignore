@@ -3,3 +3,6 @@ __pycache__/
 .venv/
 dist/
 *.zip
+
+# Local test runners (machine-specific Blender paths)
+tests/run_*.bat
