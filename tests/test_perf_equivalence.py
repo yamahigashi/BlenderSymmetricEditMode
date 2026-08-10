@@ -2,6 +2,9 @@
 
 """Headless equivalence checks for the large-mesh preparation changes."""
 
+# Wrapper fixtures intentionally capture each fresh BMesh and spy state.
+# ruff: noqa: B010, B023
+
 from __future__ import annotations
 
 import copy
@@ -17,12 +20,14 @@ from typing import Any, cast
 
 import bmesh
 import bpy
+import numpy
 from mathutils import Vector
 
 PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
 from ydd_symmetric_edit import core, operators  # noqa: E402
+from ydd_symmetric_edit import replay as replay_module  # noqa: E402
 from ydd_symmetric_edit import rip as rip_module  # noqa: E402
 from ydd_symmetric_edit._types import (  # noqa: E402
     Coordinate3D,
@@ -299,6 +304,7 @@ def _assert_lookup_case(coords, axis_index: int, tolerance: float = TOLERANCE):
     assert core.build_vertex_pair_table(coords, axis_index, tolerance) == _pair_table(reference, coords)
     assert lookup.find_all_mirrored(coords) == tuple(reference.find_all_mirrored(coords))
     assert lookup.find_all_direct(coords) == tuple(reference.find_all_direct(coords))
+    assert lookup._batch_path_count >= 2
     for query in coords:
         candidates = reference._candidates_for(core.mirror_coordinate(query, axis_index))
         if not candidates or len([distance for distance, _index in candidates if distance == candidates[0][0]]) > 1:
@@ -418,6 +424,13 @@ def _check_vertex_lookup_equivalence():
     lookup = core.build_vertex_mirror_lookup(plane_coords, 0, TOLERANCE)
     assert lookup.find_all_mirrored(plane_coords) == tuple(range(5))
 
+    batch_positions = tuple(plane_coords)
+    batch_lookup = core.build_vertex_mirror_lookup(batch_positions, 0, TOLERANCE)
+    batch_lists = batch_lookup._batch_candidates(batch_positions)
+    assert batch_lists is not None
+    assert batch_lists == [batch_lookup._candidates_for(position) for position in batch_positions]
+    assert batch_lookup._batch_path_count == 1
+
     tie_lookup = core.build_vertex_mirror_lookup(
         [Vector((0.5 * TOLERANCE, 0.0, 0.0)), Vector((-0.5 * TOLERANCE, 0.0, 0.0))],
         0,
@@ -433,17 +446,437 @@ def _check_vertex_lookup_equivalence():
     assert old_result == new_result == (1, None, None)
 
 
+def _check_batch_candidate_contract_edges():
+    tolerance = TOLERANCE
+
+    def assert_candidates(lookup, positions, plane_side=None):
+        actual = lookup._batch_candidates(positions, plane_side)
+        assert actual is not None
+        expected = [lookup._candidates_for(position) for position in positions]
+        if plane_side is not None:
+            on_plane = lookup._on_plane_registered()
+            expected = [
+                [(distance, index) for distance, index in candidates if (index in on_plane) == plane_side]
+                for candidates in expected
+            ]
+        assert actual == expected
+
+    boundary_coords = tuple(
+        Vector(co)
+        for co in (
+            (1.0, 0.0, 0.0),
+            (1.0 + 0.4 * tolerance, 0.0, 0.0),
+            (1.0 - 0.4 * tolerance, 0.0, 0.0),
+            (-1.0, -0.25, 0.5),
+            (-1.0 + 0.4 * tolerance, -0.25, 0.5),
+            (-1.0 - 0.4 * tolerance, -0.25, 0.5),
+        )
+    )
+    boundary_lookup = core.build_vertex_mirror_lookup(boundary_coords, 0, tolerance)
+    assert_candidates(boundary_lookup, boundary_coords)
+    boundary_candidates = boundary_lookup._batch_candidates((Vector((1.0, 0.0, 0.0)),))
+    assert boundary_candidates is not None
+    assert boundary_candidates[0] == sorted(boundary_lookup._candidates_for(Vector((1.0, 0.0, 0.0))))
+
+    # span_z == 1 (planar registered set): the clamped z range degenerates to
+    # one bin, and queries whose z bin sits one step outside the registered
+    # box on either side must still resolve through the neighborhood.
+    planar_coords = tuple(
+        Vector(co)
+        for co in (
+            (-1.0, 0.5, 0.0),
+            (1.0, 0.5, 0.0),
+            (0.25, -0.75, 0.0),
+            (-0.25, -0.75, 0.0),
+        )
+    )
+    planar_lookup = core.build_vertex_mirror_lookup(planar_coords, 0, tolerance)
+    planar_index = planar_lookup._registered_batch_index()
+    assert planar_index is not False and int(planar_index["spans"][2]) == 1
+    planar_queries = tuple(
+        Vector((float(co[0]), float(co[1]), float(co[2]) + offset))
+        for co in planar_coords
+        for offset in (-0.9 * tolerance, 0.0, 0.9 * tolerance, -1.9 * tolerance, 1.9 * tolerance)
+    )
+    assert_candidates(planar_lookup, planar_queries)
+    assert_candidates(planar_lookup, planar_queries, plane_side=False)
+    reference_planar = _ReferenceBinLookup(planar_coords, 0, tolerance)
+    assert planar_lookup.find_all_direct(planar_queries) == tuple(reference_planar.find_all_direct(planar_queries))
+
+    # Box-corner clamps: registered box spans 2x2x1 bins at tolerance=1;
+    # queries sit diagonally outside every axis at once.
+    corner_coords = (Vector((0.0, 0.0, 0.0)), Vector((1.0, 1.0, 0.0)))
+    corner_lookup = core.build_vertex_mirror_lookup(corner_coords, 0, 1.0)
+    corner_queries = (Vector((-1.0, -1.0, -1.0)), Vector((2.0, 2.0, 1.0)))
+    actual_corner = corner_lookup._batch_candidates(corner_queries)
+    assert actual_corner is not None
+    reference_corner = _ReferenceBinLookup(corner_coords, 0, 1.0)
+    assert actual_corner == [reference_corner._candidates_for(position) for position in corner_queries]
+
+    # Span-product overflow: |scaled| stays under 2**62 per axis, yet the
+    # packed span product overflows int64 and must fall back to the KDTree
+    # path with identical public results.
+    huge_span_coords = (Vector((0.0, 0.0, 0.0)), Vector((float(2**21), float(2**21), float(2**21))))
+    huge_span_lookup = core.build_vertex_mirror_lookup(huge_span_coords, 0, 1.0)
+    assert huge_span_lookup._registered_batch_index() is False
+    assert huge_span_lookup._batch_candidates(huge_span_coords) is None
+    reference_huge = _ReferenceBinLookup(huge_span_coords, 0, 1.0)
+    assert huge_span_lookup.find_all_direct(huge_span_coords) == tuple(reference_huge.find_all_direct(huge_span_coords))
+    assert huge_span_lookup.find_all_mirrored(huge_span_coords) == tuple(
+        reference_huge.find_all_mirrored(huge_span_coords)
+    )
+
+    # Non-finite queries abandon the batch path; the public API answers via
+    # the per-query KDTree route without raising.
+    finite_lookup = core.build_vertex_mirror_lookup((Vector((1.0, 0.0, 0.0)),), 0, tolerance)
+    nan_query = (Vector((float("nan"), 0.0, 0.0)),)
+    assert finite_lookup._batch_candidates(nan_query) is None
+    assert finite_lookup.find_all_direct(nan_query) == (None,)
+
+    # Caller-owned float64 arrays must come back untouched (the mirror
+    # negation operates on a fancy-indexed copy).
+    owned = numpy.asarray([(0.5, 0.25, 0.0), (-0.5, 0.25, 0.0)], dtype=numpy.float64)
+    owned_snapshot = owned.copy()
+    owned_lookup = core.build_vertex_mirror_lookup((Vector((0.5, 0.25, 0.0)), Vector((-0.5, 0.25, 0.0))), 0, tolerance)
+    owned_lookup.find_all_mirrored(owned)
+    owned_lookup.find_all_direct(owned)
+    assert (owned == owned_snapshot).all()
+
+    clamp_coords = (Vector((0.0, 0.0, 0.0)), Vector((1.0e-13, 0.0, 0.0)))
+    clamp_lookup = core.build_vertex_mirror_lookup(clamp_coords, 0, 0.0)
+    assert_candidates(clamp_lookup, clamp_coords)
+
+    empty_registered = core.build_vertex_mirror_lookup([], 0, tolerance)
+    assert empty_registered._batch_candidates((Vector((float("nan"), 0.0, 0.0)),)) is None
+    assert empty_registered._batch_candidates((Vector((float("inf"), 0.0, 0.0)),)) is None
+    invalid_tree = core.KDTree(1)
+    invalid_tree.insert(Vector((0.0, 0.0, 0.0)), 0)
+    invalid_tree.balance()
+    invalid_registered = core.VertexMirrorLookup(
+        axis_index=0,
+        tolerance=tolerance,
+        coords=((float("nan"), 0.0, 0.0),),
+        tree=invalid_tree,
+    )
+    assert invalid_registered._batch_candidates(()) is None
+    huge_registered = core.VertexMirrorLookup(
+        axis_index=0,
+        tolerance=tolerance,
+        coords=((2**63 * tolerance, 0.0, 0.0),),
+        tree=invalid_tree,
+    )
+    assert huge_registered._batch_candidates(()) is None
+
+    rounding_coords = (Vector((0.09375, 0.0, 0.0)), Vector((-0.09375, 0.0, 0.0)))
+    rounding_lookup = core.build_vertex_mirror_lookup(rounding_coords, 0, 1.0e-5)
+    assert_candidates(rounding_lookup, rounding_coords)
+
+    plane_coords = (Vector((0.0, 0.0, 0.0)), Vector((2.0 * tolerance, 0.0, 0.0)))
+    plane_lookup = core.build_vertex_mirror_lookup(plane_coords, 0, tolerance)
+    plane_positions = (Vector((0.0, 0.0, 0.0)), Vector((2.0 * tolerance, 0.0, 0.0)))
+    assert_candidates(plane_lookup, plane_positions, True)
+    assert_candidates(plane_lookup, plane_positions, False)
+    assert plane_lookup.find_all_mirrored((Vector((0.0, 0.0, 0.0)), Vector((-2.0 * tolerance, 0.0, 0.0)))) == (0, 1)
+    near_plane_target = core.build_vertex_mirror_lookup((Vector((0.5 * tolerance, 0.0, 0.0)),), 0, tolerance)
+    near_plane_queries = (Vector((0.5 * tolerance, 0.0, 0.0)), Vector((-1.25 * tolerance, 0.0, 0.0)))
+    near_plane_candidate_positions = (near_plane_queries[0], Vector((1.25 * tolerance, 0.0, 0.0)))
+    near_plane_candidates = near_plane_target._batch_candidates(near_plane_candidate_positions)
+    assert near_plane_candidates is not None
+    assert near_plane_candidates[0][0][1] == 0
+    assert math.isclose(near_plane_candidates[0][0][0], 0.0, abs_tol=1.0e-12)
+    assert near_plane_candidates[1][0][1] == 0
+    assert math.isclose(near_plane_candidates[1][0][0], 0.75 * tolerance, rel_tol=1.0e-6)
+    near_plane_off_candidates = near_plane_target._batch_candidates(near_plane_candidate_positions, plane_side=False)
+    assert near_plane_off_candidates is not None
+    assert near_plane_off_candidates == [[], []]
+    assert near_plane_target.find_all_mirrored(near_plane_queries) == (0, None)
+    near_plane_reference = _ReferenceBinLookup((Vector((0.5 * tolerance, 0.0, 0.0)),), 0, tolerance)
+    assert near_plane_target.find_all_mirrored(near_plane_queries) == tuple(
+        near_plane_reference.find_all_mirrored(near_plane_queries)
+    )
+
+    fallback_lookup = core.build_vertex_mirror_lookup((Vector((0.0, 0.0, 0.0)),), 0, tolerance)
+    fallback_calls = 0
+    original_candidates = fallback_lookup._candidates_for
+
+    def count_fallback(position):
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return original_candidates(position)
+
+    method_name = "_candidates_for"
+    setattr(fallback_lookup, method_name, count_fallback)
+    try:
+        out_of_range = Vector((2**63 * tolerance, 0.0, 0.0))
+        assert fallback_lookup._batch_candidates((out_of_range,)) is None
+        assert fallback_lookup.find_all_direct((out_of_range,)) == (None,)
+        assert fallback_calls == 1
+    finally:
+        setattr(fallback_lookup, method_name, original_candidates)
+
+    contested = core.build_vertex_mirror_lookup((Vector((1.0, 0.0, 0.0)),), 0, tolerance)
+    assert contested._resolve_injective((Vector((1.0, 0.0, 0.0)), Vector((1.0 + 0.4 * tolerance, 0.0, 0.0)))) == [
+        None,
+        None,
+    ]
+
+    two_target_coords = (Vector((1.0, 0.0, 0.0)), Vector((1.0 + 0.8 * tolerance, 0.0, 0.0)))
+    two_target_lookup = core.build_vertex_mirror_lookup(two_target_coords, 0, tolerance)
+    two_target_queries = (Vector((1.0 + 0.1 * tolerance, 0.0, 0.0)), Vector((1.0 + 0.2 * tolerance, 0.0, 0.0)))
+    assert two_target_lookup._resolve_injective(two_target_queries) == [0, 1]
+
+    rng = random.Random(113)
+    large_coords = []
+    for index in range(1100):
+        magnitude = 0.01 * (index + 1)
+        source = Vector((-magnitude, rng.uniform(-5.0, 5.0), rng.uniform(-5.0, 5.0)))
+        if index % 17 == 0:
+            large_coords.append(source)
+            continue
+        target = source.copy()
+        target[0] = -target[0] + rng.uniform(-0.2, 0.2) * tolerance
+        target[1] += rng.uniform(-0.2, 0.2) * tolerance
+        target[2] += rng.uniform(-0.2, 0.2) * tolerance
+        large_coords.extend((source, target))
+    assert len(large_coords) >= 2000
+    large_lookup = core.build_vertex_mirror_lookup(large_coords, 0, tolerance)
+    large_batch = large_lookup._batch_candidates(large_coords)
+    assert large_batch is not None
+    large_oracle = [large_lookup._candidates_for(position) for position in large_coords]
+    assert large_batch == large_oracle
+    reference = _ReferenceBinLookup(large_coords, 0, tolerance)
+    assert large_lookup.find_all_mirrored(large_coords) == tuple(reference.find_all_mirrored(large_coords))
+
+
+def _check_extend_selection_matrix():
+    bm = bmesh.new()
+    left = [bm.verts.new(co) for co in ((-1.0, 0.0, 0.0), (-1.0, 1.0, 0.0), (-1.0, 0.0, 1.0))]
+    right = [bm.verts.new(co) for co in ((1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (1.0, 0.0, 1.0))]
+    left_face = bm.faces.new(left)
+    right_face = bm.faces.new(right)
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    left_edge = next(edge for edge in bm.edges if set(edge.verts) == {left[0], left[1]})
+    right_edge = next(edge for edge in bm.edges if set(edge.verts) == {right[0], right[1]})
+
+    def reset():
+        for vertex in bm.verts:
+            vertex.select = False
+        for edge in bm.edges:
+            edge.select = False
+        for face in bm.faces:
+            face.select = False
+
+    try:
+        reset()
+        history_before = tuple(cast(Any, bm.select_history))
+        assert core.extend_selection_to_mirror(bm, 0, TOLERANCE) == 0
+        assert not any(vertex.select for vertex in bm.verts)
+        assert tuple(cast(Any, bm.select_history)) == history_before
+
+        reset()
+        left[0].select = True
+        bm.select_history.add(left[0])
+        history_before = tuple(cast(Any, bm.select_history))
+        assert core.extend_selection_to_mirror(bm, 0, TOLERANCE) == 1
+        assert right[0].select
+        assert tuple(cast(Any, bm.select_history)) == history_before
+
+        # Selecting a BMesh edge/face flushes selection down to its verts
+        # (and edges), so the mirrored additions count those too.
+        reset()
+        left_edge.select = True
+        bm.select_history.add(left_edge)
+        history_before = tuple(cast(Any, bm.select_history))
+        assert core.extend_selection_to_mirror(bm, 0, TOLERANCE) == 3
+        assert right_edge.select
+        assert tuple(cast(Any, bm.select_history)) == history_before
+
+        reset()
+        left_face.select = True
+        bm.select_history.add(left_face)
+        history_before = tuple(cast(Any, bm.select_history))
+        assert core.extend_selection_to_mirror(bm, 0, TOLERANCE) == 7
+        assert right_face.select
+        assert tuple(cast(Any, bm.select_history)) == history_before
+    finally:
+        bm.free()
+
+
+def _check_extend_selection_lazy_indices():
+    class CountingSequence:
+        def __init__(self, values):
+            self.values = list(values)
+            self.iterations = 0
+
+        def __iter__(self):
+            self.iterations += 1
+            return iter(self.values)
+
+        def __len__(self):
+            return len(self.values)
+
+        def __getitem__(self, index):
+            return self.values[index]
+
+    class FakeVertex:
+        def __init__(self, index, coordinate):
+            self.index = index
+            self.co = Vector(coordinate)
+            self.select = False
+            self.is_valid = True
+
+    class FakeEdge:
+        def __init__(self, vertices):
+            self.verts = vertices
+            self.select = False
+            self.is_valid = True
+
+    class FakeFace:
+        def __init__(self, vertices):
+            self.verts = vertices
+            self.select = False
+            self.is_valid = True
+
+    original_builder = core.build_vertex_pair_table
+    method_name = "build_vertex_pair_table"
+    setattr(core, method_name, lambda _coords, _axis, _tolerance: {0: 1, 1: 0, 2: 3, 3: 2, 4: 5, 5: 4})
+    try:
+        for selection_mode in ("empty", "vertex", "edge", "face"):
+            vertices = [
+                FakeVertex(0, (-1.0, 0.0, 0.0)),
+                FakeVertex(1, (1.0, 0.0, 0.0)),
+                FakeVertex(2, (-1.0, 1.0, 0.0)),
+                FakeVertex(3, (1.0, 1.0, 0.0)),
+                FakeVertex(4, (-1.0, 0.0, 1.0)),
+                FakeVertex(5, (1.0, 0.0, 1.0)),
+            ]
+            edges = [FakeEdge((vertices[0], vertices[2])), FakeEdge((vertices[1], vertices[3]))]
+            faces = [
+                FakeFace((vertices[0], vertices[2], vertices[4])),
+                FakeFace((vertices[1], vertices[3], vertices[5])),
+            ]
+            if selection_mode == "vertex":
+                vertices[0].select = True
+            elif selection_mode == "edge":
+                edges[0].select = True
+            elif selection_mode == "face":
+                faces[0].select = True
+            vertex_sequence = CountingSequence(vertices)
+            edge_sequence = CountingSequence(edges)
+            face_sequence = CountingSequence(faces)
+            bm = SimpleNamespace(
+                verts=vertex_sequence,
+                edges=edge_sequence,
+                faces=face_sequence,
+                select_history=(),
+            )
+            for sequence in (vertex_sequence, edge_sequence, face_sequence):
+                setattr(cast(Any, sequence), "ensure_lookup_table", lambda: None)
+                setattr(cast(Any, sequence), "index_update", lambda: None)
+            cast(Any, core.extend_selection_to_mirror)(bm, 0, TOLERANCE)
+            assert edge_sequence.iterations == (2 if selection_mode == "edge" else 1)
+            assert face_sequence.iterations == (2 if selection_mode == "face" else 1)
+    finally:
+        setattr(core, method_name, original_builder)
+
+
+def _check_extend_selection_wrapper_matrix():
+    wrapper_specs = (
+        (operators, "operator"),
+        (replay_module, "replay"),
+    )
+    selection_modes = ("empty", "vertex", "edge", "face")
+    original_extend = core.extend_selection_to_mirror
+    original_operator_bpy = operators.bpy
+    original_operator_bmesh = operators.bmesh
+    original_replay_bpy = replay_module.bpy
+    original_replay_bmesh = replay_module.bmesh
+
+    for wrapper_module, wrapper_name in wrapper_specs:
+        for selection_mode in selection_modes:
+            bm = bmesh.new()
+            left = [bm.verts.new(co) for co in ((-1.0, 0.0, 0.0), (-1.0, 1.0, 0.0), (-1.0, 0.0, 1.0))]
+            right = [bm.verts.new(co) for co in ((1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (1.0, 0.0, 1.0))]
+            left_face = bm.faces.new(left)
+            right_face = bm.faces.new(right)
+            bm.verts.ensure_lookup_table()
+            bm.edges.ensure_lookup_table()
+            bm.faces.ensure_lookup_table()
+            left_edge = next(edge for edge in bm.edges if set(edge.verts) == {left[0], left[1]})
+            right_edge = next(edge for edge in bm.edges if set(edge.verts) == {right[0], right[1]})
+            if selection_mode == "vertex":
+                left[0].select = True
+            elif selection_mode == "edge":
+                left_edge.select = True
+            elif selection_mode == "face":
+                left_face.select = True
+            history_element = (
+                left[0] if selection_mode == "vertex" else left_edge if selection_mode == "edge" else left_face
+            )
+            if selection_mode != "empty":
+                bm.select_history.add(history_element)
+            history_before = tuple(cast(Any, bm.select_history))
+            calls = []
+            updates = []
+
+            def spy_extend(mesh, axis_index, tolerance):
+                calls.append((mesh, axis_index, tolerance))
+                return original_extend(mesh, axis_index, tolerance)
+
+            setattr(core, "extend_selection_to_mirror", spy_extend)
+            settings = SimpleNamespace(select_mirrored=True)
+            fake_context = SimpleNamespace(scene=SimpleNamespace(ydd_symmetric_edit=settings))
+            fake_bpy = SimpleNamespace(context=fake_context)
+            fake_mesh_module = SimpleNamespace(
+                from_edit_mesh=lambda _mesh: bm,
+                update_edit_mesh=lambda _mesh, **kwargs: updates.append(kwargs),
+            )
+            setattr(wrapper_module, "bpy", fake_bpy)
+            setattr(wrapper_module, "bmesh", fake_mesh_module)
+            obj = SimpleNamespace(mode="EDIT", data=SimpleNamespace())
+            try:
+                if wrapper_name == "operator":
+                    wrapper_module._maybe_extend_selection_to_mirror(obj, 0, TOLERANCE)
+                else:
+                    wrapper_module._maybe_extend_selection_to_mirror(obj.data, 0, TOLERANCE)
+                assert len(calls) == 1, (wrapper_name, selection_mode)
+                assert calls[0][0] is bm
+                assert calls[0][1:] == (0, TOLERANCE)
+                assert len(updates) == 1, (wrapper_name, selection_mode)
+                assert tuple(cast(Any, bm.select_history)) == history_before, (wrapper_name, selection_mode)
+                if selection_mode == "empty":
+                    assert not any(element.select for element in (*bm.verts, *bm.edges, *bm.faces))
+                elif selection_mode == "vertex":
+                    assert right[0].select
+                elif selection_mode == "edge":
+                    assert right_edge.select
+                else:
+                    assert right_face.select
+            finally:
+                bm.free()
+
+    setattr(core, "extend_selection_to_mirror", original_extend)
+    setattr(operators, "bpy", original_operator_bpy)
+    setattr(operators, "bmesh", original_operator_bmesh)
+    setattr(replay_module, "bpy", original_replay_bpy)
+    setattr(replay_module, "bmesh", original_replay_bmesh)
+
+
 def _assert_a_reference_case(coords, axis_index: int, tolerance: float):
     reference = _ReferenceBinLookup(coords, axis_index, tolerance)
     lookup = core.build_vertex_mirror_lookup(coords, axis_index, tolerance)
     expected_pairs = _pair_table(reference, coords)
     assert core.build_vertex_pair_table(coords, axis_index, tolerance) == expected_pairs
+    batch_count_before = lookup._batch_path_count
     old_mirrored = tuple(reference.find_all_mirrored(coords))
     new_mirrored = lookup.find_all_mirrored(coords)
     assert old_mirrored == new_mirrored
     old_direct = tuple(reference.find_all_direct(coords))
     new_direct = lookup.find_all_direct(coords)
     assert old_direct == new_direct
+    assert lookup._batch_path_count > batch_count_before
     return old_mirrored, new_mirrored
 
 
@@ -757,41 +1190,70 @@ def _check_carrier_frame_lifecycle():
         (Coordinate3D(1.0, 0.0, 0.0), Coordinate3D(0.0, 1.0, 0.0), Coordinate3D(0.0, 0.0, 0.0)),
         basis_case,
     )
-    raw = cast(Any, {FaceId(index + 1): vertices for index, vertices in enumerate(raw_cases)})
+    vertex_coords = tuple(vertex.as_tuple() for vertices in raw_cases for vertex in vertices)
+    face_vertex_ids = {}
+    offset = 0
+    for index, vertices in enumerate(raw_cases):
+        face_id = FaceId(index + 1)
+        face_vertex_ids[face_id] = tuple(range(offset, offset + len(vertices)))
+        offset += len(vertices)
     lazy_type_name = "LazyCarrierFrameMap"
     lazy_type = cast(Any, getattr(core, lazy_type_name))
-    lazy = lazy_type(raw)
+    lazy = lazy_type(vertex_coords, face_vertex_ids)
     assert lazy._cache == {}
     keys = tuple(lazy)
-    assert len(lazy) == len(raw)
-    assert keys == tuple(raw)
+    assert len(lazy) == len(face_vertex_ids)
+    assert keys == tuple(face_vertex_ids)
     assert FaceId(1) in lazy
     assert lazy._cache == {}
-    same = lazy_type(dict(raw))
-    different_raw = dict(raw)
-    different_raw[FaceId(1)] = (Coordinate3D(99.0, 99.0, 99.0),)
-    different = lazy_type(different_raw)
+    same = lazy_type(vertex_coords, dict(face_vertex_ids))
+    different_coords = ((99.0, 99.0, 99.0),) + vertex_coords[1:]
+    different = lazy_type(different_coords, dict(face_vertex_ids))
     assert lazy == same
     assert lazy != different
     assert lazy._cache == same._cache == different._cache == {}
+    single = lazy_type(vertex_coords[:3], {FaceId(1): (0, 1, 2)})
+    loose = lazy_type((vertex_coords[2], vertex_coords[1], vertex_coords[0]), {FaceId(1): (2, 1, 0)})
+    assert single == loose
+    assert single._cache == loose._cache == {}
     shared = copy.copy(lazy)
-    assert shared._raw is lazy._raw
+    assert shared._vertex_coords is lazy._vertex_coords
+    assert shared._face_vertex_ids is lazy._face_vertex_ids
     assert shared._cache is lazy._cache
     cloned = copy.deepcopy(lazy)
-    assert cloned._raw == lazy._raw
-    assert cloned._raw is not lazy._raw
+    assert cloned._vertex_coords == lazy._vertex_coords
+    assert cloned._face_vertex_ids == lazy._face_vertex_ids
+    assert cloned._face_vertex_ids is not lazy._face_vertex_ids
     assert cloned._cache == {}
-    partial = lazy_type(dict(raw))
+    partial = lazy_type(vertex_coords, dict(face_vertex_ids))
     partial.get(FaceId(1))
-    partial_clone = copy.deepcopy(partial)
+    original_factory = core._carrier_frame_from_coords
+    factory_calls = 0
+
+    def count_factory(vertices):
+        nonlocal factory_calls
+        factory_calls += 1
+        return original_factory(vertices)
+
+    setattr(core, "_carrier_frame_from_coords", count_factory)
+    try:
+        factory_calls = 0
+        partial_clone = copy.deepcopy(partial)
+    finally:
+        setattr(core, "_carrier_frame_from_coords", original_factory)
+    assert factory_calls == 0
     assert tuple(partial._cache) == tuple(partial_clone._cache) == (FaceId(1),)
-    assert len(partial_clone._cache) < len(raw)
-    for face_id, vertices in raw.items():
+    assert len(partial_clone._cache) < len(face_vertex_ids)
+    assert partial_clone._cache is not partial._cache
+    partial_clone._cache.clear()
+    assert tuple(partial._cache) == (FaceId(1),)
+    for face_id, vertex_ids in face_vertex_ids.items():
+        vertices = tuple(Coordinate3D(*vertex_coords[index]) for index in vertex_ids)
         assert lazy.get(face_id) == _reference_carrier_frame(vertices)
     value = lazy.get(FaceId(2))
     assert lazy[FaceId(2)] is value
     assert lazy.get(FaceId(999)) is None
-    assert len(lazy._cache) == len(raw)
+    assert len(lazy._cache) == len(face_vertex_ids)
     assert lazy[FaceId(6)] != lazy[FaceId(7)]
     cloned_value = cloned.get(FaceId(2))
     assert cloned_value == value
@@ -799,10 +1261,11 @@ def _check_carrier_frame_lifecycle():
 
 
 def _check_history_and_single_object_guard():
-    raw = {FaceId(1): (Coordinate3D(0.0, 0.0, 0.0),)}
+    vertex_coords = ((0.0, 0.0, 0.0),)
+    face_vertex_ids = {FaceId(1): (0,)}
     lazy_type_name = "LazyCarrierFrameMap"
     lazy_type = cast(Any, getattr(core, lazy_type_name))
-    carrier_frames = lazy_type(raw)
+    carrier_frames = lazy_type(vertex_coords, face_vertex_ids)
     session = KnifeSession(
         window_pointer=1,
         area_pointer=2,
@@ -901,11 +1364,13 @@ def _check_rip_lookup_validation():
             "tolerance": core.build_vertex_mirror_lookup(coords, 0, TOLERANCE * 2.0),
             "count": core.build_vertex_mirror_lookup(coords[:-1], 0, TOLERANCE),
         }
-        first_bad = core.build_vertex_mirror_lookup(coords, 0, TOLERANCE)
-        first_bad._coords[0] = (first_bad._coords[0][0] + 1.0, *first_bad._coords[0][1:])
+        first_bad_coords = list(coords)
+        first_bad_coords[0] = Vector((first_bad_coords[0][0] + 1.0, *first_bad_coords[0][1:]))
+        first_bad = core.build_vertex_mirror_lookup(first_bad_coords, 0, TOLERANCE)
         variants["first"] = first_bad
-        last_bad = core.build_vertex_mirror_lookup(coords, 0, TOLERANCE)
-        last_bad._coords[-1] = (last_bad._coords[-1][0] + 1.0, *last_bad._coords[-1][1:])
+        last_bad_coords = list(coords)
+        last_bad_coords[-1] = Vector((last_bad_coords[-1][0] + 1.0, *last_bad_coords[-1][1:]))
+        last_bad = core.build_vertex_mirror_lookup(last_bad_coords, 0, TOLERANCE)
         variants["last"] = last_bad
 
         original_match = rip_module._lookup_matches_mesh
@@ -960,6 +1425,10 @@ def _check_rip_lookup_validation():
 
 def run():
     _check_vertex_lookup_equivalence()
+    _check_batch_candidate_contract_edges()
+    _check_extend_selection_matrix()
+    _check_extend_selection_lazy_indices()
+    _check_extend_selection_wrapper_matrix()
     _check_topology_equivalence()
     _check_carrier_frame_lifecycle()
     _check_history_and_single_object_guard()

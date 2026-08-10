@@ -11,11 +11,12 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal, cast
 
 import bmesh
+import numpy  # type: ignore
 from mathutils import Vector
 from mathutils.kdtree import KDTree
 
@@ -192,14 +193,26 @@ class VertexMirrorLookup:
         *,
         axis_index: int,
         tolerance: float,
-        coords: list[tuple[float, float, float]],
-        tree: KDTree,
+        coords: tuple[tuple[float, float, float], ...],
+        tree: KDTree | None = None,
     ) -> None:
         self._axis_index = axis_index
         self._tolerance = tolerance
         self._coords = coords
         self._tree = tree
         self._on_plane_indices: frozenset[int] | None = None
+        self._batch_index: dict | Literal[False] | None = None
+        self._batch_path_count = 0
+
+    def _ensure_tree(self) -> KDTree:
+        tree = self._tree
+        if tree is None:
+            tree = KDTree(len(self._coords))
+            for index, stored in enumerate(self._coords):
+                tree.insert(Vector(stored), index)
+            tree.balance()
+            self._tree = tree
+        return tree
 
     def _on_plane_registered(self) -> frozenset[int]:
         """Registered indices whose stored coordinate lies on the plane."""
@@ -251,6 +264,26 @@ class VertexMirrorLookup:
         """
 
         results: list[int | None] = [None] * len(coords)
+        query = self._query_matrix(coords)
+        if query is not None:
+            # The float64 image of every float32 coordinate is exact, so the
+            # vectorized plane predicate and axis negation match is_on_plane
+            # and mirror_coordinate value-for-value.
+            on_plane_mask = numpy.abs(query[:, self._axis_index]) <= self._tolerance
+            on_plane_queries = numpy.flatnonzero(on_plane_mask)
+            if len(on_plane_queries):
+                resolved = self._resolve_injective(query[on_plane_mask], plane_side=True)
+                for query_index, target in zip(on_plane_queries.tolist(), resolved, strict=True):
+                    results[query_index] = target
+            off_queries = numpy.flatnonzero(~on_plane_mask)
+            if len(off_queries):
+                mirrored = query[~on_plane_mask]
+                mirrored[:, self._axis_index] = -mirrored[:, self._axis_index]
+                resolved = self._resolve_injective(mirrored, plane_side=False)
+                for query_index, target in zip(off_queries.tolist(), resolved, strict=True):
+                    results[query_index] = target
+            return tuple(results)
+
         on_plane_entries = [(index, co) for index, co in enumerate(coords) if self.is_on_plane(co)]
         if on_plane_entries:
             resolved = self._resolve_injective(
@@ -280,7 +313,33 @@ class VertexMirrorLookup:
         ``find(mirror_coordinate(co))`` double-reflection idiom.
         """
 
-        return tuple(self._resolve_injective(list(coords)))
+        query = self._query_matrix(coords)
+        return tuple(self._resolve_injective(query if query is not None else list(coords)))
+
+    @staticmethod
+    def _query_matrix(coords: Sequence) -> numpy.ndarray | None:
+        """Vectorized float64 image of *coords*, or ``None`` when unconvertible."""
+
+        if len(coords) == 0:
+            return numpy.zeros((0, 3), dtype=numpy.float64)
+        if isinstance(coords, numpy.ndarray):
+            matrix = numpy.asarray(coords, dtype=numpy.float64)
+        else:
+            # Vector.to_tuple() is a C call and ~4x faster than letting numpy
+            # iterate each Vector through the sequence protocol.
+            try:
+                matrix = numpy.array([position.to_tuple() for position in coords], dtype=numpy.float64)
+            except AttributeError:
+                try:
+                    matrix = numpy.array(
+                        [(float(position[0]), float(position[1]), float(position[2])) for position in coords],
+                        dtype=numpy.float64,
+                    )
+                except (TypeError, ValueError, IndexError):
+                    return None
+        if matrix.ndim != 2 or matrix.shape != (len(coords), 3):
+            return None
+        return matrix
 
     def _candidates_for(self, position) -> list[tuple[float, int]]:
         """Distance-ascending registered candidates within *tolerance*."""
@@ -289,7 +348,7 @@ class VertexMirrorLookup:
         tolerance = self._tolerance
         radius = math.sqrt(3.0) * tolerance * (1.0 + 1.0e-3)
         found = []
-        for _coordinate, index, _distance in self._tree.find_range(Vector(position_coord), radius):
+        for _coordinate, index, _distance in self._ensure_tree().find_range(Vector(position_coord), radius):
             stored = self._coords[index]
             distance = _chebyshev_distance_3d(position_coord, stored)
             if distance <= tolerance:
@@ -312,26 +371,66 @@ class VertexMirrorLookup:
         whole result injective.
         """
 
-        if plane_side is None:
-            candidate_lists = [list(self._candidates_for(position)) for position in positions]
-        else:
-            on_plane_targets = self._on_plane_registered()
-            candidate_lists = [
-                [
-                    (distance, index)
-                    for distance, index in self._candidates_for(position)
-                    if (index in on_plane_targets) == plane_side
+        arrays = self._batch_candidate_arrays(positions, plane_side)
+        results: list[int | None] = [None] * len(positions)
+        if arrays is not None:
+            query_indices, registered_indices, distances = arrays
+            if len(query_indices) == 0:
+                return results
+            query_counts = numpy.bincount(query_indices, minlength=len(positions))
+            target_counts = numpy.bincount(registered_indices, minlength=len(self._coords))
+            starts = numpy.cumsum(query_counts) - query_counts
+            single = query_counts == 1
+            single_queries = numpy.flatnonzero(single)
+            single_targets = registered_indices[starts[single_queries]]
+            trivial = target_counts[single_targets] == 1
+            assigned = numpy.full(len(positions), -1, dtype=numpy.int64)
+            assigned[single_queries[trivial]] = single_targets[trivial]
+            remainder_mask = query_counts > 0
+            remainder_mask[single_queries[trivial]] = False
+            remainder = numpy.flatnonzero(remainder_mask).tolist()
+            results = [None if target < 0 else target for target in assigned.tolist()]
+            if not remainder:
+                return results
+            candidate_lists: dict[int, list[tuple[float, int]]] = {}
+            registered_list = registered_indices.tolist()
+            distance_list = distances.tolist()
+            for query in remainder:
+                begin = int(starts[query])
+                end = begin + int(query_counts[query])
+                candidate_lists[query] = [
+                    (float(distance_list[position]), int(registered_list[position])) for position in range(begin, end)
                 ]
-                for position in positions
-            ]
+            queue = remainder
+        else:
+            if plane_side is None:
+                candidate_lists = {
+                    query: list(self._candidates_for(position)) for query, position in enumerate(positions)
+                }
+            else:
+                on_plane_targets = self._on_plane_registered()
+                candidate_lists = {
+                    query: [
+                        (distance, index)
+                        for distance, index in self._candidates_for(position)
+                        if (index in on_plane_targets) == plane_side
+                    ]
+                    for query, position in enumerate(positions)
+                }
+            queue = list(range(len(positions)))
+
         queries_by_target: dict[int, list[int]] = defaultdict(list)
-        for query, candidates in enumerate(candidate_lists):
-            for _distance, target in candidates:
+        for query in queue:
+            for _distance, target in candidate_lists[query]:
                 queries_by_target[target].append(query)
 
-        results: list[int | None] = [None] * len(positions)
-        visited = [False] * len(positions)
-        for start in range(len(positions)):
+        visited: dict[int, bool] = dict.fromkeys(queue, False)
+        for query in queue:
+            candidates = candidate_lists[query]
+            if len(candidates) == 1 and queries_by_target[candidates[0][1]] == [query]:
+                results[query] = candidates[0][1]
+                visited[query] = True
+        for start in queue:
             if visited[start]:
                 continue
             visited[start] = True
@@ -357,6 +456,145 @@ class VertexMirrorLookup:
                     results[query] = target
         return results
 
+    def _registered_batch_index(self):
+        """Registered-side packed-bin index, built once; ``False`` when unpackable."""
+
+        cached = self._batch_index
+        if cached is not None:
+            return cached
+        matrix = numpy.array(self._coords, dtype=numpy.float64).reshape(len(self._coords), 3)
+        inverse = 1.0 / max(self._tolerance, 1.0e-12)
+        scaled = matrix * inverse
+        if not numpy.isfinite(scaled).all() or numpy.any(numpy.abs(scaled) >= 2**62):
+            self._batch_index = False
+            return False
+        bins = numpy.floor(scaled).astype(numpy.int64)
+        mins = bins.min(axis=0)
+        span_x, span_y, span_z = (int(size) for size in (bins.max(axis=0) - mins + 1))
+        # Collision-free 1D packing: shift bins into the registered bounding
+        # box and refuse the batch path when the span product would overflow
+        # the int64 key space.
+        if span_x * span_y * span_z >= 2**63:
+            self._batch_index = False
+            return False
+        stride_y = span_z
+        stride_x = span_y * span_z
+        shifted = bins - mins
+        keys = shifted[:, 0] * stride_x + shifted[:, 1] * stride_y + shifted[:, 2]
+        order = numpy.argsort(keys, kind="stable")
+        cached = {
+            "matrix": matrix,
+            "mins": mins,
+            "spans": numpy.asarray((span_x, span_y, span_z), dtype=numpy.int64),
+            "stride_x": stride_x,
+            "stride_y": stride_y,
+            "order": order,
+            "sorted_keys": keys[order],
+            "on_plane": numpy.abs(matrix[:, self._axis_index]) <= self._tolerance,
+        }
+        self._batch_index = cached
+        return cached
+
+    def _batch_candidate_arrays(self, positions: Sequence, plane_side: bool | None):
+        """Sorted (query, registered, distance) candidate arrays, or ``None``."""
+
+        if isinstance(positions, numpy.ndarray) and positions.dtype == numpy.float64:
+            query_coords = positions.reshape(len(positions), 3)
+        else:
+            query_coords = numpy.asarray(
+                [(float(position[0]), float(position[1]), float(position[2])) for position in positions],
+                dtype=numpy.float64,
+            ).reshape(len(positions), 3)
+        inverse = 1.0 / max(self._tolerance, 1.0e-12)
+        scaled_queries = query_coords * inverse
+        if not numpy.isfinite(scaled_queries).all() or numpy.any(numpy.abs(scaled_queries) >= 2**62):
+            return None
+
+        empty = (
+            numpy.empty(0, dtype=numpy.int64),
+            numpy.empty(0, dtype=numpy.int64),
+            numpy.empty(0, dtype=numpy.float64),
+        )
+        if len(self._coords):
+            index = self._registered_batch_index()
+            if index is False:
+                return None
+        if len(positions) == 0 or len(self._coords) == 0:
+            self._batch_path_count += 1
+            return empty
+
+        query_bins = numpy.floor(scaled_queries).astype(numpy.int64)
+        # The z-neighborhood is contiguous in packed-key space, so the 27
+        # neighbor bins collapse into 9 (dx, dy) windows of a clamped
+        # three-bin z range; clamping keeps ranges from bleeding into the
+        # neighboring (x, y) row.
+        offsets = numpy.asarray([(x, y) for x in (-1, 0, 1) for y in (-1, 0, 1)], dtype=numpy.int64)
+        shifted_xy = (query_bins[:, None, :2] + offsets[None, :, :]).reshape(-1, 2) - index["mins"][:2]
+        shifted_z = numpy.repeat(query_bins[:, 2] - index["mins"][2], len(offsets))
+        span_z = int(index["spans"][2])
+        valid = numpy.flatnonzero(
+            (shifted_xy >= 0).all(axis=1)
+            & (shifted_xy < index["spans"][:2]).all(axis=1)
+            & (shifted_z >= -1)
+            & (shifted_z <= span_z)
+        )
+        if len(valid) == 0:
+            self._batch_path_count += 1
+            return empty
+        valid_xy = shifted_xy[valid]
+        low_z = numpy.clip(shifted_z[valid] - 1, 0, span_z - 1)
+        high_z = numpy.clip(shifted_z[valid] + 1, 0, span_z - 1)
+        row_keys = valid_xy[:, 0] * index["stride_x"] + valid_xy[:, 1] * index["stride_y"]
+        sorted_keys = index["sorted_keys"]
+        left = numpy.searchsorted(sorted_keys, row_keys + low_z, side="left")
+        right = numpy.searchsorted(sorted_keys, row_keys + high_z, side="right")
+        counts = right - left
+        total = int(counts.sum())
+        if total == 0:
+            self._batch_path_count += 1
+            return empty
+
+        repeated_windows = numpy.repeat(numpy.arange(len(counts), dtype=numpy.int64), counts)
+        window_starts = numpy.repeat(numpy.cumsum(counts) - counts, counts)
+        offsets_in_window = numpy.arange(total, dtype=numpy.int64) - window_starts
+        registered_indices = index["order"][left[repeated_windows] + offsets_in_window]
+        query_indices = valid[repeated_windows] // len(offsets)
+        matrix = index["matrix"]
+        distances = numpy.max(numpy.abs(matrix[registered_indices] - query_coords[query_indices]), axis=1)
+        within = distances <= self._tolerance
+        if plane_side is not None:
+            within &= index["on_plane"][registered_indices] == plane_side
+        query_indices = query_indices[within]
+        registered_indices = registered_indices[within]
+        distances = distances[within]
+        # Window traversal is already query-grouped; a per-query (distance,
+        # index) sort is only needed when some query has several candidates.
+        if len(query_indices) and int(numpy.bincount(query_indices).max()) > 1:
+            candidate_order = numpy.lexsort((registered_indices, distances, query_indices))
+            query_indices = query_indices[candidate_order]
+            registered_indices = registered_indices[candidate_order]
+            distances = distances[candidate_order]
+        self._batch_path_count += 1
+        return query_indices, registered_indices, distances
+
+    def _batch_candidates(
+        self,
+        positions: Sequence,
+        plane_side: bool | None = None,
+    ) -> list[list[tuple[float, int]]] | None:
+        """Return all registered candidates for a batch, or ``None`` to fallback."""
+
+        arrays = self._batch_candidate_arrays(positions, plane_side)
+        if arrays is None:
+            return None
+        query_indices, registered_indices, distances = arrays
+        candidates: list[list[tuple[float, int]]] = [[] for _ in positions]
+        for query_index, registered_index, distance in zip(
+            query_indices.tolist(), registered_indices.tolist(), distances.tolist(), strict=True
+        ):
+            candidates[query_index].append((float(distance), int(registered_index)))
+        return candidates
+
 
 # One step is one trial assignment of a candidate to a query.  Only a
 # pathological mesh with many vertices packed inside one tolerance ball can
@@ -366,7 +604,7 @@ _INJECTIVE_STEP_LIMIT = 2_000
 
 def _solve_injective_component(
     queries: Sequence[int],
-    candidate_lists: Sequence[Sequence[tuple[float, int]]],
+    candidate_lists: Mapping[int, Sequence[tuple[float, int]]] | Sequence[Sequence[tuple[float, int]]],
     step_limit: int = _INJECTIVE_STEP_LIMIT,
 ) -> dict[int, int] | None:
     """Minimum-total-Chebyshev complete assignment for one candidate component.
@@ -471,14 +709,8 @@ def build_vertex_mirror_lookup(
     Chebyshev verification remains against the stored coordinate tuples.
     """
 
-    stored_coords: list[tuple[float, float, float]] = []
-    tree = KDTree(len(coords))
-    for index, co in enumerate(coords):
-        stored = (float(co[0]), float(co[1]), float(co[2]))
-        stored_coords.append(stored)
-        tree.insert(Vector(stored), index)
-    tree.balance()
-    return VertexMirrorLookup(axis_index=axis_index, tolerance=tolerance, coords=stored_coords, tree=tree)
+    stored_coords = tuple((float(co[0]), float(co[1]), float(co[2])) for co in coords)
+    return VertexMirrorLookup(axis_index=axis_index, tolerance=tolerance, coords=stored_coords)
 
 
 def _vertex_pair_table_from_lookup(
@@ -660,33 +892,48 @@ def remove_temporary_mesh_attributes(mesh) -> bool:
 
 
 class LazyCarrierFrameMap:
-    def __init__(self, raw: dict[FaceId, tuple[Coordinate3D, ...]]) -> None:
-        self._raw = raw
+    def __init__(
+        self,
+        vertex_coords: tuple[tuple[float, float, float], ...],
+        face_vertex_ids: dict[FaceId, tuple[int, ...]],
+    ) -> None:
+        self._vertex_coords = vertex_coords
+        self._face_vertex_ids = face_vertex_ids
         self._cache: dict[FaceId, CarrierFrameSnapshot] = {}
 
     def get(self, key: FaceId, default=None):
-        if key not in self._raw:
+        if key not in self._face_vertex_ids:
             return default
         return self[key]
 
     def __getitem__(self, key: FaceId) -> CarrierFrameSnapshot:
         cached = self._cache.get(key)
         if cached is None:
-            cached = _carrier_frame_from_coords(self._raw[key])
+            vertices = tuple(Coordinate3D(*self._vertex_coords[index]) for index in self._face_vertex_ids[key])
+            cached = _carrier_frame_from_coords(vertices)
             self._cache[key] = cached
         return cached
 
     def __contains__(self, key: object) -> bool:
-        return key in self._raw
+        return key in self._face_vertex_ids
 
     def __len__(self) -> int:
-        return len(self._raw)
+        return len(self._face_vertex_ids)
 
     def __iter__(self) -> Iterator[FaceId]:
-        return iter(self._raw)
+        return iter(self._face_vertex_ids)
 
     def __eq__(self, other) -> bool:
-        return isinstance(other, LazyCarrierFrameMap) and self._raw == other._raw
+        if not isinstance(other, LazyCarrierFrameMap):
+            return False
+        if set(self._face_vertex_ids) != set(other._face_vertex_ids):
+            return False
+        for face_id, vertex_ids in self._face_vertex_ids.items():
+            first = tuple(self._vertex_coords[index] for index in vertex_ids)
+            second = tuple(other._vertex_coords[index] for index in other._face_vertex_ids[face_id])
+            if first != second:
+                return False
+        return True
 
     def __ne__(self, other) -> bool:
         return not self == other
@@ -792,7 +1039,6 @@ def prepare_topology(
     hidden_by_face_id: HiddenFaceMap = {}
     key_to_face_ids: dict[FaceKey, list[FaceId]] = defaultdict(list)
     face_records: dict[FaceId, FaceMatchRecord] = {}
-    carrier_raw: dict[FaceId, tuple[Coordinate3D, ...]] = {}
     face_vertex_ids: dict[FaceId, tuple[int, ...]] = {}
     face_ids_by_vertex_set: dict[frozenset[int], list[FaceId]] = defaultdict(list)
     total_faces = 0
@@ -807,7 +1053,6 @@ def prepare_topology(
         face[face_hidden_layer] = int(face.hide)
         face[history_token_layer] = history_token
         hidden_by_face_id[face_id] = bool(face.hide)
-        carrier_raw[face_id] = tuple(_coordinate_3d(vertex.co) for vertex in face.verts)
         vertex_ids = tuple(vertex.index for vertex in face.verts)
         face_vertex_ids[face_id] = vertex_ids
         face_ids_by_vertex_set[frozenset(vertex_ids)].append(face_id)
@@ -952,7 +1197,7 @@ def prepare_topology(
     return TopologyPreparation(
         mirror_face_ids=mirror_face_ids,
         hidden_by_face_id=hidden_by_face_id,
-        carrier_frames=cast(CarrierFrameMap, LazyCarrierFrameMap(carrier_raw)),
+        carrier_frames=cast(CarrierFrameMap, LazyCarrierFrameMap(vertex_lookup._coords, face_vertex_ids)),
         vertex_lookup=vertex_lookup,
         matched_faces=len(mirror_face_ids),
         total_faces=total_faces,
@@ -3323,8 +3568,16 @@ def extend_selection_to_mirror(
     selected_edges = [edge for edge in bm.edges if edge.select]
     selected_faces = [face for face in bm.faces if face.select]
 
-    edge_by_verts = {frozenset((edge.verts[0].index, edge.verts[1].index)): edge for edge in bm.edges if edge.is_valid}
-    face_by_verts = {frozenset(vertex.index for vertex in face.verts): face for face in bm.faces if face.is_valid}
+    edge_by_verts = (
+        {frozenset((edge.verts[0].index, edge.verts[1].index)): edge for edge in bm.edges if edge.is_valid}
+        if selected_edges
+        else {}
+    )
+    face_by_verts = (
+        {frozenset(vertex.index for vertex in face.verts): face for face in bm.faces if face.is_valid}
+        if selected_faces
+        else {}
+    )
 
     added = 0
 
