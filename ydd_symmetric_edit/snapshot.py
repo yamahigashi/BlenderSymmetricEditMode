@@ -915,16 +915,16 @@ def _capture_mesh_selection(
         flags = numpy.empty(count_faces, dtype=bool)
         polygons.foreach_get("select", flags)
         selected_faces = _selected_indices_from_flags(flags)
-        if include_loops:
-            loop_verts32 = numpy.empty(len(loops), dtype=numpy.int32)
-            loop_starts32 = numpy.empty(count_faces, dtype=numpy.int32)
-            loop_totals32 = numpy.empty(count_faces, dtype=numpy.int32)
-            loops.foreach_get("vertex_index", loop_verts32)
-            polygons.foreach_get("loop_start", loop_starts32)
-            polygons.foreach_get("loop_total", loop_totals32)
-            loop_verts = loop_verts32.astype(numpy.int64)
-            loop_starts = loop_starts32.astype(numpy.int64)
-            loop_totals = loop_totals32.astype(numpy.int64)
+    if "FACE" in domain_set and include_loops:
+        loop_verts32 = numpy.empty(len(loops), dtype=numpy.int32)
+        loop_starts32 = numpy.empty(count_faces, dtype=numpy.int32)
+        loop_totals32 = numpy.empty(count_faces, dtype=numpy.int32)
+        loops.foreach_get("vertex_index", loop_verts32)
+        polygons.foreach_get("loop_start", loop_starts32)
+        polygons.foreach_get("loop_total", loop_totals32)
+        loop_verts = loop_verts32.astype(numpy.int64)
+        loop_starts = loop_starts32.astype(numpy.int64)
+        loop_totals = loop_totals32.astype(numpy.int64)
 
     return SelectionCapture(
         coords=coords,

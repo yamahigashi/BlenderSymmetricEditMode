@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import sys
 import traceback
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import bmesh
@@ -360,6 +361,134 @@ def check_hidden_and_selected_counterpart() -> None:
         bm.free()
 
 
+def _legacy_build_element_pair_maps(
+    bm: bmesh.types.BMesh,
+) -> delete_dissolve.ElementPairMaps:
+    """Pre-U-7 scalar oracle for edge/face pairing."""
+
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    bm.verts.index_update()
+    bm.edges.index_update()
+    bm.faces.index_update()
+    coords = tuple(vertex.co.copy() for vertex in bm.verts)
+    vert_pairs = delete_dissolve.core.build_vertex_pair_table(coords, _AXIS, _TOL)
+
+    endpoint_to_edges = defaultdict(list)
+    for edge in bm.edges:
+        endpoint_to_edges[frozenset((edge.verts[0].index, edge.verts[1].index))].append(edge.index)
+    multi_edge_keys = {key for key, indices in endpoint_to_edges.items() if len(indices) > 1}
+    edge_pairs = {}
+    for edge in bm.edges:
+        own_key = frozenset((edge.verts[0].index, edge.verts[1].index))
+        mapped = tuple(vert_pairs.get(vertex.index) for vertex in edge.verts)
+        counterpart_key = frozenset(mapped)
+        candidates = endpoint_to_edges.get(counterpart_key)
+        edge_pairs[edge.index] = (
+            None
+            if own_key in multi_edge_keys or None in mapped or counterpart_key in multi_edge_keys or not candidates
+            else candidates[0]
+        )
+
+    face_ids_by_vertex_set = defaultdict(list)
+    for face in bm.faces:
+        face_ids_by_vertex_set[frozenset(vertex.index for vertex in face.verts)].append(face.index)
+    conflicted_keys = {key for key, indices in face_ids_by_vertex_set.items() if len(indices) > 1}
+    face_pairs = {}
+    for face in bm.faces:
+        own_key = frozenset(vertex.index for vertex in face.verts)
+        mapped = tuple(vert_pairs.get(vertex.index) for vertex in face.verts)
+        counterpart_key = frozenset(mapped)
+        counterparts = face_ids_by_vertex_set.get(counterpart_key)
+        face_pairs[face.index] = (
+            None
+            if own_key in conflicted_keys or None in mapped or counterpart_key in conflicted_keys or not counterparts
+            else counterparts[0]
+        )
+    return delete_dissolve.ElementPairMaps(vert_pairs, edge_pairs, face_pairs)
+
+
+def _legacy_quantize(co) -> tuple[float, float, float]:
+    scale = max(float(_TOL), 1.0e-12)
+    return tuple(round(round(float(value) / scale) * scale, 12) for value in co)
+
+
+def _legacy_symmetry_census(pair_maps, bm):
+    """Pre-U-7 scalar oracle for the global unmatched-element census."""
+
+    unmatched_verts = Counter(
+        _legacy_quantize(vertex.co) for vertex in bm.verts if vertex.index not in pair_maps.vert_pairs
+    )
+    unmatched_edges = Counter(
+        frozenset(_legacy_quantize(vertex.co) for vertex in edge.verts)
+        for edge in bm.edges
+        if pair_maps.edge_pair_by_index.get(edge.index) is None
+    )
+    unmatched_faces = Counter(
+        frozenset(_legacy_quantize(vertex.co) for vertex in face.verts)
+        for face in bm.faces
+        if pair_maps.face_pair_by_index.get(face.index) is None
+    )
+    return unmatched_verts, unmatched_edges, unmatched_faces
+
+
+def _assert_pair_maps_equal(actual, expected) -> None:
+    assert actual.vert_pairs == expected.vert_pairs
+    assert actual.edge_pair_by_index == expected.edge_pair_by_index
+    assert actual.face_pair_by_index == expected.face_pair_by_index
+
+
+def check_u7_census_and_pair_map_equivalence() -> None:
+    """U-7 vector paths preserve global census and pair-map semantics."""
+
+    bm = _build_symmetric_grid()
+    try:
+        legacy_before_maps = _legacy_build_element_pair_maps(bm)
+        actual_before_maps = delete_dissolve.build_element_pair_maps(bm, _AXIS, _TOL)
+        _assert_pair_maps_equal(actual_before_maps, legacy_before_maps)
+        legacy_before = _legacy_symmetry_census(legacy_before_maps, bm)
+        actual_before = delete_dissolve._symmetry_census(actual_before_maps, bm, _TOL)
+        assert actual_before == legacy_before
+
+        # Hidden state is intentionally outside census/pair-map keys.
+        bm.verts[0].hide = True
+        bm.edges[0].hide = True
+        bm.faces[0].hide = True
+        hidden_maps = delete_dissolve.build_element_pair_maps(bm, _AXIS, _TOL)
+        _assert_pair_maps_equal(hidden_maps, legacy_before_maps)
+        assert delete_dissolve._symmetry_census(hidden_maps, bm, _TOL) == legacy_before
+
+        # One asymmetric point makes the global pre/post census comparison fail.
+        bm.verts[0].co.x += 0.37
+        legacy_after_maps = _legacy_build_element_pair_maps(bm)
+        actual_after_maps = delete_dissolve.build_element_pair_maps(bm, _AXIS, _TOL)
+        _assert_pair_maps_equal(actual_after_maps, legacy_after_maps)
+        legacy_after = _legacy_symmetry_census(legacy_after_maps, bm)
+        actual_after = delete_dissolve._symmetry_census(actual_after_maps, bm, _TOL)
+        assert actual_after == legacy_after
+        assert (actual_before == actual_after) == (legacy_before == legacy_after) is False
+    finally:
+        bm.free()
+
+
+
+def check_u7_far_origin_key_parity() -> None:
+    """Vector census keys match the scalar rule far from the origin."""
+
+    import numpy
+
+    offsets = (0.0, 999.0, 5000.0, -55509.512847766746, 65000.25)
+    coords = numpy.asarray(
+        [(offset + step * _TOL, -offset, offset * 0.5) for offset in offsets for step in (-1.4, 0.0, 0.7, 2.0)],
+        dtype=numpy.float64,
+    )
+    for tolerance in (_TOL, 1.0e-4):
+        vector_keys = delete_dissolve._quantized_coordinate_keys(coords, tolerance)
+        for row, co in zip(vector_keys, coords, strict=True):
+            assert tuple(row.tolist()) == delete_dissolve._quantize_co_key(co, tolerance)
+
+
 def run() -> None:
     check_symmetric_grid_domains()
     check_on_plane_self_pairs()
@@ -371,6 +500,8 @@ def run() -> None:
     check_already_selected_counterpart()
     check_pair_map_involution()
     check_hidden_and_selected_counterpart()
+    check_u7_census_and_pair_map_equivalence()
+    check_u7_far_origin_key_parity()
     print("YSE_DELETE_UNITS_OK", flush=True)
 
 

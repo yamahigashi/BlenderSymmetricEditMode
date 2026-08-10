@@ -3166,6 +3166,58 @@ def _check_partial_face_resolution_vertex_registry_fallback():
     assert partial.resolve_count == 1
 
 
+def _check_u7_unselected_topology_bulk_capture():
+    """U-7 topology arrays remain global when every selection column is empty."""
+
+    from ydd_symmetric_edit import delete_dissolve
+
+    bm = _build_deformed_grid(4)
+    bulk = _clone_bmesh(bm)
+    try:
+        for source in (bm, bulk):
+            for element in (*source.verts, *source.edges, *source.faces):
+                element.select = False
+        bulk_data = _BulkMeshData(bulk)
+        mesh_object = _BulkMeshObject(bulk_data)
+        compatibility = core.capture_selection_snapshot(
+            bm,
+            domains=("EDGE", "FACE"),
+            include_loops=True,
+        )
+        captured = core.capture_selection_snapshot(
+            bulk,
+            mesh_object=mesh_object,
+            domains=("EDGE", "FACE"),
+            include_loops=True,
+        )
+        assert numpy.array_equal(captured.loop_verts, compatibility.loop_verts)
+        assert numpy.array_equal(captured.loop_starts, compatibility.loop_starts)
+        assert numpy.array_equal(captured.loop_totals, compatibility.loop_totals)
+        assert len(captured.loop_starts) == len(bulk.faces)
+
+        maps_compat = delete_dissolve.build_element_pair_maps(bm, 0, TOLERANCE)
+        maps_bulk = delete_dissolve.build_element_pair_maps(
+            bulk,
+            0,
+            TOLERANCE,
+            mesh_object=mesh_object,
+        )
+        assert maps_bulk.vert_pairs == maps_compat.vert_pairs
+        assert maps_bulk.edge_pair_by_index == maps_compat.edge_pair_by_index
+        assert maps_bulk.face_pair_by_index == maps_compat.face_pair_by_index
+        census_compat = delete_dissolve._symmetry_census(maps_compat, bm, TOLERANCE)
+        census_bulk = delete_dissolve._symmetry_census(
+            maps_bulk,
+            bulk,
+            TOLERANCE,
+            mesh_object=mesh_object,
+        )
+        assert census_bulk == census_compat
+    finally:
+        bulk.free()
+        bm.free()
+
+
 def run():
     _check_vertex_lookup_equivalence()
     _check_batch_candidate_contract_edges()
@@ -3205,6 +3257,7 @@ def run():
     _check_face_primary_conflict_downgrades_every_claimant()
     _check_partial_face_resolution_counter_and_deepcopy()
     _check_partial_face_resolution_vertex_registry_fallback()
+    _check_u7_unselected_topology_bulk_capture()
     _check_lazy_restore_state_matrix()
     _check_prepare_session_invoke_does_not_resolve()
     # Duplicate COMMITTED records and F9 ABSENT are exercised by the existing

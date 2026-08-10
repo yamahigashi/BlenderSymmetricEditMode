@@ -7,19 +7,58 @@ from __future__ import annotations
 import math
 import traceback
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, cast
 
 import bmesh
 import bpy
+import numpy  # type: ignore
 from bpy.props import BoolProperty, EnumProperty, FloatProperty
 
 from . import backup, core
+from .matching import _one_sided_pair_table
 from .replay import _symmetry_parameters
 from .snapshot import capture_selection_snapshot
 
 _DeleteType = Literal["VERT", "EDGE", "FACE", "EDGE_FACE", "ONLY_FACE"]
 _DissolveMode = Literal["VERTS", "EDGES", "FACES"]
+
+
+class _DensePartnerMap(Mapping[int, int | None]):
+    """Read-only mapping view over a dense ``-1``-for-unmatched pair column."""
+
+    __slots__ = ("_partners",)
+
+    def __init__(self, partners: numpy.ndarray) -> None:
+        self._partners = partners
+
+    def __getitem__(self, key: int) -> int | None:
+        if not isinstance(key, (int, numpy.integer)):
+            raise KeyError(key)
+        index = int(key)
+        if index < 0 or index >= len(self._partners):
+            raise KeyError(key)
+        partner = int(self._partners[index])
+        return None if partner < 0 else partner
+
+    def __iter__(self):
+        return iter(range(len(self._partners)))
+
+    def __len__(self) -> int:
+        return len(self._partners)
+
+    def __eq__(self, other) -> bool:
+        if isinstance(other, _DensePartnerMap):
+            return numpy.array_equal(self._partners, other._partners)
+        if not isinstance(other, Mapping) or len(self) != len(other):
+            return False
+        missing = object()
+        return all(other.get(index, missing) == self[index] for index in self)
+
+    def __repr__(self) -> str:
+        unmatched = int(numpy.count_nonzero(self._partners < 0))
+        return f"_DensePartnerMap(count={len(self)}, unmatched={unmatched})"
 
 
 @dataclass(frozen=True)
@@ -31,8 +70,15 @@ class ElementPairMaps:
     """
 
     vert_pairs: dict[int, int]
-    edge_pair_by_index: dict[int, int | None]
-    face_pair_by_index: dict[int, int | None]
+    edge_pair_by_index: Mapping[int, int | None]
+    face_pair_by_index: Mapping[int, int | None]
+    _vertex_partner_indices: numpy.ndarray | None = field(default=None, repr=False, compare=False)
+    _edge_partner_indices: numpy.ndarray | None = field(default=None, repr=False, compare=False)
+    _face_partner_indices: numpy.ndarray | None = field(default=None, repr=False, compare=False)
+    _edge_vertices: numpy.ndarray | None = field(default=None, repr=False, compare=False)
+    _loop_verts: numpy.ndarray | None = field(default=None, repr=False, compare=False)
+    _loop_starts: numpy.ndarray | None = field(default=None, repr=False, compare=False)
+    _loop_totals: numpy.ndarray | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -59,6 +105,129 @@ class CollapseTracking:
     mirror_group_by_group: dict[int, int | None]
 
 
+def _vertex_pair_arrays(
+    coords: numpy.ndarray,
+    axis_index: int,
+    tolerance: float,
+) -> tuple[dict[int, int], numpy.ndarray]:
+    """Resolve all vertex pairs once and retain a dense partner column."""
+
+    count = len(coords)
+    pairs = _one_sided_pair_table(coords, axis_index, tolerance)
+    if pairs is None:
+        pairs = core.build_vertex_pair_table(coords, axis_index, tolerance)
+
+    dense = numpy.full(count, -1, dtype=numpy.int64)
+    if pairs:
+        sources = numpy.fromiter(pairs, dtype=numpy.int64, count=len(pairs))
+        dense[sources] = numpy.fromiter(pairs.values(), dtype=numpy.int64, count=len(pairs))
+    return pairs, dense
+
+
+def _edge_vertex_rows(bm: bmesh.types.BMesh, mesh_object) -> numpy.ndarray:
+    """Capture edge endpoints through Mesh bulk when its index order is safe."""
+
+    count = len(bm.edges)
+    data = getattr(mesh_object, "data", None) if mesh_object is not None else None
+    edges = getattr(data, "edges", None) if data is not None else None
+    if (
+        data is not None
+        and getattr(data, "shape_keys", None) is None
+        and edges is not None
+        and len(edges) == count
+        and callable(getattr(edges, "foreach_get", None))
+    ):
+        endpoints32 = numpy.empty(count * 2, dtype=numpy.int32)
+        try:
+            edges.foreach_get("vertices", endpoints32)
+            endpoints = endpoints32.astype(numpy.int64).reshape((-1, 2))
+            if count:
+                first = sorted(vertex.index for vertex in bm.edges[0].verts)
+                last = sorted(vertex.index for vertex in bm.edges[count - 1].verts)
+                if sorted(endpoints[0].tolist()) != first or sorted(endpoints[-1].tolist()) != last:
+                    raise ValueError("Mesh/BMesh edge order mismatch")
+            return endpoints
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            pass
+
+    return numpy.fromiter(
+        (vertex.index for edge in bm.edges for vertex in edge.verts),
+        dtype=numpy.int64,
+        count=count * 2,
+    ).reshape((-1, 2))
+
+
+def _unique_row_partner_indices(
+    rows: numpy.ndarray,
+    mapped_rows: numpy.ndarray,
+    mapped_valid: numpy.ndarray,
+) -> numpy.ndarray:
+    """Match unordered fixed-width rows, rejecting source/destination collisions."""
+
+    count, width = rows.shape
+    partners = numpy.full(count, -1, dtype=numpy.int64)
+    if count == 0 or width == 0:
+        return partners
+
+    canonical = numpy.sort(rows, axis=1)
+    bits_per_value = max(1, int(canonical.max(initial=0)).bit_length())
+    if width * bits_per_value <= 64:
+        keys = numpy.zeros(count, dtype=numpy.uint64)
+        for column in canonical.T:
+            keys = (keys << bits_per_value) | column.astype(numpy.uint64)
+    else:
+        row_dtype = numpy.dtype((numpy.void, canonical.dtype.itemsize * width))
+        keys = numpy.ascontiguousarray(canonical).view(row_dtype).reshape(-1)
+    unique_keys, first_rows, inverse, counts = numpy.unique(
+        keys,
+        return_index=True,
+        return_inverse=True,
+        return_counts=True,
+    )
+
+    mapped = numpy.sort(mapped_rows, axis=1)
+    if width * bits_per_value <= 64:
+        mapped_keys = numpy.zeros(count, dtype=numpy.uint64)
+        for column in mapped.T:
+            mapped_keys = (mapped_keys << bits_per_value) | numpy.maximum(column, 0).astype(numpy.uint64)
+    else:
+        mapped_keys = numpy.ascontiguousarray(mapped).view(row_dtype).reshape(-1)
+    destinations = numpy.searchsorted(unique_keys, mapped_keys)
+    clipped = numpy.minimum(destinations, max(len(unique_keys) - 1, 0))
+    found = (destinations < len(unique_keys)) & (unique_keys[clipped] == mapped_keys)
+    usable = mapped_valid & (counts[inverse] == 1) & found
+    usable &= counts[clipped] == 1
+    partners[usable] = first_rows[clipped[usable]]
+    return partners
+
+
+def _face_partner_indices(
+    loop_verts: numpy.ndarray,
+    loop_starts: numpy.ndarray,
+    loop_totals: numpy.ndarray,
+    vertex_partners: numpy.ndarray,
+) -> numpy.ndarray:
+    """Build face partners in degree groups using canonical row keys."""
+
+    partners = numpy.full(len(loop_starts), -1, dtype=numpy.int64)
+    for raw_total in numpy.unique(loop_totals):
+        total = int(raw_total)
+        face_indices = numpy.flatnonzero(loop_totals == total)
+        if total == 0:
+            continue
+        positions = loop_starts[face_indices, None] + numpy.arange(total, dtype=numpy.int64)
+        rows = loop_verts[positions]
+        mapped_rows = vertex_partners[rows]
+        local_partners = _unique_row_partner_indices(
+            rows,
+            mapped_rows,
+            numpy.all(mapped_rows >= 0, axis=1),
+        )
+        matched = local_partners >= 0
+        partners[face_indices[matched]] = face_indices[local_partners[matched]]
+    return partners
+
+
 def build_element_pair_maps(
     bm: bmesh.types.BMesh,
     axis_index: int,
@@ -66,11 +235,7 @@ def build_element_pair_maps(
     *,
     mesh_object=None,
 ) -> ElementPairMaps:
-    """Resolve vertex / edge / face counterparts for selection expansion.
-
-    Vertex coordinates are bulk-captured when *mesh_object* is provided
-    (:func:`capture_selection_snapshot`). Edge/face pair logic is unchanged.
-    """
+    """Resolve global vertex/edge/face counterparts through bulk row arrays."""
 
     bm.verts.ensure_lookup_table()
     bm.edges.ensure_lookup_table()
@@ -82,80 +247,36 @@ def build_element_pair_maps(
     capture = capture_selection_snapshot(
         bm,
         mesh_object=mesh_object,
-        domains=(),
+        domains=("FACE",),
         include_history=False,
+        include_loops=True,
     )
-    vert_pairs = core.build_vertex_pair_table(capture.coords, axis_index, tolerance)
-
-    endpoint_to_edges: dict[frozenset[int], list[int]] = defaultdict(list)
-    for edge in bm.edges:
-        key = frozenset((edge.verts[0].index, edge.verts[1].index))
-        endpoint_to_edges[key].append(edge.index)
-
-    multi_edge_keys = {key for key, indices in endpoint_to_edges.items() if len(indices) > 1}
-
-    edge_pair_by_index: dict[int, int | None] = {}
-    for edge in bm.edges:
-        v1 = edge.verts[0].index
-        v2 = edge.verts[1].index
-        own_key = frozenset((v1, v2))
-        if own_key in multi_edge_keys:
-            edge_pair_by_index[edge.index] = None
-            continue
-        p1 = vert_pairs.get(v1)
-        p2 = vert_pairs.get(v2)
-        if p1 is None or p2 is None:
-            edge_pair_by_index[edge.index] = None
-            continue
-        counterpart_key = frozenset((p1, p2))
-        if counterpart_key in multi_edge_keys:
-            edge_pair_by_index[edge.index] = None
-            continue
-        candidates = endpoint_to_edges.get(counterpart_key)
-        if not candidates:
-            edge_pair_by_index[edge.index] = None
-            continue
-        edge_pair_by_index[edge.index] = candidates[0]
-
-    face_ids_by_vertex_set: dict[frozenset[int], list[int]] = defaultdict(list)
-    for face in bm.faces:
-        key = frozenset(vertex.index for vertex in face.verts)
-        face_ids_by_vertex_set[key].append(face.index)
-
-    conflicted_keys = {key for key, indices in face_ids_by_vertex_set.items() if len(indices) > 1}
-
-    face_pair_by_index: dict[int, int | None] = {}
-    for face in bm.faces:
-        own_verts = [vertex.index for vertex in face.verts]
-        own_key = frozenset(own_verts)
-        if own_key in conflicted_keys:
-            face_pair_by_index[face.index] = None
-            continue
-        mapped: list[int] = []
-        missing = False
-        for vertex_index in own_verts:
-            partner = vert_pairs.get(vertex_index)
-            if partner is None:
-                missing = True
-                break
-            mapped.append(partner)
-        if missing:
-            face_pair_by_index[face.index] = None
-            continue
-        counterpart_key = frozenset(mapped)
-        if counterpart_key in conflicted_keys:
-            face_pair_by_index[face.index] = None
-            continue
-        counterparts = face_ids_by_vertex_set.get(counterpart_key)
-        if not counterparts:
-            face_pair_by_index[face.index] = None
-            continue
-        face_pair_by_index[face.index] = counterparts[0]
+    vert_pairs, vertex_partners = _vertex_pair_arrays(capture.coords, axis_index, tolerance)
+    edge_vertices = _edge_vertex_rows(bm, mesh_object)
+    mapped_edge_vertices = vertex_partners[edge_vertices]
+    edge_partners = _unique_row_partner_indices(
+        edge_vertices,
+        mapped_edge_vertices,
+        numpy.all(mapped_edge_vertices >= 0, axis=1),
+    )
+    face_partners = _face_partner_indices(
+        capture.loop_verts,
+        capture.loop_starts,
+        capture.loop_totals,
+        vertex_partners,
+    )
 
     return ElementPairMaps(
         vert_pairs=vert_pairs,
-        edge_pair_by_index=edge_pair_by_index,
-        face_pair_by_index=face_pair_by_index,
+        edge_pair_by_index=_DensePartnerMap(edge_partners),
+        face_pair_by_index=_DensePartnerMap(face_partners),
+        _vertex_partner_indices=vertex_partners,
+        _edge_partner_indices=edge_partners,
+        _face_partner_indices=face_partners,
+        _edge_vertices=edge_vertices,
+        _loop_verts=capture.loop_verts,
+        _loop_starts=capture.loop_starts,
+        _loop_totals=capture.loop_totals,
     )
 
 
@@ -339,6 +460,60 @@ def _quantize_co_key(co, tolerance: float) -> tuple[float, float, float]:
     )
 
 
+def _quantized_coordinate_keys(coords: numpy.ndarray, tolerance: float) -> numpy.ndarray:
+    """Vector form of :func:`_quantize_co_key` over a float64 coordinate matrix."""
+
+    scale = max(float(tolerance), 1.0e-12)
+    scaled = numpy.asarray(coords, dtype=numpy.float64) / scale
+    if not numpy.isfinite(scaled).all():
+        # Preserve the scalar path's exception type/order for non-finite input.
+        return numpy.asarray([_quantize_co_key(co, tolerance) for co in coords], dtype=numpy.float64)
+    # numpy.round(x, 12) diverges from Python round(x, 12) beyond |x| ~ 5e3,
+    # so representatives come from Python round applied to the few unique bins
+    # — bit-identical to _quantize_co_key at vectorized cost.
+    bins = numpy.rint(scaled)
+    unique_bins, inverse = numpy.unique(bins, return_inverse=True)
+    representatives = numpy.asarray(
+        [round(value * scale, 12) for value in unique_bins.tolist()],
+        dtype=numpy.float64,
+    )
+    keys = representatives[inverse].reshape(bins.shape)
+    keys[keys == 0.0] = 0.0
+    return keys
+
+
+def _dense_partner_indices(mapping, count: int) -> numpy.ndarray:
+    return numpy.fromiter(
+        (-1 if (partner := mapping.get(index)) is None else int(partner) for index in range(count)),
+        dtype=numpy.int64,
+        count=count,
+    )
+
+
+def _census_topology_arrays(
+    pair_maps: ElementPairMaps,
+    bm: bmesh.types.BMesh,
+) -> tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray, numpy.ndarray]:
+    edge_vertices = pair_maps._edge_vertices
+    loop_verts = pair_maps._loop_verts
+    loop_starts = pair_maps._loop_starts
+    loop_totals = pair_maps._loop_totals
+    if edge_vertices is None or len(edge_vertices) != len(bm.edges):
+        edge_vertices = _edge_vertex_rows(bm, None)
+    if loop_starts is None or len(loop_starts) != len(bm.faces):
+        capture = capture_selection_snapshot(
+            bm,
+            domains=("FACE",),
+            include_history=False,
+            include_loops=True,
+        )
+        loop_verts = capture.loop_verts
+        loop_starts = capture.loop_starts
+        loop_totals = capture.loop_totals
+    assert loop_verts is not None and loop_starts is not None and loop_totals is not None
+    return edge_vertices, loop_verts, loop_starts, loop_totals
+
+
 def _native_op_kwargs(op, options: dict) -> dict:
     """Keep only kwargs that the native operator RNA actually exposes.
 
@@ -390,6 +565,8 @@ def _symmetry_census(
     pair_maps: ElementPairMaps,
     bm: bmesh.types.BMesh,
     tolerance: float,
+    *,
+    mesh_object=None,
 ) -> tuple[Counter, Counter, Counter]:
     """Multiset of unmatched element signatures for post-operation verification.
 
@@ -399,22 +576,38 @@ def _symmetry_census(
     check, so equal unmatched *counts* at different positions still fail.
     """
 
-    unmatched_verts: Counter = Counter()
-    for vertex in bm.verts:
-        if vertex.index not in pair_maps.vert_pairs:
-            unmatched_verts[_quantize_co_key(vertex.co, tolerance)] += 1
+    capture = capture_selection_snapshot(
+        bm,
+        mesh_object=mesh_object,
+        domains=(),
+        include_history=False,
+    )
+    quantized = _quantized_coordinate_keys(capture.coords, tolerance)
+    edge_vertices, loop_verts, loop_starts, loop_totals = _census_topology_arrays(pair_maps, bm)
+    vertex_partners = pair_maps._vertex_partner_indices
+    edge_partners = pair_maps._edge_partner_indices
+    face_partners = pair_maps._face_partner_indices
+    if vertex_partners is None or len(vertex_partners) != len(bm.verts):
+        vertex_partners = _dense_partner_indices(pair_maps.vert_pairs, len(bm.verts))
+    if edge_partners is None or len(edge_partners) != len(bm.edges):
+        edge_partners = _dense_partner_indices(pair_maps.edge_pair_by_index, len(bm.edges))
+    if face_partners is None or len(face_partners) != len(bm.faces):
+        face_partners = _dense_partner_indices(pair_maps.face_pair_by_index, len(bm.faces))
 
-    unmatched_edges: Counter = Counter()
-    for edge in bm.edges:
-        if pair_maps.edge_pair_by_index.get(edge.index) is None:
-            key = frozenset(_quantize_co_key(vertex.co, tolerance) for vertex in edge.verts)
-            unmatched_edges[key] += 1
-
+    unmatched_verts: Counter = Counter(
+        tuple(float(value) for value in quantized[index]) for index in numpy.flatnonzero(vertex_partners < 0)
+    )
+    unmatched_edges: Counter = Counter(
+        frozenset(tuple(float(value) for value in quantized[vertex_id]) for vertex_id in edge_vertices[index])
+        for index in numpy.flatnonzero(edge_partners < 0)
+    )
     unmatched_faces: Counter = Counter()
-    for face in bm.faces:
-        if pair_maps.face_pair_by_index.get(face.index) is None:
-            key = frozenset(_quantize_co_key(vertex.co, tolerance) for vertex in face.verts)
-            unmatched_faces[key] += 1
+    for index in numpy.flatnonzero(face_partners < 0):
+        start = int(loop_starts[index])
+        total = int(loop_totals[index])
+        vertex_ids = loop_verts[start : start + total]
+        key = frozenset(tuple(float(value) for value in quantized[vertex_id]) for vertex_id in vertex_ids)
+        unmatched_faces[key] += 1
 
     return unmatched_verts, unmatched_edges, unmatched_faces
 
@@ -865,7 +1058,7 @@ class MESH_OT_ydd_symmetric_edit_dissolve(bpy.types.Operator):
             )
             return {"CANCELLED"}
 
-        census_before = _symmetry_census(pair_maps, bm, tolerance)
+        census_before = _symmetry_census(pair_maps, bm, tolerance, mesh_object=obj)
 
         # Backup before expansion so census rollback restores the original
         # one-sided selection (select flags are part of the mesh backup).
@@ -897,7 +1090,7 @@ class MESH_OT_ydd_symmetric_edit_dissolve(bpy.types.Operator):
                 if plan.unmatched_count == 0:
                     bm = bmesh.from_edit_mesh(mesh)
                     pair_maps_after = build_element_pair_maps(bm, axis_index, tolerance, mesh_object=obj)
-                    census_after = _symmetry_census(pair_maps_after, bm, tolerance)
+                    census_after = _symmetry_census(pair_maps_after, bm, tolerance, mesh_object=obj)
                     if census_before != census_after:
                         try:
                             backup.restore_topology_backup(mesh, backup_mesh)
@@ -1008,7 +1201,7 @@ class MESH_OT_ydd_symmetric_edit_edge_collapse(bpy.types.Operator):
 
             apply_expansion_plan(bm, plan)
             tracking = _mark_collapse_components(bm, pair_maps)
-            census_before = _symmetry_census(pair_maps, bm, tolerance)
+            census_before = _symmetry_census(pair_maps, bm, tolerance, mesh_object=obj)
             bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
 
             try:
@@ -1034,7 +1227,7 @@ class MESH_OT_ydd_symmetric_edit_edge_collapse(bpy.types.Operator):
                 if plan.unmatched_count == 0:
                     bm = bmesh.from_edit_mesh(mesh)
                     pair_maps_after = build_element_pair_maps(bm, axis_index, tolerance, mesh_object=obj)
-                    census_after = _symmetry_census(pair_maps_after, bm, tolerance)
+                    census_after = _symmetry_census(pair_maps_after, bm, tolerance, mesh_object=obj)
                     if census_before != census_after:
                         return _rollback_with_report(
                             self,
@@ -1122,7 +1315,7 @@ class MESH_OT_ydd_symmetric_edit_delete_edgeloop(bpy.types.Operator):
             )
             return {"CANCELLED"}
 
-        census_before = _symmetry_census(pair_maps, bm, tolerance)
+        census_before = _symmetry_census(pair_maps, bm, tolerance, mesh_object=obj)
         backup_mesh = None
         try:
             try:
@@ -1151,7 +1344,7 @@ class MESH_OT_ydd_symmetric_edit_delete_edgeloop(bpy.types.Operator):
                 if plan.unmatched_count == 0:
                     bm = bmesh.from_edit_mesh(mesh)
                     pair_maps_after = build_element_pair_maps(bm, axis_index, tolerance, mesh_object=obj)
-                    census_after = _symmetry_census(pair_maps_after, bm, tolerance)
+                    census_after = _symmetry_census(pair_maps_after, bm, tolerance, mesh_object=obj)
                     if census_before != census_after:
                         return _rollback_with_report(
                             self,
