@@ -36,6 +36,7 @@ from .layer_names import (
 )
 from .matching import (
     VertexMirrorLookup,
+    VertexRegistry,
     _coordinate_3d,
     _one_sided_pair_table,
     build_vertex_pair_table,
@@ -264,10 +265,18 @@ class LazyTopologyResolution:
         self._pairs: dict[int, int] = {}
         self._mirror_face_ids: MirrorFaceMap = {}
         self._carrier_frames: LazyCarrierFrameMap | None = None
+        self._vertex_registry: VertexRegistry | None = None
+        self._vertex_resolved = numpy.zeros(self.vertex_count, dtype=bool)
+        self._vertex_cache: dict[int, int | None] = {}
+        self._partial_resolve_count = 0
 
     @property
     def resolve_count(self) -> int:
         return self._resolve_count
+
+    @property
+    def partial_resolve_count(self) -> int:
+        return self._partial_resolve_count
 
     def __eq__(self, other) -> bool:
         if not isinstance(other, LazyTopologyResolution):
@@ -336,8 +345,31 @@ class LazyTopologyResolution:
             self.loop_starts,
             self.loop_totals,
         )
+        self._vertex_resolved[:] = True
         self._resolved = True
         return self
+
+    def resolve_vertices(self, vertex_ids) -> dict[int, int | None]:
+        requested = numpy.unique(numpy.asarray(tuple(vertex_ids), dtype=numpy.int64).reshape(-1))
+        if len(requested) and (numpy.any(requested < 0) or numpy.any(requested >= self.vertex_count)):
+            raise IndexError("vertex query index out of range")
+        if self._resolved:
+            return {int(vertex_id): self._pairs.get(int(vertex_id)) for vertex_id in requested.tolist()}
+
+        unresolved = requested[~self._vertex_resolved[requested]]
+        if len(unresolved):
+            if self._vertex_registry is None:
+                self._vertex_registry = VertexRegistry(self.coords64, self.axis_index, self.tolerance)
+            resolution = self._vertex_registry.resolve_closure(unresolved)
+            if resolution is None:
+                self.resolve()
+                return {int(vertex_id): self._pairs.get(int(vertex_id)) for vertex_id in requested.tolist()}
+            closure_ids, pairs = resolution
+            updates = {int(vertex_id): pairs.get(int(vertex_id)) for vertex_id in closure_ids.tolist()}
+            self._vertex_cache.update(updates)
+            self._vertex_resolved[closure_ids] = True
+            self._partial_resolve_count += 1
+        return {int(vertex_id): self._vertex_cache[int(vertex_id)] for vertex_id in requested.tolist()}
 
     def __deepcopy__(self, memo):
         clone = type(self).__new__(type(self))
@@ -351,6 +383,7 @@ class LazyTopologyResolution:
             "hide_edges",
             "hide_faces",
             "vertex_select",
+            "_vertex_resolved",
         ):
             value = getattr(self, name)
             setattr(clone, name, None if value is None else value.copy())
@@ -364,10 +397,13 @@ class LazyTopologyResolution:
             "face_count",
             "_resolved",
             "_resolve_count",
+            "_partial_resolve_count",
         ):
             setattr(clone, name, getattr(self, name))
         clone._pairs = dict(self._pairs)
         clone._mirror_face_ids = dict(self._mirror_face_ids)
+        clone._vertex_cache = dict(self._vertex_cache)
+        clone._vertex_registry = None
         if self._carrier_frames is None:
             clone._carrier_frames = None
         else:

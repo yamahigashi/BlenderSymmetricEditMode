@@ -699,6 +699,46 @@ class VertexRegistry:
         targets, queries, distances = arrays
         return self._sorted_candidate_arrays(queries, targets, distances)
 
+    def resolve_closure(self, vertex_ids):
+        """Resolve the candidate-graph closure containing *vertex_ids*."""
+
+        seeds = self._query_indices(vertex_ids)
+        if self._index is None:
+            return None
+        if len(seeds) == 0:
+            return numpy.empty(0, dtype=numpy.int64), {}
+
+        closure = set(int(vertex_id) for vertex_id in seeds.tolist())
+        frontier = numpy.asarray(sorted(closure), dtype=numpy.int64)
+        while len(frontier):
+            candidates = (
+                self.candidates_on_plane(frontier),
+                self.candidates_off_plane(frontier),
+            )
+            claimants = (
+                self.claimants_on_plane(frontier),
+                self.claimants_off_plane(frontier),
+            )
+            if any(arrays is None for arrays in (*candidates, *claimants)):
+                return None
+            neighbors = {int(vertex_id) for arrays in candidates for vertex_id in arrays[1].tolist()}
+            neighbors.update(int(vertex_id) for arrays in claimants for vertex_id in arrays[0].tolist())
+            added = neighbors.difference(closure)
+            closure.update(added)
+            frontier = numpy.asarray(sorted(added), dtype=numpy.int64)
+
+        closure_ids = numpy.asarray(sorted(closure), dtype=numpy.int64)
+        parts = (
+            self.candidates_on_plane(closure_ids),
+            self.candidates_off_plane(closure_ids),
+        )
+        if any(arrays is None for arrays in parts):
+            return None
+        queries = numpy.concatenate(tuple(arrays[0] for arrays in parts))
+        targets = numpy.concatenate(tuple(arrays[1] for arrays in parts))
+        distances = numpy.concatenate(tuple(arrays[2] for arrays in parts))
+        return closure_ids, _pair_table_from_candidate_arrays(closure_ids, queries, targets, distances)
+
 
 _INJECTIVE_STEP_LIMIT = 2_000
 
@@ -799,6 +839,84 @@ def _injective_tie_margin(cost: float, best_cost: float | None) -> float:
     return reference * 1.0e-9
 
 
+def _pair_table_from_candidate_arrays(vertex_ids, queries, targets, distances):
+    vertex_ids = numpy.asarray(vertex_ids, dtype=numpy.int64)
+    local_count = len(vertex_ids)
+    if len(queries):
+        order = numpy.lexsort((targets, distances, queries))
+        queries = queries[order]
+        targets = targets[order]
+        distances = distances[order]
+        local_queries = numpy.searchsorted(vertex_ids, queries)
+        local_targets = numpy.searchsorted(vertex_ids, targets)
+        if (
+            numpy.any(local_queries >= local_count)
+            or numpy.any(local_targets >= local_count)
+            or not numpy.array_equal(vertex_ids[local_queries], queries)
+            or not numpy.array_equal(vertex_ids[local_targets], targets)
+        ):
+            raise RuntimeError("candidate arrays escape their vertex closure")
+    else:
+        local_queries = numpy.empty(0, dtype=numpy.int64)
+        local_targets = numpy.empty(0, dtype=numpy.int64)
+
+    query_counts = numpy.bincount(local_queries, minlength=local_count)
+    target_counts = numpy.bincount(local_targets, minlength=local_count)
+    starts = numpy.cumsum(query_counts) - query_counts
+    assigned = numpy.full(local_count, -1, dtype=numpy.int64)
+    singles = numpy.flatnonzero(query_counts == 1)
+    if len(singles):
+        single_targets = local_targets[starts[singles]]
+        unique = target_counts[single_targets] == 1
+        assigned[singles[unique]] = single_targets[unique]
+
+    remainder_mask = query_counts > 0
+    remainder_mask[assigned >= 0] = False
+    candidate_lists: dict[int, list[tuple[float, int]]] = {}
+    for query in numpy.flatnonzero(remainder_mask).tolist():
+        begin = int(starts[query])
+        end = begin + int(query_counts[query])
+        candidate_lists[query] = [
+            (float(distance), int(target))
+            for distance, target in zip(distances[begin:end], local_targets[begin:end], strict=True)
+        ]
+    if candidate_lists:
+        queries_by_target: dict[int, list[int]] = defaultdict(list)
+        for query, candidates in candidate_lists.items():
+            for _distance, target in candidates:
+                queries_by_target[target].append(query)
+        visited: set[int] = set()
+        for start_query in candidate_lists:
+            if start_query in visited or not candidate_lists[start_query]:
+                visited.add(start_query)
+                continue
+            component = []
+            component_targets: set[int] = set()
+            pending = [start_query]
+            visited.add(start_query)
+            while pending:
+                query = pending.pop()
+                component.append(query)
+                for _distance, target in candidate_lists[query]:
+                    if target in component_targets:
+                        continue
+                    component_targets.add(target)
+                    for other in queries_by_target[target]:
+                        if other not in visited:
+                            visited.add(other)
+                            pending.append(other)
+            assignment = _solve_injective_component(component, candidate_lists)
+            if assignment is not None:
+                for query, target in assignment.items():
+                    assigned[query] = target
+
+    return {
+        int(vertex_ids[source]): int(vertex_ids[target])
+        for source, target in enumerate(assigned.tolist())
+        if target >= 0 and int(assigned[target]) == source
+    }
+
+
 def _one_sided_candidate_arrays(coords64: numpy.ndarray, axis_index: int, tolerance: float):
     """Build sorted mirror candidate arrays with one off-plane probe."""
 
@@ -887,62 +1005,9 @@ def _one_sided_pair_table(coords64: numpy.ndarray, axis_index: int, tolerance: f
     arrays = _one_sided_candidate_arrays(coords64, axis_index, tolerance)
     if arrays is None:
         return None
-    count = len(coords64)
     queries, targets, distances = arrays
-    query_counts = numpy.bincount(queries, minlength=count)
-    target_counts = numpy.bincount(targets, minlength=count)
-    starts = numpy.cumsum(query_counts) - query_counts
-    assigned = numpy.full(count, -1, dtype=numpy.int64)
-    singles = numpy.flatnonzero(query_counts == 1)
-    if len(singles):
-        single_targets = targets[starts[singles]]
-        unique = target_counts[single_targets] == 1
-        assigned[singles[unique]] = single_targets[unique]
-    remainder_mask = query_counts > 0
-    remainder_mask[assigned >= 0] = False
-    candidate_lists: dict[int, list[tuple[float, int]]] = {}
-    for query in numpy.flatnonzero(remainder_mask).tolist():
-        begin = int(starts[query])
-        end = begin + int(query_counts[query])
-        candidate_lists[query] = [
-            (float(distance), int(target))
-            for distance, target in zip(distances[begin:end], targets[begin:end], strict=True)
-        ]
-    if candidate_lists:
-        queries_by_target: dict[int, list[int]] = defaultdict(list)
-        for query, candidates in candidate_lists.items():
-            for _distance, target in candidates:
-                queries_by_target[target].append(query)
-        visited: set[int] = set()
-        for start_query in candidate_lists:
-            if start_query in visited or not candidate_lists[start_query]:
-                visited.add(start_query)
-                continue
-            component = []
-            component_targets: set[int] = set()
-            pending = [start_query]
-            visited.add(start_query)
-            while pending:
-                query = pending.pop()
-                component.append(query)
-                for _distance, target in candidate_lists[query]:
-                    if target in component_targets:
-                        continue
-                    component_targets.add(target)
-                    for other in queries_by_target[target]:
-                        if other not in visited:
-                            visited.add(other)
-                            pending.append(other)
-            assignment = _solve_injective_component(component, candidate_lists)
-            if assignment is not None:
-                for query, target in assignment.items():
-                    assigned[query] = target
-    pairs = {
-        source: int(target)
-        for source, target in enumerate(assigned.tolist())
-        if target >= 0 and int(assigned[target]) == source
-    }
-    return pairs
+    vertex_ids = numpy.arange(len(coords64), dtype=numpy.int64)
+    return _pair_table_from_candidate_arrays(vertex_ids, queries, targets, distances)
 
 
 def build_vertex_mirror_lookup(

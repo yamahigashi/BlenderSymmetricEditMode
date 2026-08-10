@@ -25,6 +25,9 @@ from mathutils import Vector
 
 PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
+sys.path.insert(0, str(PACKAGE_PARENT / "tests"))
+
+from perf_fixtures import DENSE_CANDIDATE_COORDS  # noqa: E402
 
 from ydd_symmetric_edit import core, face_mapping, operators, selection, snapshot  # noqa: E402
 from ydd_symmetric_edit import replay as replay_module  # noqa: E402
@@ -2004,6 +2007,171 @@ def _check_vertex_registry_matches_one_sided_candidate_multiset():
         assert sorted(candidate_rows) == _candidate_multiset(expected)
 
 
+def _partial_resolution_handle(coords, tolerance=TOLERANCE):
+    coords64 = numpy.asarray(coords, dtype=numpy.float64).reshape((-1, 3))
+    empty = numpy.empty(0, dtype=numpy.int64)
+    return core.LazyTopologyResolution(
+        coords64,
+        empty,
+        empty,
+        empty,
+        numpy.zeros(len(coords64), dtype=bool),
+        empty,
+        empty,
+        0,
+        tolerance,
+        1,
+    )
+
+
+def _full_vertex_results(coords, tolerance=TOLERANCE):
+    handle = _partial_resolution_handle(coords, tolerance)
+    handle.resolve()
+    return {vertex_id: handle._pairs.get(vertex_id) for vertex_id in range(handle.vertex_count)}
+
+
+def _phase4_u3_coords():
+    return numpy.asarray(
+        DENSE_CANDIDATE_COORDS
+        + (
+            (3.0, 2.0, 0.0),
+            (-3.0, 2.0, 0.0),
+            (0.0, 4.0, 0.0),
+            (0.0, 4.0 + 0.5 * TOLERANCE, 0.0),
+            (7.0, 7.0, 0.0),
+        ),
+        dtype=numpy.float64,
+    )
+
+
+def _check_partial_vertex_resolution_matches_global():
+    coords = _phase4_u3_coords()
+    expected = _full_vertex_results(coords)
+
+    rng = random.Random(830_021)
+    random_ids = rng.sample(range(len(coords)), 7)
+    random_handle = _partial_resolution_handle(coords)
+    assert random_handle.resolve_vertices(random_ids) == {
+        vertex_id: expected[vertex_id] for vertex_id in sorted(random_ids)
+    }
+
+    negative_handle = _partial_resolution_handle(coords)
+    assert negative_handle.resolve_vertices((1,)) == {1: expected[1]}
+    assert negative_handle._vertex_resolved[: len(DENSE_CANDIDATE_COORDS)].all()
+    assert 0 in negative_handle._vertex_cache
+
+    plane_handle = _partial_resolution_handle(coords)
+    assert plane_handle.resolve_vertices((10,)) == {10: expected[10]}
+    assert plane_handle._vertex_resolved[10:12].all()
+
+    dense_handle = _partial_resolution_handle(coords)
+    assert dense_handle.resolve_vertices((0,)) == {0: expected[0]}
+    assert dense_handle._vertex_resolved[: len(DENSE_CANDIDATE_COORDS)].all()
+
+    rejection_coords = numpy.asarray(
+        ((1.0, 0.0, 0.0), (-1.0, 0.0, 0.0), (1.0 + 0.5 * TOLERANCE, 0.0, 0.0)),
+        dtype=numpy.float64,
+    )
+    rejection_expected = _full_vertex_results(rejection_coords)
+    assert rejection_expected == {0: None, 1: None, 2: None}
+    rejection_handle = _partial_resolution_handle(rejection_coords)
+    assert rejection_handle.resolve_vertices((1,)) == {1: None}
+    assert rejection_handle._vertex_resolved.all()
+    assert rejection_handle._vertex_cache == {0: None, 1: None, 2: None}
+
+
+def _check_partial_vertex_resolution_sequence_and_negative_cache():
+    coords = _phase4_u3_coords()
+    expected = _full_vertex_results(coords)
+    first = (1, 8)
+    second = (10, 12)
+
+    sequential = _partial_resolution_handle(coords)
+    assert sequential.resolve_vertices(first) == {vertex_id: expected[vertex_id] for vertex_id in first}
+    assert sequential.resolve_vertices(second) == {vertex_id: expected[vertex_id] for vertex_id in second}
+
+    combined = _partial_resolution_handle(coords)
+    union = tuple(sorted(set(first) | set(second)))
+    assert combined.resolve_vertices(union) == {vertex_id: expected[vertex_id] for vertex_id in union}
+    assert sequential._vertex_cache == combined._vertex_cache
+    assert numpy.array_equal(sequential._vertex_resolved, combined._vertex_resolved)
+
+    negative_count = sequential.partial_resolve_count
+    registry = sequential._vertex_registry
+    assert sequential.resolve_vertices((12,)) == {12: None}
+    assert sequential.resolve_vertices((12,)) == {12: None}
+    assert sequential.partial_resolve_count == negative_count
+    assert sequential._vertex_registry is registry
+
+
+def _check_partial_vertex_resolution_deepcopy_and_full_resolve():
+    coords = _phase4_u3_coords()
+    expected = _full_vertex_results(coords)
+    original = _partial_resolution_handle(coords)
+    original.resolve_vertices((1,))
+    assert original.resolve_count == 0
+
+    cloned = copy.deepcopy(original)
+    assert original.resolve_count == cloned.resolve_count == 0
+    assert cloned == original
+    assert cloned._vertex_cache == original._vertex_cache
+    assert cloned._vertex_cache is not original._vertex_cache
+    assert cloned._vertex_resolved is not original._vertex_resolved
+    assert cloned._vertex_registry is None or cloned._vertex_registry is not original._vertex_registry
+
+    cloned.resolve_vertices((8,))
+    assert cloned._vertex_resolved[8]
+    assert not original._vertex_resolved[8]
+    assert 8 not in original._vertex_cache
+
+    original.resolve()
+    assert original.resolve_count == 1
+    assert original._pairs == {vertex_id: mirror for vertex_id, mirror in expected.items() if mirror is not None}
+    assert original.resolve_vertices(range(len(coords))) == expected
+
+
+def _check_partial_vertex_resolution_non_power_tolerance_boundary():
+    tolerance = 1.0e-5
+    source_axis = 21.0 * 2.0**-20
+    target_axis = -source_axis + tolerance
+    coords = numpy.asarray(
+        (
+            (source_axis, 0.25, -0.5),
+            (target_axis, 0.25, -0.5),
+            (0.0, 3.0, 0.0),
+        ),
+        dtype=numpy.float64,
+    )
+    assert abs(-coords[0, 0] - coords[1, 0]) == tolerance
+    expected = _full_vertex_results(coords, tolerance)
+    handle = _partial_resolution_handle(coords, tolerance)
+    assert handle.resolve_vertices((0, 1, 2)) == expected
+
+
+def _check_partial_vertex_resolution_registry_fallback_and_empty_guard():
+    empty_registry = core.VertexRegistry(numpy.empty((0, 3), dtype=numpy.float64), 0, TOLERANCE)
+    empty_closure = empty_registry.resolve_closure(())
+    assert empty_closure is not None
+    assert len(empty_closure[0]) == 0 and empty_closure[1] == {}
+
+    coords = numpy.asarray(((numpy.nan, 0.0, 0.0),), dtype=numpy.float64)
+    invalid_registry = core.VertexRegistry(coords, 0, TOLERANCE)
+    assert invalid_registry.resolve_closure(()) is None
+    full = _partial_resolution_handle(coords)
+    partial = _partial_resolution_handle(coords)
+
+    def outcome(call):
+        try:
+            return "ok", call()
+        except Exception as exc:
+            return "error", type(exc)
+
+    expected = outcome(lambda: full.resolve()._pairs.get(0))
+    actual = outcome(lambda: partial.resolve_vertices((0,))[0])
+    assert actual == expected
+    assert partial.resolve_count == 1
+
+
 def _check_lazy_restore_state_matrix():
     bm = _build_deformed_grid(3)
     try:
@@ -2254,6 +2422,11 @@ def run():
     _check_vertex_registry_plane_split_oracle()
     _check_vertex_registry_dense_candidates()
     _check_vertex_registry_matches_one_sided_candidate_multiset()
+    _check_partial_vertex_resolution_matches_global()
+    _check_partial_vertex_resolution_sequence_and_negative_cache()
+    _check_partial_vertex_resolution_deepcopy_and_full_resolve()
+    _check_partial_vertex_resolution_non_power_tolerance_boundary()
+    _check_partial_vertex_resolution_registry_fallback_and_empty_guard()
     _check_lazy_restore_state_matrix()
     _check_prepare_session_invoke_does_not_resolve()
     # Duplicate COMMITTED records and F9 ABSENT are exercised by the existing
