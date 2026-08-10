@@ -325,47 +325,32 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
             self.report({"ERROR"}, f"The edited mesh changed during {tool_label}")
             return {"CANCELLED"}
 
-        if session.topology_resolution is not None:
-            try:
-                resolution = session.topology_resolution.resolve()
-                session.mirror_face_ids = resolution.mirror_face_ids
-                session.carrier_frames = resolution.carrier_frames
-                session.hidden_by_face_id = {
-                    FaceId(face_id): bool(hidden)
-                    for face_id, hidden in zip(
-                        range(1, resolution.total_faces + 1),
-                        resolution.hide_faces.tolist(),
-                        strict=True,
-                    )
-                }
-                bm = bmesh.from_edit_mesh(obj.data)
-                resolution.materialize(bm)
-            except Exception as exc:
-                traceback.print_exc()
-                record = session_state._HISTORY_RECORDS.get(session.history_token)
-                if record is not None:
-                    record.status = "FAILED"
-                cleanup_session(window_pointer, keep_history_record=True)
-                _finish_report(self, {"ERROR"}, f"ydd Symmetric Edit resolution failed: {exc}")
-                return {"FINISHED"}
-            if resolution.matched_faces == 0:
-                core.remove_temporary_layers(bm)
-                bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
-                _finish_report(
-                    self,
-                    {"WARNING"},
-                    f"Only 0 of {resolution.total_faces} faces have an exact mirrored counterpart",
-                )
-                cleanup_session(window_pointer, keep_history_record=True)
-                return {"FINISHED"}
-            if resolution.matched_faces < resolution.total_faces:
-                _finish_report(
-                    self,
-                    {"WARNING"},
-                    f"Only {resolution.matched_faces} of {resolution.total_faces} faces have an exact mirrored counterpart",
-                )
-
         if session.tool_kind == "RIP":
+            if session.topology_resolution is not None:
+                try:
+                    resolution = session.topology_resolution
+                    rip_face_scope = (
+                        {FaceId(face_id) for vertex in session.rip.vertices for face_id in vertex.face_ids}
+                        if session.rip is not None
+                        else set()
+                    )
+                    resolution.resolve_faces(rip_face_scope)
+                    session.mirror_face_ids = {
+                        face_id: target
+                        for face_id, target in resolution.scoped_mirror_face_ids.items()
+                        if target is not None
+                    }
+                    session.carrier_frames = resolution.scoped_carrier_frames
+                    bm = bmesh.from_edit_mesh(obj.data)
+                    resolution.materialize_faces(bm, rip_face_scope)
+                except Exception as exc:
+                    traceback.print_exc()
+                    record = session_state._HISTORY_RECORDS.get(session.history_token)
+                    if record is not None:
+                        record.status = "FAILED"
+                    cleanup_session(window_pointer, keep_history_record=True)
+                    _finish_report(self, {"ERROR"}, f"ydd Symmetric Edit resolution failed: {exc}")
+                    return {"FINISHED"}
             return _finish_rip_session(self, session, obj, window_pointer)
 
         cutter = None
@@ -393,6 +378,40 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
             edge_layer, face_layer = core.get_required_layers(bm)
             if edge_layer is None or face_layer is None:
                 raise SymmetricKnifeError("Temporary topology markers are missing")
+
+            materialized_face_scope: set[FaceId] = set()
+
+            def _resolve_scope_overlay_and_materialize(edit_bm, path_edges):
+                current_face_layer = edit_bm.faces.layers.int.get(core.FACE_ID_LAYER)
+                if current_face_layer is None:
+                    raise SymmetricKnifeError("Temporary face markers are missing")
+                scope = {
+                    FaceId(int(face[current_face_layer]))
+                    for edge in path_edges
+                    if edge.is_valid
+                    for face in edge.link_faces
+                    if face.is_valid
+                }
+                resolution = session.topology_resolution
+                if resolution is None:
+                    lazy_face_map = session.mirror_face_ids
+                else:
+                    resolution.resolve_faces(scope)
+                    lazy_face_map = resolution.scoped_mirror_face_ids
+                    session.carrier_frames = resolution.scoped_carrier_frames
+                overlay = core.resolve_live_mirror_face_map(
+                    edit_bm,
+                    lazy_face_map,
+                    session.axis_index,
+                    session.tolerance,
+                    path_edges=path_edges,
+                )
+                if resolution is not None:
+                    pending = scope - materialized_face_scope
+                    if pending:
+                        resolution.materialize_faces(edit_bm, pending)
+                        materialized_face_scope.update(pending)
+                return overlay
 
             def _create_backup(edit_bm):
                 """Create topology backup; classify create failure as fatal."""
@@ -428,13 +447,14 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
 
                 crossing_count = len(by_side["CROSSES"])
                 side = "BOTH"
-                live_mirror_face_ids = core.resolve_live_mirror_face_map(
+                live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, _all_path_edges(by_side))
+                _edge_layer, face_layer = core.get_required_layers(bm)
+                by_side, total_path_edges = core.collect_knife_path_edges_by_side(
                     bm,
-                    session.mirror_face_ids,
                     session.axis_index,
                     session.tolerance,
-                    path_edges=_all_path_edges(by_side),
                 )
+                live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, _all_path_edges(by_side))
 
                 if crossing_count:
                     # Single backup covers p-stitch + mirror.
@@ -446,13 +466,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                         session.axis_index,
                         session.tolerance,
                     )
-                    live_mirror_face_ids = core.resolve_live_mirror_face_map(
-                        bm,
-                        session.mirror_face_ids,
-                        session.axis_index,
-                        session.tolerance,
-                        path_edges=_all_path_edges(by_side),
-                    )
+                    live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, _all_path_edges(by_side))
                     stitched, stitch_reason = core.apply_crosses_p_stitch(
                         bm,
                         by_side["CROSSES"],
@@ -467,13 +481,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                         session.axis_index,
                         session.tolerance,
                     )
-                    live_mirror_face_ids = core.resolve_live_mirror_face_map(
-                        bm,
-                        session.mirror_face_ids,
-                        session.axis_index,
-                        session.tolerance,
-                        path_edges=_all_path_edges(by_side),
-                    )
+                    live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, _all_path_edges(by_side))
                     crossing_count = len(by_side["CROSSES"])
                     # Remaining CROSSES are self-mirrored (skipped by stitch) or
                     # still straddling after a failed reclassification — the
@@ -490,13 +498,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                             session.axis_index,
                             session.tolerance,
                         )
-                        live_mirror_face_ids = core.resolve_live_mirror_face_map(
-                            bm,
-                            session.mirror_face_ids,
-                            session.axis_index,
-                            session.tolerance,
-                            path_edges=_all_path_edges(by_side),
-                        )
+                        live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, _all_path_edges(by_side))
 
                 crossing_plan, crossing_reason = core.plan_mirrored_path_crossings(
                     bm,
@@ -519,13 +521,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                             session.axis_index,
                             session.tolerance,
                         )
-                        live_mirror_face_ids = core.resolve_live_mirror_face_map(
-                            bm,
-                            session.mirror_face_ids,
-                            session.axis_index,
-                            session.tolerance,
-                            path_edges=_all_path_edges(by_side),
-                        )
+                        live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, _all_path_edges(by_side))
                         crossing_plan, crossing_reason = core.plan_mirrored_path_crossings(
                             bm,
                             by_side,
@@ -550,13 +546,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                         session.axis_index,
                         session.tolerance,
                     )
-                    live_mirror_face_ids = core.resolve_live_mirror_face_map(
-                        bm,
-                        session.mirror_face_ids,
-                        session.axis_index,
-                        session.tolerance,
-                        path_edges=_all_path_edges(by_side),
-                    )
+                    live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, _all_path_edges(by_side))
                     _edge_layer, face_layer = core.get_required_layers(bm)
 
                 source_edges = by_side["POSITIVE"] + by_side["NEGATIVE"]
@@ -577,12 +567,10 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     face_layer,
                     live_mirror_face_ids,
                 )
-                if not target_face_ids:
-                    raise SymmetricKnifeError(
-                        "The cut faces have no exact mirrored counterpart; adjust axis or tolerance"
-                    )
                 if unmatched:
                     raise SymmetricKnifeError(f"{len(unmatched)} cut face(s) have no exact mirrored counterpart")
+                if not target_face_ids:
+                    raise SymmetricKnifeError("The native cut path has no carrier faces")
 
                 use_direct_topology = core.reflected_path_uses_only_target_boundaries(
                     bm,
@@ -601,13 +589,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                             session.axis_index,
                             session.tolerance,
                         )
-                        live_mirror_face_ids = core.resolve_live_mirror_face_map(
-                            bm,
-                            session.mirror_face_ids,
-                            session.axis_index,
-                            session.tolerance,
-                            path_edges=_all_path_edges(by_side),
-                        )
+                        live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, _all_path_edges(by_side))
                         source_edges = by_side["POSITIVE"] + by_side["NEGATIVE"]
                     if not source_edges:
                         raise SymmetricKnifeError("The native cut path was lost before mirroring")
@@ -747,17 +729,31 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                 if core.path_ring_includes_pre_hidden_edges(bm):
                     raise SymmetricKnifeError("the cut ring includes hidden edges; partial ring cuts are not mirrored")
 
+                live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, source_edges)
+                _edge_layer, face_layer = core.get_required_layers(bm)
+                source_edges, side, total_path_edges, crossing_count = core.collect_source_path_edges(
+                    bm,
+                    session.axis_index,
+                    session.tolerance,
+                    session.source_side,
+                    selected_only=session.tool_kind
+                    in {
+                        "LOOP_CUT",
+                        "OFFSET_LOOP_CUT",
+                    },
+                )
+                if side is None or not source_edges:
+                    raise SymmetricKnifeError("The native cut path was lost before mirroring")
+                live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, source_edges)
                 target_face_ids, unmatched = core.target_face_ids_for_edges(
                     source_edges,
                     face_layer,
-                    session.mirror_face_ids,
+                    live_mirror_face_ids,
                 )
-                if not target_face_ids:
-                    raise SymmetricKnifeError(
-                        "The cut faces have no exact mirrored counterpart; adjust axis or tolerance"
-                    )
                 if unmatched:
                     raise SymmetricKnifeError(f"{len(unmatched)} cut face(s) have no exact mirrored counterpart")
+                if not target_face_ids:
+                    raise SymmetricKnifeError("The native cut path has no carrier faces")
 
                 collapsed_target_markers = set()
                 profile = TOOL_PROFILES.get(session.tool_kind)
@@ -822,7 +818,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                         source_edges,
                         session.axis_index,
                         session.tolerance,
-                        session.mirror_face_ids,
+                        live_mirror_face_ids,
                     )
                     if direct_reason:
                         raise SymmetricKnifeError(f"Could not rebuild the mirrored {tool_label}: {direct_reason}")

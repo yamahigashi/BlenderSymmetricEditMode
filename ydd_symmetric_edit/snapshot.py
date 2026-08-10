@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import cast
 
@@ -434,6 +434,27 @@ class LazyTopologyResolution:
             self._partial_face_resolve_count += 1
         return {face_id: self._face_cache[face_id] for face_id in requested_ids}
 
+    @property
+    def scoped_mirror_face_ids(self) -> Mapping[FaceId, FaceId | None]:
+        """Return only the face results already available without resolving all."""
+
+        if self._resolved:
+            return self._mirror_face_ids
+        return self._face_cache
+
+    @property
+    def scoped_carrier_frames(self) -> LazyCarrierFrameMap:
+        """Return the snapshot-backed lazy frame map without resolving topology."""
+
+        if self._carrier_frames is None:
+            self._carrier_frames = LazyCarrierFrameMap.from_snapshot(
+                self.coords64,
+                self.loop_verts,
+                self.loop_starts,
+                self.loop_totals,
+            )
+        return self._carrier_frames
+
     def __deepcopy__(self, memo):
         clone = type(self).__new__(type(self))
         memo[id(self)] = clone
@@ -532,6 +553,44 @@ class LazyTopologyResolution:
         for face in bm.faces:
             face_id = FaceId(int(face[face_id_layer]))
             face[mirror_layer] = int(values.get(face_id, FaceId(0)))
+
+    def materialize_faces(self, bm: bmesh.types.BMesh, face_ids) -> None:
+        """Write mirror IDs for the resolved face scope only.
+
+        A newly-created BMesh integer layer is zero-initialized. Consequently,
+        faces outside *face_ids* retain the same observable "no counterpart"
+        value that full materialization writes for unmatched faces. When the
+        layer already exists, out-of-scope faces keep their previous values;
+        the layer-completeness heuristic in history.py therefore reports such
+        sessions as incomplete and repair declines instead of restoring a
+        partial map.
+        """
+
+        requested = numpy.unique(numpy.asarray(tuple(face_ids), dtype=numpy.int64).reshape(-1))
+        if len(requested) == 0:
+            return
+        if numpy.any(requested < 1) or numpy.any(requested > self.face_count):
+            raise IndexError("face materialize index out of range")
+        if not self._resolved and numpy.any(~self._face_resolved[requested - 1]):
+            raise RuntimeError("Topology face scope must be resolved before materialize_faces")
+
+        face_id_layer = bm.faces.layers.int.get(FACE_ID_LAYER)
+        if face_id_layer is None:
+            return
+        mirror_layer = bm.faces.layers.int.get(FACE_MIRROR_ID_LAYER)
+        if mirror_layer is None:
+            mirror_layer = bm.faces.layers.int.new(FACE_MIRROR_ID_LAYER)
+            face_id_layer = bm.faces.layers.int.get(FACE_ID_LAYER)
+            if face_id_layer is None:
+                return
+
+        requested_ids = {FaceId(int(face_id)) for face_id in requested.tolist()}
+        values = self.scoped_mirror_face_ids
+        for face in bm.faces:
+            face_id = FaceId(int(face[face_id_layer]))
+            if face_id not in requested_ids:
+                continue
+            face[mirror_layer] = int(values.get(face_id) or FaceId(0))
 
 
 def _face_loop_vertex_indices_match(mesh_vertex_indices: Sequence[int], bm_face) -> bool:

@@ -602,7 +602,7 @@ def _region_allows_orphan_self_map(
 
 def resolve_live_mirror_face_map(
     bm: bmesh.types.BMesh,
-    mirror_face_ids: MirrorFaceMap,
+    mirror_face_ids: Mapping[FaceId, FaceId | None],
     axis_index: int,
     tolerance: float,
     path_edges: Sequence[bmesh.types.BMEdge] | None = None,
@@ -623,13 +623,11 @@ def resolve_live_mirror_face_map(
     ``None``, no orphan remapping is applied.
     """
 
+    if path_edges is None:
+        return {}
     face_layer = bm.faces.layers.int.get(FACE_ID_LAYER)
     if face_layer is None:
-        return dict(mirror_face_ids)
-
-    remapped: MirrorFaceMap = dict(mirror_face_ids)
-    if path_edges is None:
-        return remapped
+        return {}
 
     # index_update assigns stable 0..n-1 indices even on free-standing BMesh
     # (ensure_lookup_table alone leaves index==-1 there). Edit-mesh BMesh also
@@ -639,7 +637,6 @@ def resolve_live_mirror_face_map(
     bm.verts.ensure_lookup_table()
     bm.faces.ensure_lookup_table()
 
-    live_ids = {FaceId(int(face[face_layer])) for face in bm.faces}
     path_vertex_indices: set[int] = set()
     scope_ids: set[FaceId] = set()
     for edge in path_edges:
@@ -652,9 +649,15 @@ def resolve_live_mirror_face_map(
             if face.is_valid:
                 scope_ids.add(FaceId(int(face[face_layer])))
     for face_id in list(scope_ids):
-        target = remapped.get(face_id)
+        target = mirror_face_ids.get(face_id)
         if target is not None:
             scope_ids.add(target)
+
+    remapped: MirrorFaceMap = {}
+    for face_id in scope_ids:
+        target = mirror_face_ids.get(face_id)
+        if target is not None:
+            remapped[face_id] = target
 
     faces_by_id: dict[FaceId, list[bmesh.types.BMFace]] = defaultdict(list)
     for face in bm.faces:
@@ -663,6 +666,7 @@ def resolve_live_mirror_face_map(
         face_id = FaceId(int(face[face_layer]))
         if face_id in scope_ids:
             faces_by_id[face_id].append(face)
+    live_ids = set(faces_by_id)
 
     for face_id, faces in faces_by_id.items():
         target_id = remapped.get(face_id)

@@ -2171,6 +2171,154 @@ def _check_bulk_edit_mesh_order_variants():
                 bpy.data.meshes.remove(mesh)
 
 
+def _finish_scope_fixture(face_coordinates, path_face_index):
+    source = bmesh.new()
+    for coordinates in face_coordinates:
+        source.faces.new([source.verts.new(value) for value in coordinates])
+    mesh = bpy.data.meshes.new("YSEPerfFinishScopeMesh")
+    source.to_mesh(mesh)
+    source.free()
+    obj = bpy.data.objects.new("YSEPerfFinishScopeObject", mesh)
+    window_pointer = operators._window_key(bpy.context)
+    if bpy.context.object is not None and bpy.context.object.mode != "OBJECT":
+        bpy.ops.object.mode_set(mode="OBJECT")
+    bpy.ops.object.select_all(action="DESELECT")
+    bpy.context.scene.collection.objects.link(obj)
+    obj.select_set(True)
+    bpy.context.view_layer.objects.active = obj
+    bpy.ops.object.mode_set(mode="EDIT")
+    bm = bmesh.from_edit_mesh(mesh)
+    token = operators._new_history_token()
+    topology = core.prepare_topology(bm, 0, TOLERANCE, token, mesh_object=obj)
+    bm.faces.ensure_lookup_table()
+    path_face = bm.faces[path_face_index]
+    edge_layer = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+    assert edge_layer is not None
+    path_face.edges[0][edge_layer] = 0
+    bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+    session = KnifeSession(
+        window_pointer=window_pointer,
+        area_pointer=0,
+        region_pointer=0,
+        object_name=obj.name,
+        mesh_name=mesh.name,
+        axis_index=0,
+        source_side="NEGATIVE",
+        tolerance=TOLERANCE,
+        mirror_face_ids={},
+        hidden_by_face_id=topology.hidden_by_face_id,
+        carrier_frames={},
+        mesh_select_mode=MeshSelectionMode(True, False, False),
+        started_at=1.0,
+        history_token=token,
+        topology_resolution=topology.topology_resolution,
+    )
+    return obj, mesh, window_pointer, session, topology.topology_resolution
+
+
+def _check_finish_scope_warning_matrix():
+    left = ((-2.0, -1.0, 0.0), (-1.0, -1.0, 0.0), (-1.5, 1.0, 0.0))
+    right = tuple((-x, y, z) for x, y, z in reversed(left))
+    unmatched = ((3.0, 2.0, 0.0), (4.0, 2.0, 0.0), (3.5, 3.0, 0.0))
+    cases = (
+        ("matched-scope-with-distant-unmatched", (left, right, unmatched), 0, False, True),
+        ("unmatched-in-scope", (left, right, unmatched), 2, True, False),
+        ("zero-match-mesh", (unmatched,), 0, True, False),
+    )
+    for label, faces, path_face_index, expect_warning, expect_apply in cases:
+        obj, mesh, window_pointer, session, resolution = _finish_scope_fixture(faces, path_face_index)
+        original_crossing_plan = core.plan_mirrored_path_crossings
+        original_boundary_check = core.reflected_path_uses_only_target_boundaries
+        original_apply = core.apply_reflected_path_topology
+        original_backup_create = operators.backup.create_topology_backup
+        original_backup_remove = operators.backup.remove_backup
+        apply_calls = 0
+
+        def count_apply(_bm, source_edges, *_args, **_kwargs):
+            nonlocal apply_calls
+            apply_calls += 1
+            return len(source_edges), 0, ""
+
+        setattr(core, "plan_mirrored_path_crossings", lambda *_args, **_kwargs: ([], ""))
+        setattr(core, "reflected_path_uses_only_target_boundaries", lambda *_args, **_kwargs: True)
+        setattr(core, "apply_reflected_path_topology", count_apply)
+        setattr(operators.backup, "create_topology_backup", lambda _bm: object())
+        setattr(operators.backup, "remove_backup", lambda _value: None)
+        operators._SESSIONS[window_pointer] = session
+        reports = []
+        fake_operator = SimpleNamespace(report=lambda level, message: reports.append((level, message)))
+        try:
+            result = operators.MESH_OT_ydd_symmetric_edit_finish.execute(fake_operator, bpy.context)
+            assert result == {"FINISHED"}, label
+            warnings = [message for level, message in reports if level == {"WARNING"}]
+            if expect_warning:
+                assert warnings == ["ydd Symmetric Edit: 1 cut face(s) have no exact mirrored counterpart"], label
+            else:
+                assert warnings == [], label
+            assert bool(apply_calls) is expect_apply, label
+            if label == "matched-scope-with-distant-unmatched":
+                assert resolution.resolve_count == 0
+                assert resolution.partial_face_resolve_count >= 1
+        finally:
+            setattr(core, "plan_mirrored_path_crossings", original_crossing_plan)
+            setattr(core, "reflected_path_uses_only_target_boundaries", original_boundary_check)
+            setattr(core, "apply_reflected_path_topology", original_apply)
+            setattr(operators.backup, "create_topology_backup", original_backup_create)
+            setattr(operators.backup, "remove_backup", original_backup_remove)
+            operators._SESSIONS.pop(window_pointer, None)
+            if obj.mode != "OBJECT":
+                bpy.ops.object.mode_set(mode="OBJECT")
+            bpy.data.objects.remove(obj, do_unlink=True)
+            if mesh.name in bpy.data.meshes:
+                bpy.data.meshes.remove(mesh)
+
+
+def _check_scoped_face_overlay_and_materialize():
+    bm = _build_deformed_grid(3)
+    try:
+        topology = core.prepare_topology(bm, 0, TOLERANCE, 808)
+        resolution = topology.topology_resolution
+        face_id_layer = bm.faces.layers.int.get(core.FACE_ID_LAYER)
+        edge_layer = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+        assert face_id_layer is not None and edge_layer is not None
+        bm.faces.ensure_lookup_table()
+        path_edge = bm.faces[0].edges[0]
+        path_edge[edge_layer] = 0
+        scope = {FaceId(int(face[face_id_layer])) for face in path_edge.link_faces}
+        resolution.resolve_faces(scope)
+
+        class GetOnlyFaceMap:
+            def get(self, key, default=None):
+                return resolution.scoped_mirror_face_ids.get(key, default)
+
+            def __iter__(self):
+                raise AssertionError("scope overlay must not iterate the lazy face map")
+
+            def __len__(self):
+                raise AssertionError("scope overlay must not resolve the lazy face map")
+
+        overlay = core.resolve_live_mirror_face_map(
+            bm,
+            GetOnlyFaceMap(),
+            0,
+            TOLERANCE,
+            path_edges=(path_edge,),
+        )
+        assert set(overlay).issuperset(scope)
+        assert resolution.resolve_count == 0
+
+        resolution.materialize_faces(bm, scope)
+        mirror_layer = bm.faces.layers.int.get(core.FACE_MIRROR_ID_LAYER)
+        assert mirror_layer is not None
+        for face in bm.faces:
+            face_id = FaceId(int(face[face_id_layer]))
+            expected = int(resolution.scoped_mirror_face_ids.get(face_id) or 0) if face_id in scope else 0
+            assert int(face[mirror_layer]) == expected
+        assert resolution.resolve_count == 0
+    finally:
+        bm.free()
+
+
 def _check_finish_zero_match_decline():
     source = bmesh.new()
     vertices = [source.verts.new(value) for value in ((1.0, 0.0, 0.0), (2.0, 0.0, 0.0), (1.0, 1.0, 0.0))]
@@ -2193,7 +2341,14 @@ def _check_finish_zero_match_decline():
         topology = core.prepare_topology(bm, 0, TOLERANCE, token, mesh_object=obj)
         bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
         bm.edges.ensure_lookup_table()
-        bmesh.ops.subdivide_edges(bm, edges=(bm.edges[0],), cuts=1, use_grid_fill=False)
+        split = bmesh.ops.subdivide_edges(bm, edges=(bm.edges[0],), cuts=1, use_grid_fill=False)
+        marker_layer = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+        assert marker_layer is not None
+        # subdivide interpolates int layers from the parent edge; a real knife
+        # cut leaves the marker at 0, so zero the split edges explicitly.
+        for element in split["geom_split"]:
+            if isinstance(element, bmesh.types.BMEdge):
+                element[marker_layer] = 0
         native_vertex_count = len(bm.verts)
         assert native_vertex_count > 3
         bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=True)
@@ -2222,7 +2377,7 @@ def _check_finish_zero_match_decline():
         assert reports == [
             (
                 {"WARNING"},
-                "Only 0 of 1 faces have an exact mirrored counterpart",
+                "ydd Symmetric Edit: 1 cut face(s) have no exact mirrored counterpart",
             )
         ]
         restored = bmesh.from_edit_mesh(mesh)
@@ -3235,6 +3390,8 @@ def run():
     _check_rip_lookup_validation()
     _check_capture_resolve_contract()
     _check_bulk_edit_mesh_order_variants()
+    _check_finish_scope_warning_matrix()
+    _check_scoped_face_overlay_and_materialize()
     _check_finish_zero_match_decline()
     _check_hide_layer_omission_and_consumers()
     _check_bulk_guard_fallbacks()
