@@ -4,6 +4,7 @@ from collections.abc import Iterable
 from typing import cast
 
 import bmesh
+import numpy  # type: ignore
 from mathutils import Vector
 
 from ._types import (
@@ -16,7 +17,7 @@ from ._types import (
     SelectionSnapshot,
     VertexSelectionHistory,
 )
-from .matching import _coordinate_3d, build_vertex_pair_table
+from .matching import VertexRegistry, _coordinate_3d, build_vertex_pair_table
 from .snapshot import (
     EDGE_HIDDEN_LAYER,
     EDGE_ORIGINAL_LAYER,
@@ -203,6 +204,32 @@ def _selection_element_coordinate(element) -> Vector:
     return element.calc_center_median()
 
 
+def _faces_by_verts(bm: bmesh.types.BMesh, vertex_sets: Iterable[frozenset[int]]):
+    vertex_indices = {vertex_index for vertex_set in vertex_sets if vertex_set for vertex_index in vertex_set}
+    candidates_by_index = {}
+    for vertex_index in vertex_indices:
+        if vertex_index < 0 or vertex_index >= len(bm.verts):
+            continue
+        vertex = bm.verts[vertex_index]
+        if not vertex.is_valid:
+            continue
+        for face in vertex.link_faces:
+            if face.is_valid:
+                candidates_by_index[face.index] = face
+
+    faces_by_verts = {}
+    for face in candidates_by_index.values():
+        face_vertex_set = frozenset(vertex.index for vertex in face.verts)
+        current = faces_by_verts.get(face_vertex_set)
+        if current is None or face.index > current.index:
+            faces_by_verts[face_vertex_set] = face
+    return faces_by_verts
+
+
+def _find_face_by_verts(bm: bmesh.types.BMesh, vertex_indices: frozenset[int]):
+    return _faces_by_verts(bm, (vertex_indices,)).get(vertex_indices)
+
+
 def extend_selection_to_mirror(
     bm: bmesh.types.BMesh,
     axis_index: int,
@@ -216,10 +243,9 @@ def extend_selection_to_mirror(
     ``select_history`` or the active element. Unresolved counterparts are
     skipped silently. On-plane / self-mirrored elements are no-ops.
 
-    Vertex pairing reuses :func:`build_vertex_pair_table` (KDTree candidates,
-    double-precision Chebyshev verification, involutive). Edges and faces
-    resolve when every constituent vertex has a pair and some element owns
-    exactly that partner vertex set.
+    Vertex pairing resolves only the selected topology's candidate closure.
+    Edges and faces resolve when every constituent vertex has a pair and some
+    element owns exactly that partner vertex set.
 
     Coordinates and selection flags are captured via
     :func:`capture_selection_snapshot` (Mesh bulk when *mesh_object* is set).
@@ -230,97 +256,143 @@ def extend_selection_to_mirror(
     cascade to lower elements if the caller flushes — that is allowed.
     """
 
-    bm.verts.ensure_lookup_table()
-    bm.edges.ensure_lookup_table()
-    bm.faces.ensure_lookup_table()
-    # Pair tables are keyed by enumerate(bm.verts) order; .index must match.
-    bm.verts.index_update()
-    bm.edges.index_update()
-    bm.faces.index_update()
-
+    # capture refreshes lookup tables and indices for every requested domain;
+    # pair tables are keyed by enumerate(bm.verts) order, which then holds.
     capture = capture_selection_snapshot(
         bm,
         mesh_object=mesh_object,
         domains=("VERT", "EDGE", "FACE"),
         include_history=False,
     )
-    # numpy float64 rows are accepted by build_vertex_pair_table (float(co[i])).
-    pairs = build_vertex_pair_table(capture.coords, axis_index, tolerance)
-    if not pairs:
-        return 0
-
     # Snapshot first: newly selected counterparts must not seed further
     # expansion in the same call (contract is one-shot add of ρ(S), not a
     # fixed point). Indices come from the capture; element wrappers are
     # resolved only for selected members.
-    selected_verts = [bm.verts[int(index)] for index in capture.selected_verts]
-    selected_edges = [bm.edges[int(index)] for index in capture.selected_edges]
+    selected_vert_indices = numpy.asarray(capture.selected_verts, dtype=numpy.int64)
+    selected_edge_indices = numpy.asarray(capture.selected_edges, dtype=numpy.int64)
     selected_faces = [bm.faces[int(index)] for index in capture.selected_faces]
 
-    edge_by_verts = (
-        {frozenset((edge.verts[0].index, edge.verts[1].index)): edge for edge in bm.edges if edge.is_valid}
-        if selected_edges
-        else {}
-    )
-    face_by_verts = (
-        {frozenset(vertex.index for vertex in face.verts): face for face in bm.faces if face.is_valid}
-        if selected_faces
-        else {}
-    )
+    seed_parts = [selected_vert_indices]
+    if len(selected_edge_indices):
+        seed_parts.append(
+            numpy.asarray(
+                [
+                    vertex.index
+                    for index in selected_edge_indices.tolist()
+                    if bm.edges[index].is_valid
+                    for vertex in bm.edges[index].verts
+                ],
+                dtype=numpy.int64,
+            )
+        )
+    if selected_faces:
+        seed_parts.append(
+            numpy.asarray(
+                [vertex.index for face in selected_faces if face.is_valid for vertex in face.verts],
+                dtype=numpy.int64,
+            )
+        )
+    seeds = numpy.unique(numpy.concatenate(seed_parts)) if seed_parts else numpy.empty(0, dtype=numpy.int64)
+    resolved = VertexRegistry(capture.coords, axis_index, tolerance).resolve_closure_arrays(seeds)
+    partner_by_vertex = numpy.full(len(capture.coords), -1, dtype=numpy.int64)
+    if resolved is None:
+        pairs = build_vertex_pair_table(capture.coords, axis_index, tolerance)
+        if not pairs:
+            return 0
+        for source, target in pairs.items():
+            partner_by_vertex[source] = target
+    else:
+        _closure_ids, pair_sources, pair_targets = resolved
+        if len(pair_sources) == 0:
+            return 0
+        partner_by_vertex[pair_sources] = pair_targets
 
     added = 0
+    vertex_count = len(bm.verts)
 
-    for vertex in selected_verts:
-        partner_index = pairs.get(vertex.index)
-        if partner_index is None or partner_index == vertex.index:
-            continue
-        if partner_index < 0 or partner_index >= len(bm.verts):
-            continue
-        partner = bm.verts[partner_index]
-        if partner.is_valid and not partner.select:
-            partner.select = True
-            added += 1
+    if len(selected_vert_indices):
+        vert_targets = partner_by_vertex[selected_vert_indices]
+        vert_mask = (vert_targets >= 0) & (vert_targets != selected_vert_indices) & (vert_targets < vertex_count)
+        for partner_index in vert_targets[vert_mask].tolist():
+            partner = bm.verts[partner_index]
+            if partner.is_valid and not partner.select:
+                partner.select = True
+                added += 1
 
-    for edge in selected_edges:
-        if not edge.is_valid:
-            continue
-        source_indices = (edge.verts[0].index, edge.verts[1].index)
-        partner_indices = []
-        for index in source_indices:
-            partner = pairs.get(index)
-            if partner is None:
-                partner_indices = None
-                break
-            partner_indices.append(partner)
-        if partner_indices is None:
-            continue
-        partner_set = frozenset(partner_indices)
-        if partner_set == frozenset(source_indices):
-            continue
-        partner_edge = edge_by_verts.get(partner_set)
-        if partner_edge is not None and partner_edge.is_valid and not partner_edge.select:
-            partner_edge.select = True
-            added += 1
+    if len(selected_edge_indices):
+        bm_verts = bm.verts
+        bm_edges = bm.edges
+        partner_edge_list = partner_by_vertex.tolist()
+        for index in selected_edge_indices.tolist():
+            edge = bm_edges[index]
+            if not edge.is_valid:
+                continue
+            edge_verts = edge.verts
+            first_index = edge_verts[0].index
+            second_index = edge_verts[1].index
+            first_partner = partner_edge_list[first_index]
+            second_partner = partner_edge_list[second_index]
+            if first_partner < 0 or second_partner < 0:
+                continue
+            if (first_partner == first_index and second_partner == second_index) or (
+                first_partner == second_index and second_partner == first_index
+            ):
+                continue
+            # BMesh forbids duplicate edges between one vertex pair, so the
+            # first link_edges match is the unique partner (no tie to break).
+            first_vert = bm_verts[first_partner]
+            partner_edge = None
+            for candidate in first_vert.link_edges:
+                if candidate.is_valid and candidate.other_vert(first_vert).index == second_partner:
+                    partner_edge = candidate
+                    break
+            if partner_edge is not None and not partner_edge.select:
+                partner_edge.select = True
+                added += 1
 
+    partner_list = partner_by_vertex.tolist() if selected_faces else ()
     for face in selected_faces:
         if not face.is_valid:
             continue
-        source_indices = tuple(vertex.index for vertex in face.verts)
         partner_indices = []
-        for index in source_indices:
-            partner = pairs.get(index)
-            if partner is None:
+        source_set = set()
+        for vertex in face.verts:
+            index = vertex.index
+            source_set.add(index)
+            partner = partner_list[index]
+            if partner < 0:
                 partner_indices = None
                 break
             partner_indices.append(partner)
         if partner_indices is None:
             continue
-        partner_set = frozenset(partner_indices)
-        if partner_set == frozenset(source_indices):
+        partner_set = set(partner_indices)
+        if partner_set == source_set:
             continue
-        partner_face = face_by_verts.get(partner_set)
-        if partner_face is not None and partner_face.is_valid and not partner_face.select:
-            partner_face.select = True
+        partner_len = len(partner_set)
+        anchor_index = partner_indices[0]
+        if anchor_index >= vertex_count:
+            continue
+        anchor = bm.verts[anchor_index]
+        if not anchor.is_valid:
+            continue
+        # Every face sharing the partner vertex set links to the anchor, so
+        # max-index over these candidates equals the global tie rule.
+        best = None
+        for candidate in anchor.link_faces:
+            if not candidate.is_valid:
+                continue
+            candidate_verts = candidate.verts
+            if len(candidate_verts) != partner_len:
+                continue
+            for vertex in candidate_verts:
+                if vertex.index not in partner_set:
+                    break
+            else:
+                if best is None or candidate.index > best.index:
+                    best = candidate
+        if best is not None and not best.select:
+            best.select = True
             added += 1
 
     return added

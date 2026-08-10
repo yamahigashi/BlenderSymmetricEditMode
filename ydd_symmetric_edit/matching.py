@@ -660,23 +660,31 @@ class VertexRegistry:
         queries = query_indices[local_queries]
         distances = numpy.max(numpy.abs(self.coords64[targets] - query_points[local_queries]), axis=1)
         keep = (distances <= self.tolerance) & target_mask[targets]
-        return self._sorted_candidate_arrays(queries[keep], targets[keep], distances[keep])
+        return queries[keep], targets[keep], distances[keep]
 
-    def candidates_on_plane(self, query_indices):
-        """Return C0(q) for the on-plane members of *query_indices*."""
-
+    def _candidates_on_plane_raw(self, query_indices):
         queries = self._query_indices(query_indices)
         queries = queries[self._on_plane[queries]]
         return self._probe(queries, self.coords64[queries], self._on_plane)
 
-    def candidates_off_plane(self, query_indices):
-        """Return Coff(q) for the off-plane members of *query_indices*."""
-
+    def _candidates_off_plane_raw(self, query_indices):
         queries = self._query_indices(query_indices)
         queries = queries[~self._on_plane[queries]]
         points = self.coords64[queries].copy()
         points[:, self.axis_index] = -points[:, self.axis_index]
         return self._probe(queries, points, ~self._on_plane)
+
+    def candidates_on_plane(self, query_indices):
+        """Return C0(q) for the on-plane members of *query_indices*."""
+
+        arrays = self._candidates_on_plane_raw(query_indices)
+        return None if arrays is None else self._sorted_candidate_arrays(*arrays)
+
+    def candidates_off_plane(self, query_indices):
+        """Return Coff(q) for the off-plane members of *query_indices*."""
+
+        arrays = self._candidates_off_plane_raw(query_indices)
+        return None if arrays is None else self._sorted_candidate_arrays(*arrays)
 
     # Both claimant methods rely on Chebyshev mirror symmetry
     # d∞(ρ(q), t) == d∞(ρ(t), q): the reverse relation is the forward
@@ -699,45 +707,147 @@ class VertexRegistry:
         targets, queries, distances = arrays
         return self._sorted_candidate_arrays(queries, targets, distances)
 
-    def resolve_closure(self, vertex_ids):
-        """Resolve the candidate-graph closure containing *vertex_ids*."""
-
+    def _closure_candidate_arrays(self, vertex_ids):
         seeds = self._query_indices(vertex_ids)
         if self._index is None:
             return None
         if len(seeds) == 0:
-            return numpy.empty(0, dtype=numpy.int64), {}
+            empty = numpy.empty(0, dtype=numpy.int64)
+            return empty, empty, empty.copy(), numpy.empty(0, dtype=numpy.float64)
 
-        closure = set(int(vertex_id) for vertex_id in seeds.tolist())
-        frontier = numpy.asarray(sorted(closure), dtype=numpy.int64)
+        closure_mask = numpy.zeros(len(self.coords64), dtype=numpy.bool_)
+        closure_mask[seeds] = True
+        frontier = numpy.unique(seeds)
+        candidate_parts = []
         while len(frontier):
+            # Raw (unsorted) probes: the assignment pipeline lexsorts the
+            # concatenation with the same key, so per-probe sorting is waste.
             candidates = (
-                self.candidates_on_plane(frontier),
-                self.candidates_off_plane(frontier),
+                self._candidates_on_plane_raw(frontier),
+                self._candidates_off_plane_raw(frontier),
             )
-            claimants = (
-                self.claimants_on_plane(frontier),
-                self.claimants_off_plane(frontier),
-            )
-            if any(arrays is None for arrays in (*candidates, *claimants)):
+            if any(arrays is None for arrays in candidates):
                 return None
-            neighbors = {int(vertex_id) for arrays in candidates for vertex_id in arrays[1].tolist()}
-            neighbors.update(int(vertex_id) for arrays in claimants for vertex_id in arrays[0].tolist())
-            added = neighbors.difference(closure)
-            closure.update(added)
-            frontier = numpy.asarray(sorted(added), dtype=numpy.int64)
+            candidate_parts.extend(candidates)
+            neighbors = numpy.concatenate((candidates[0][1], candidates[1][1]))
+            frontier = numpy.unique(neighbors[~closure_mask[neighbors]])
+            closure_mask[frontier] = True
 
-        closure_ids = numpy.asarray(sorted(closure), dtype=numpy.int64)
-        parts = (
-            self.candidates_on_plane(closure_ids),
-            self.candidates_off_plane(closure_ids),
-        )
-        if any(arrays is None for arrays in parts):
+        closure_ids = numpy.flatnonzero(closure_mask)
+        queries = numpy.concatenate(tuple(arrays[0] for arrays in candidate_parts))
+        targets = numpy.concatenate(tuple(arrays[1] for arrays in candidate_parts))
+        distances = numpy.concatenate(tuple(arrays[2] for arrays in candidate_parts))
+        return closure_ids, queries, targets, distances
+
+    def resolve_closure(self, vertex_ids):
+        """Resolve the candidate-graph closure containing *vertex_ids*."""
+
+        arrays = self._closure_candidate_arrays(vertex_ids)
+        if arrays is None:
             return None
-        queries = numpy.concatenate(tuple(arrays[0] for arrays in parts))
-        targets = numpy.concatenate(tuple(arrays[1] for arrays in parts))
-        distances = numpy.concatenate(tuple(arrays[2] for arrays in parts))
+        closure_ids, queries, targets, distances = arrays
         return closure_ids, _pair_table_from_candidate_arrays(closure_ids, queries, targets, distances)
+
+    def resolve_closure_arrays(self, vertex_ids):
+        """Like resolve_closure, returning mutual (sources, targets) index arrays."""
+
+        arrays = self._closure_candidate_arrays(vertex_ids)
+        if arrays is None:
+            return None
+        closure_ids, queries, targets, distances = arrays
+        assigned_ids, assigned = _assigned_from_candidate_arrays(closure_ids, queries, targets, distances)
+        sources, mapped = _mutual_pair_arrays(assigned_ids, assigned)
+        return closure_ids, sources, mapped
+
+
+class _ScopedVertexPairTable(dict[int, int]):
+    """A dict-compatible pair table that resolves untouched closures on demand."""
+
+    def __init__(self, registry: VertexRegistry, closure_ids, pairs: Mapping[int, int]) -> None:
+        super().__init__(pairs)
+        self._registry = registry
+        self._resolved_ids = {int(vertex_id) for vertex_id in closure_ids.tolist()}
+        self._all_resolved = len(self._resolved_ids) == len(registry.coords64)
+
+    def _resolve_key(self, key) -> None:
+        if not isinstance(key, (int, numpy.integer)):
+            return
+        vertex_id = int(key)
+        if vertex_id < 0 or vertex_id >= len(self._registry.coords64) or vertex_id in self._resolved_ids:
+            return
+        resolved = self._registry.resolve_closure((vertex_id,))
+        if resolved is None:
+            raise RuntimeError("vertex registry became unavailable after scoped resolution")
+        closure_ids, pairs = resolved
+        super().update(pairs)
+        self._resolved_ids.update(int(index) for index in closure_ids.tolist())
+        self._all_resolved = len(self._resolved_ids) == len(self._registry.coords64)
+
+    def _resolve_all(self) -> None:
+        if self._all_resolved:
+            return
+        resolved = self._registry.resolve_closure(range(len(self._registry.coords64)))
+        if resolved is None:
+            raise RuntimeError("vertex registry became unavailable after scoped resolution")
+        closure_ids, pairs = resolved
+        super().update(pairs)
+        self._resolved_ids.update(int(index) for index in closure_ids.tolist())
+        self._all_resolved = True
+
+    def __contains__(self, key) -> bool:
+        if dict.__contains__(self, key):
+            return True
+        self._resolve_key(key)
+        return dict.__contains__(self, key)
+
+    def __getitem__(self, key):
+        if dict.__contains__(self, key):
+            return dict.__getitem__(self, key)
+        self._resolve_key(key)
+        return dict.__getitem__(self, key)
+
+    def get(self, key, default=None):
+        if dict.__contains__(self, key):
+            return dict.get(self, key, default)
+        self._resolve_key(key)
+        return dict.get(self, key, default)
+
+    def __iter__(self):
+        self._resolve_all()
+        return super().__iter__()
+
+    def __len__(self) -> int:
+        self._resolve_all()
+        return super().__len__()
+
+    def __eq__(self, other) -> bool:
+        self._resolve_all()
+        if isinstance(other, _ScopedVertexPairTable):
+            other._resolve_all()
+        return super().__eq__(other)
+
+    def __ne__(self, other) -> bool:
+        return not self == other
+
+    def keys(self):
+        self._resolve_all()
+        return super().keys()
+
+    def items(self):
+        self._resolve_all()
+        return super().items()
+
+    def values(self):
+        self._resolve_all()
+        return super().values()
+
+    def copy(self):
+        self._resolve_all()
+        return dict(self)
+
+    def __repr__(self) -> str:
+        self._resolve_all()
+        return super().__repr__()
 
 
 _INJECTIVE_STEP_LIMIT = 2_000
@@ -840,6 +950,11 @@ def _injective_tie_margin(cost: float, best_cost: float | None) -> float:
 
 
 def _pair_table_from_candidate_arrays(vertex_ids, queries, targets, distances):
+    vertex_ids, assigned = _assigned_from_candidate_arrays(vertex_ids, queries, targets, distances)
+    return _mutual_pairs_dict(vertex_ids, assigned)
+
+
+def _assigned_from_candidate_arrays(vertex_ids, queries, targets, distances):
     vertex_ids = numpy.asarray(vertex_ids, dtype=numpy.int64)
     local_count = len(vertex_ids)
     if len(queries):
@@ -910,11 +1025,20 @@ def _pair_table_from_candidate_arrays(vertex_ids, queries, targets, distances):
                 for query, target in assignment.items():
                     assigned[query] = target
 
-    return {
-        int(vertex_ids[source]): int(vertex_ids[target])
-        for source, target in enumerate(assigned.tolist())
-        if target >= 0 and int(assigned[target]) == source
-    }
+    return vertex_ids, assigned
+
+
+def _mutual_pair_arrays(vertex_ids: numpy.ndarray, assigned: numpy.ndarray):
+    """Vectorized mutual-pair filter: global (sources, targets) index arrays."""
+
+    local = numpy.flatnonzero(assigned >= 0)
+    mutual = local[assigned[assigned[local]] == local]
+    return vertex_ids[mutual], vertex_ids[assigned[mutual]]
+
+
+def _mutual_pairs_dict(vertex_ids: numpy.ndarray, assigned: numpy.ndarray) -> dict[int, int]:
+    sources, targets = _mutual_pair_arrays(vertex_ids, assigned)
+    return {int(source): int(target) for source, target in zip(sources.tolist(), targets.tolist(), strict=True)}
 
 
 def _one_sided_candidate_arrays(coords64: numpy.ndarray, axis_index: int, tolerance: float):
@@ -1071,8 +1195,14 @@ def classify_selection_overlap(
     case into SELF_MIRRORED versus PARTIAL.
     """
 
-    pairs = build_vertex_pair_table(coords, axis_index, tolerance)
     selected = frozenset(selected_indices)
+    registry = VertexRegistry(numpy.asarray(coords, dtype=numpy.float64), axis_index, tolerance)
+    resolved = registry.resolve_closure(sorted(selected))
+    pairs = (
+        build_vertex_pair_table(coords, axis_index, tolerance)
+        if resolved is None
+        else _ScopedVertexPairTable(registry, resolved[0], resolved[1])
+    )
     shared = frozenset(index for index in selected if abs(coords[index][axis_index]) <= tolerance)
     off = selected - shared
     complete = all(index in pairs for index in off)

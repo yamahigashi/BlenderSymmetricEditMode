@@ -31,8 +31,8 @@ class MirrorSelection:
     """Coordinate-index snapshot used before a native topology operation.
 
     ``overlap`` / ``complete`` classify the selection against its own mirror
-    image; ``pairs`` is the whole-mesh involutive vertex pair table that the
-    classification was derived from (``pairs[pairs[v]] == v``).
+    image; ``pairs`` is the lazily completed whole-mesh involutive vertex pair
+    table that the classification was derived from (``pairs[pairs[v]] == v``).
     """
 
     selected: frozenset[int]

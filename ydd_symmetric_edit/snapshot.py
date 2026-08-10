@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import cast
 
 import bmesh
@@ -758,10 +758,11 @@ def get_required_layers(bm: bmesh.types.BMesh):
 
 @dataclass(frozen=True, slots=True)
 class SelectionCapture:
-    """Bulk or BMesh-compatible capture of coordinates and selection indices.
+    """Bulk or BMesh-compatible capture of coordinates, topology, and selection.
 
     ``coords`` is always float64 shaped ``(N, 3)``. Selected-index arrays are
-    empty when their domain was not requested. History is populated only when
+    empty when their domain was not requested. Face-loop arrays are populated
+    only when the face domain was requested. History is populated only when
     ``include_history=True`` was passed to :func:`capture_selection_snapshot`.
     """
 
@@ -769,6 +770,9 @@ class SelectionCapture:
     selected_verts: numpy.ndarray
     selected_edges: numpy.ndarray
     selected_faces: numpy.ndarray
+    loop_verts: numpy.ndarray = field(default_factory=lambda: numpy.empty(0, dtype=numpy.int64))
+    loop_starts: numpy.ndarray = field(default_factory=lambda: numpy.empty(0, dtype=numpy.int64))
+    loop_totals: numpy.ndarray = field(default_factory=lambda: numpy.empty(0, dtype=numpy.int64))
     history_coords: tuple[Vector, ...] = ()
     history_indices: tuple[int, ...] = ()
 
@@ -786,6 +790,7 @@ def _selected_indices_from_flags(flags: numpy.ndarray) -> numpy.ndarray:
 def _capture_bmesh_selection(
     bm: bmesh.types.BMesh,
     domain_set: frozenset[str],
+    include_loops: bool = False,
 ) -> SelectionCapture:
     """Compatibility path: read coordinates and selection flags from BMesh."""
 
@@ -803,16 +808,31 @@ def _capture_bmesh_selection(
         if "EDGE" in domain_set
         else _empty_selected()
     )
-    selected_faces = (
-        _selected_indices_from_flags(numpy.asarray([bool(face.select) for face in bm.faces], dtype=bool))
-        if "FACE" in domain_set
-        else _empty_selected()
-    )
+    selected_faces = _empty_selected()
+    loop_verts = numpy.empty(0, dtype=numpy.int64)
+    loop_starts = numpy.empty(0, dtype=numpy.int64)
+    loop_totals = numpy.empty(0, dtype=numpy.int64)
+    if "FACE" in domain_set:
+        selected_faces = _selected_indices_from_flags(
+            numpy.asarray([bool(face.select) for face in bm.faces], dtype=bool)
+        )
+        if include_loops:
+            face_loop_totals = []
+            face_loop_verts = []
+            for face in bm.faces:
+                face_loop_totals.append(len(face.verts))
+                face_loop_verts.extend(vertex.index for vertex in face.verts)
+            loop_verts = numpy.asarray(face_loop_verts, dtype=numpy.int64)
+            loop_totals = numpy.asarray(face_loop_totals, dtype=numpy.int64)
+            loop_starts = numpy.cumsum(loop_totals, dtype=numpy.int64) - loop_totals
     return SelectionCapture(
         coords=coords,
         selected_verts=selected_verts,
         selected_edges=selected_edges,
         selected_faces=selected_faces,
+        loop_verts=loop_verts,
+        loop_starts=loop_starts,
+        loop_totals=loop_totals,
     )
 
 
@@ -820,6 +840,7 @@ def _capture_mesh_selection(
     mesh_object,
     bm: bmesh.types.BMesh,
     domain_set: frozenset[str],
+    include_loops: bool = False,
 ) -> SelectionCapture | None:
     """Mesh bulk path with the same integrity guards as ``_capture_mesh_snapshot``.
 
@@ -877,24 +898,42 @@ def _capture_mesh_selection(
     selected_verts = _empty_selected()
     selected_edges = _empty_selected()
     selected_faces = _empty_selected()
-    if "VERT" in domain_set:
+    loop_verts = numpy.empty(0, dtype=numpy.int64)
+    loop_starts = numpy.empty(0, dtype=numpy.int64)
+    loop_totals = numpy.empty(0, dtype=numpy.int64)
+    # total_*_sel is maintained by update_from_editmode; zero means the flag
+    # column is all false, so the foreach_get can be skipped bit-identically.
+    if "VERT" in domain_set and int(getattr(data, "total_vert_sel", -1)) != 0:
         flags = numpy.empty(count_vertices, dtype=bool)
         vertices.foreach_get("select", flags)
         selected_verts = _selected_indices_from_flags(flags)
-    if "EDGE" in domain_set:
+    if "EDGE" in domain_set and int(getattr(data, "total_edge_sel", -1)) != 0:
         flags = numpy.empty(count_edges, dtype=bool)
         edges.foreach_get("select", flags)
         selected_edges = _selected_indices_from_flags(flags)
-    if "FACE" in domain_set:
+    if "FACE" in domain_set and int(getattr(data, "total_face_sel", -1)) != 0:
         flags = numpy.empty(count_faces, dtype=bool)
         polygons.foreach_get("select", flags)
         selected_faces = _selected_indices_from_flags(flags)
+        if include_loops:
+            loop_verts32 = numpy.empty(len(loops), dtype=numpy.int32)
+            loop_starts32 = numpy.empty(count_faces, dtype=numpy.int32)
+            loop_totals32 = numpy.empty(count_faces, dtype=numpy.int32)
+            loops.foreach_get("vertex_index", loop_verts32)
+            polygons.foreach_get("loop_start", loop_starts32)
+            polygons.foreach_get("loop_total", loop_totals32)
+            loop_verts = loop_verts32.astype(numpy.int64)
+            loop_starts = loop_starts32.astype(numpy.int64)
+            loop_totals = loop_totals32.astype(numpy.int64)
 
     return SelectionCapture(
         coords=coords,
         selected_verts=selected_verts,
         selected_edges=selected_edges,
         selected_faces=selected_faces,
+        loop_verts=loop_verts,
+        loop_starts=loop_starts,
+        loop_totals=loop_totals,
     )
 
 
@@ -904,6 +943,7 @@ def capture_selection_snapshot(
     mesh_object=None,
     domains: Sequence[str] = ("VERT", "EDGE", "FACE"),
     include_history: bool = False,
+    include_loops: bool = False,
 ) -> SelectionCapture:
     """Capture vertex coordinates and selected indices for bulk consumers.
 
@@ -928,9 +968,9 @@ def capture_selection_snapshot(
 
     captured: SelectionCapture | None = None
     if mesh_object is not None:
-        captured = _capture_mesh_selection(mesh_object, bm, domain_set)
+        captured = _capture_mesh_selection(mesh_object, bm, domain_set, include_loops)
     if captured is None:
-        captured = _capture_bmesh_selection(bm, domain_set)
+        captured = _capture_bmesh_selection(bm, domain_set, include_loops)
 
     if not include_history:
         return captured
@@ -947,6 +987,9 @@ def capture_selection_snapshot(
         selected_verts=captured.selected_verts,
         selected_edges=captured.selected_edges,
         selected_faces=captured.selected_faces,
+        loop_verts=captured.loop_verts,
+        loop_starts=captured.loop_starts,
+        loop_totals=captured.loop_totals,
         history_coords=history_coords,
         history_indices=history_indices,
     )

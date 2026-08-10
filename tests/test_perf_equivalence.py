@@ -29,7 +29,7 @@ sys.path.insert(0, str(PACKAGE_PARENT / "tests"))
 
 from perf_fixtures import DENSE_CANDIDATE_COORDS  # noqa: E402
 
-from ydd_symmetric_edit import core, face_mapping, operators, selection, snapshot  # noqa: E402
+from ydd_symmetric_edit import core, face_mapping, matching, operators, selection, snapshot  # noqa: E402
 from ydd_symmetric_edit import replay as replay_module  # noqa: E402
 from ydd_symmetric_edit import rip as rip_module  # noqa: E402
 from ydd_symmetric_edit import session as session_module  # noqa: E402
@@ -39,6 +39,8 @@ from ydd_symmetric_edit._types import (  # noqa: E402
     FaceId,
     KnifeSession,
     MeshSelectionMode,
+    MirrorOverlap,
+    OverlapClassification,
 )
 
 TOLERANCE = 1.0e-5
@@ -731,61 +733,65 @@ def _check_extend_selection_lazy_indices():
             self.co = Vector(coordinate)
             self.select = False
             self.is_valid = True
+            self.link_edges = []
+            self.link_faces = []
 
     class FakeEdge:
-        def __init__(self, vertices):
+        def __init__(self, index, vertices):
+            self.index = index
             self.verts = vertices
             self.select = False
             self.is_valid = True
+            for vertex in vertices:
+                vertex.link_edges.append(self)
+
+        def other_vert(self, vertex):
+            return self.verts[1] if self.verts[0] is vertex else self.verts[0]
 
     class FakeFace:
-        def __init__(self, vertices):
+        def __init__(self, index, vertices):
+            self.index = index
             self.verts = vertices
             self.select = False
             self.is_valid = True
+            for vertex in vertices:
+                vertex.link_faces.append(self)
 
-    original_builder = selection.build_vertex_pair_table
-    method_name = "build_vertex_pair_table"
-    setattr(selection, method_name, lambda _coords, _axis, _tolerance: {0: 1, 1: 0, 2: 3, 3: 2, 4: 5, 5: 4})
-    try:
-        for selection_mode in ("empty", "vertex", "edge", "face"):
-            vertices = [
-                FakeVertex(0, (-1.0, 0.0, 0.0)),
-                FakeVertex(1, (1.0, 0.0, 0.0)),
-                FakeVertex(2, (-1.0, 1.0, 0.0)),
-                FakeVertex(3, (1.0, 1.0, 0.0)),
-                FakeVertex(4, (-1.0, 0.0, 1.0)),
-                FakeVertex(5, (1.0, 0.0, 1.0)),
-            ]
-            edges = [FakeEdge((vertices[0], vertices[2])), FakeEdge((vertices[1], vertices[3]))]
-            faces = [
-                FakeFace((vertices[0], vertices[2], vertices[4])),
-                FakeFace((vertices[1], vertices[3], vertices[5])),
-            ]
-            if selection_mode == "vertex":
-                vertices[0].select = True
-            elif selection_mode == "edge":
-                edges[0].select = True
-            elif selection_mode == "face":
-                faces[0].select = True
-            vertex_sequence = CountingSequence(vertices)
-            edge_sequence = CountingSequence(edges)
-            face_sequence = CountingSequence(faces)
-            bm = SimpleNamespace(
-                verts=vertex_sequence,
-                edges=edge_sequence,
-                faces=face_sequence,
-                select_history=(),
-            )
-            for sequence in (vertex_sequence, edge_sequence, face_sequence):
-                setattr(cast(Any, sequence), "ensure_lookup_table", lambda: None)
-                setattr(cast(Any, sequence), "index_update", lambda: None)
-            # Compat path (mesh_object=None): domain maps stay lazy.
-            cast(Any, core.extend_selection_to_mirror)(bm, 0, TOLERANCE)
-            assert edge_sequence.iterations == (2 if selection_mode == "edge" else 1)
-            assert face_sequence.iterations == (2 if selection_mode == "face" else 1)
-    finally:
-        setattr(selection, method_name, original_builder)
+    for selection_mode in ("empty", "vertex", "edge", "face"):
+        vertices = [
+            FakeVertex(0, (-1.0, 0.0, 0.0)),
+            FakeVertex(1, (1.0, 0.0, 0.0)),
+            FakeVertex(2, (-1.0, 1.0, 0.0)),
+            FakeVertex(3, (1.0, 1.0, 0.0)),
+            FakeVertex(4, (-1.0, 0.0, 1.0)),
+            FakeVertex(5, (1.0, 0.0, 1.0)),
+        ]
+        edges = [FakeEdge(0, (vertices[0], vertices[2])), FakeEdge(1, (vertices[1], vertices[3]))]
+        faces = [
+            FakeFace(0, (vertices[0], vertices[2], vertices[4])),
+            FakeFace(1, (vertices[1], vertices[3], vertices[5])),
+        ]
+        if selection_mode == "vertex":
+            vertices[0].select = True
+        elif selection_mode == "edge":
+            edges[0].select = True
+        elif selection_mode == "face":
+            faces[0].select = True
+        vertex_sequence = CountingSequence(vertices)
+        edge_sequence = CountingSequence(edges)
+        face_sequence = CountingSequence(faces)
+        bm = SimpleNamespace(
+            verts=vertex_sequence,
+            edges=edge_sequence,
+            faces=face_sequence,
+            select_history=(),
+        )
+        for sequence in (vertex_sequence, edge_sequence, face_sequence):
+            setattr(cast(Any, sequence), "ensure_lookup_table", lambda: None)
+            setattr(cast(Any, sequence), "index_update", lambda: None)
+        cast(Any, core.extend_selection_to_mirror)(bm, 0, TOLERANCE)
+        assert edge_sequence.iterations == 1
+        assert face_sequence.iterations == 1
 
 
 def _check_extend_selection_wrapper_matrix():
@@ -1590,9 +1596,7 @@ class _BulkMeshData:
         # Mutable lists so guard tests can corrupt loop order / totals in place.
         self._starts = starts
         self._totals = totals
-        self.polygons = _BulkPolygonCollection(
-            face_hide, self._starts, self._totals, by_name={"select": face_select}
-        )
+        self.polygons = _BulkPolygonCollection(face_hide, self._starts, self._totals, by_name={"select": face_select})
         self.loops = _BulkLoopCollection(loops)
 
     def sync_selection_from(self, bm):
@@ -1656,6 +1660,303 @@ def _selection_state(bm):
     )
 
 
+def _reference_classify_selection_overlap(coords, selected_indices, axis_index=0, tolerance=TOLERANCE):
+    pairs = matching.build_vertex_pair_table(coords, axis_index, tolerance)
+    selected = frozenset(selected_indices)
+    shared = frozenset(index for index in selected if abs(coords[index][axis_index]) <= tolerance)
+    off = selected - shared
+    complete = all(index in pairs for index in off)
+    mirrors = {pairs[index] for index in off if index in pairs}
+    crossing = mirrors & selected
+    if not crossing:
+        overlap = MirrorOverlap.SELF_MIRRORED if not off else MirrorOverlap.DISJOINT
+    elif complete and mirrors == off:
+        overlap = MirrorOverlap.SELF_MIRRORED
+    else:
+        overlap = MirrorOverlap.PARTIAL
+    return OverlapClassification(overlap=overlap, complete=complete, pairs=pairs)
+
+
+def _reference_extend_selection_to_mirror(bm, axis_index=0, tolerance=TOLERANCE):
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    bm.verts.index_update()
+    bm.edges.index_update()
+    bm.faces.index_update()
+    pairs = matching.build_vertex_pair_table(tuple(vertex.co.copy() for vertex in bm.verts), axis_index, tolerance)
+    if not pairs:
+        return 0
+
+    selected_verts = [vertex for vertex in bm.verts if vertex.select]
+    selected_edges = [edge for edge in bm.edges if edge.select]
+    selected_faces = [face for face in bm.faces if face.select]
+    edge_by_verts = {frozenset((edge.verts[0].index, edge.verts[1].index)): edge for edge in bm.edges if edge.is_valid}
+    face_by_verts = {frozenset(vertex.index for vertex in face.verts): face for face in bm.faces if face.is_valid}
+    added = 0
+    for vertex in selected_verts:
+        partner_index = pairs.get(vertex.index)
+        if partner_index is None or partner_index == vertex.index:
+            continue
+        if partner_index < 0 or partner_index >= len(bm.verts):
+            continue
+        partner = bm.verts[partner_index]
+        if partner.is_valid and not partner.select:
+            partner.select = True
+            added += 1
+    for edge in selected_edges:
+        if not edge.is_valid:
+            continue
+        source_indices = (edge.verts[0].index, edge.verts[1].index)
+        partner_indices = [pairs[index] for index in source_indices if index in pairs]
+        if len(partner_indices) != len(source_indices):
+            continue
+        partner_set = frozenset(partner_indices)
+        if partner_set == frozenset(source_indices):
+            continue
+        partner = edge_by_verts.get(partner_set)
+        if partner is not None and partner.is_valid and not partner.select:
+            partner.select = True
+            added += 1
+    for face in selected_faces:
+        if not face.is_valid:
+            continue
+        source_indices = tuple(vertex.index for vertex in face.verts)
+        partner_indices = [pairs[index] for index in source_indices if index in pairs]
+        if len(partner_indices) != len(source_indices):
+            continue
+        partner_set = frozenset(partner_indices)
+        if partner_set == frozenset(source_indices):
+            continue
+        partner = face_by_verts.get(partner_set)
+        if partner is not None and partner.is_valid and not partner.select:
+            partner.select = True
+            added += 1
+    return added
+
+
+def _build_u6_scoped_fixture(*, perturb=False):
+    bm = bmesh.new()
+    bmesh.ops.create_grid(bm, x_segments=12, y_segments=12, size=2.0)
+    bm.verts.ensure_lookup_table()
+    for vertex in bm.verts:
+        vertex.co.z = 0.05 * math.cos(float(vertex.co.x) * 2.0) * math.cos(float(vertex.co.y))
+    dense_indices = []
+    for coordinate in DENSE_CANDIDATE_COORDS:
+        dense_indices.append(bm.verts.new(coordinate).index)
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    bm.verts.index_update()
+    bm.edges.index_update()
+    bm.faces.index_update()
+    dense_indices = list(range(len(bm.verts) - len(DENSE_CANDIDATE_COORDS), len(bm.verts)))
+    if perturb:
+        bm.verts[0].co.x += 0.37
+    return bm, dense_indices
+
+
+def _select_u6_pattern(bm, dense_indices, pattern):
+    rng = random.Random(60_006)
+    if pattern == "random":
+        for vertex in rng.sample(list(bm.verts), 18):
+            vertex.select = True
+        for edge in rng.sample(list(bm.edges), 12):
+            edge.select = True
+        for face in rng.sample(list(bm.faces), 8):
+            face.select = True
+    elif pattern == "on_plane":
+        for vertex in bm.verts:
+            if abs(float(vertex.co.x)) <= TOLERANCE:
+                vertex.select = True
+        for face in list(bm.faces)[::31]:
+            face.select = True
+    elif pattern == "negative":
+        for vertex in [vertex for vertex in bm.verts if float(vertex.co.x) < -TOLERANCE][::7]:
+            vertex.select = True
+        for edge in [edge for edge in bm.edges if max(float(vertex.co.x) for vertex in edge.verts) < -TOLERANCE][::11]:
+            edge.select = True
+        for face in [face for face in bm.faces if max(float(vertex.co.x) for vertex in face.verts) < -TOLERANCE][::13]:
+            face.select = True
+    elif pattern == "dense":
+        for index in dense_indices[1::2]:
+            bm.verts[index].select = True
+    else:
+        raise AssertionError(pattern)
+
+
+def _check_u6_scoped_selection_equivalence():
+    for pattern, perturb in (
+        ("random", False),
+        ("on_plane", False),
+        ("negative", False),
+        ("random", True),
+        ("dense", False),
+    ):
+        source, dense_indices = _build_u6_scoped_fixture(perturb=perturb)
+        try:
+            _select_u6_pattern(source, dense_indices, pattern)
+            expected_bm = _clone_bmesh(source)
+            actual_bm = _clone_bmesh(source)
+            expected_added = _reference_extend_selection_to_mirror(expected_bm)
+
+            full_build_calls = 0
+            original_selection_builder = selection.build_vertex_pair_table
+
+            def count_selection_full_build(*args, **kwargs):
+                nonlocal full_build_calls
+                full_build_calls += 1
+                return original_selection_builder(*args, **kwargs)
+
+            setattr(selection, "build_vertex_pair_table", count_selection_full_build)
+            try:
+                actual_added = core.extend_selection_to_mirror(actual_bm, 0, TOLERANCE)
+            finally:
+                setattr(selection, "build_vertex_pair_table", original_selection_builder)
+            assert full_build_calls == 0, (pattern, full_build_calls)
+            assert actual_added == expected_added, pattern
+            assert _selection_state(actual_bm) == _selection_state(expected_bm), pattern
+
+            coords = numpy.asarray([tuple(vertex.co) for vertex in source.verts], dtype=numpy.float64)
+            selected = tuple(vertex.index for vertex in source.verts if vertex.select)
+            expected = _reference_classify_selection_overlap(coords, selected)
+            registry = core.VertexRegistry(coords, 0, TOLERANCE)
+            resolved = registry.resolve_closure(selected)
+            assert resolved is not None
+            closure, expected_scoped_pairs = resolved
+            assert expected_scoped_pairs == {
+                index: partner for index, partner in expected.pairs.items() if index in set(closure.tolist())
+            }
+
+            full_build_calls = 0
+            original_matching_builder = matching.build_vertex_pair_table
+
+            def count_matching_full_build(*args, **kwargs):
+                nonlocal full_build_calls
+                full_build_calls += 1
+                return original_matching_builder(*args, **kwargs)
+
+            setattr(matching, "build_vertex_pair_table", count_matching_full_build)
+            try:
+                actual = core.classify_selection_overlap(
+                    coords,
+                    selected,
+                    axis_index=0,
+                    tolerance=TOLERANCE,
+                )
+            finally:
+                setattr(matching, "build_vertex_pair_table", original_matching_builder)
+            assert full_build_calls == 0, (pattern, full_build_calls)
+            assert actual.overlap == expected.overlap, pattern
+            assert actual.complete == expected.complete, pattern
+            assert dict.__len__(actual.pairs) == len(expected_scoped_pairs), pattern
+            assert all(actual.pairs[index] == partner for index, partner in expected_scoped_pairs.items()), pattern
+            assert actual.pairs == expected.pairs, pattern
+
+            replay_actual = replay_module.classify_mirror_selection(
+                coords,
+                selected,
+                axis_index=0,
+                tolerance=TOLERANCE,
+            )
+            expected_off = frozenset(index for index in selected if abs(coords[index][0]) > TOLERANCE)
+            expected_mirror_by_source = {
+                index: expected.pairs[index] for index in expected_off if index in expected.pairs
+            }
+            assert replay_actual.selected == frozenset(selected)
+            assert replay_actual.off == expected_off
+            assert replay_actual.shared == frozenset(selected) - expected_off
+            assert replay_actual.mirror_by_source == expected_mirror_by_source
+            assert replay_actual.missing == frozenset(expected_off - expected_mirror_by_source.keys())
+            assert replay_actual.overlap == expected.overlap
+            assert replay_actual.complete == expected.complete
+            assert dict.__len__(replay_actual.pairs) == len(expected_scoped_pairs)
+            assert replay_actual.pairs == expected.pairs
+        finally:
+            expected_bm.free()
+            actual_bm.free()
+            source.free()
+
+
+def _check_u6_face_duplicate_vertex_set_tie():
+    class FakeVertex:
+        def __init__(self, index):
+            self.index = index
+            self.is_valid = True
+            self.link_faces = []
+
+    class FakeFace:
+        def __init__(self, index, vertices, is_valid=True):
+            self.index = index
+            self.verts = vertices
+            self.is_valid = is_valid
+            for vertex in vertices:
+                vertex.link_faces.append(self)
+
+    vertices = [FakeVertex(index) for index in range(4)]
+    lower = FakeFace(3, vertices)
+    higher = FakeFace(9, tuple(reversed(vertices)))
+    FakeFace(12, vertices, is_valid=False)
+    bm = SimpleNamespace(verts=vertices)
+    assert selection._find_face_by_verts(bm, frozenset(range(4))) is higher
+    assert higher.index > lower.index
+
+
+def _check_u6_registry_fallback():
+    class UnavailableRegistry:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def resolve_closure(self, _seeds):
+            return None
+
+        def resolve_closure_arrays(self, _seeds):
+            return None
+
+    coords = numpy.asarray(((-1.0, 0.0, 0.0), (1.0, 0.0, 0.0)), dtype=numpy.float64)
+    expected = _reference_classify_selection_overlap(coords, (0,))
+    original_registry = matching.VertexRegistry
+    original_builder = matching.build_vertex_pair_table
+    build_calls = 0
+
+    def count_build(*args, **kwargs):
+        nonlocal build_calls
+        build_calls += 1
+        return original_builder(*args, **kwargs)
+
+    setattr(matching, "VertexRegistry", UnavailableRegistry)
+    setattr(matching, "build_vertex_pair_table", count_build)
+    try:
+        actual = core.classify_selection_overlap(coords, (0,), axis_index=0, tolerance=TOLERANCE)
+    finally:
+        setattr(matching, "build_vertex_pair_table", original_builder)
+        setattr(matching, "VertexRegistry", original_registry)
+    assert build_calls == 1
+    assert actual == expected
+
+    bm = bmesh.new()
+    try:
+        left = bm.verts.new((-1.0, 0.0, 0.0))
+        bm.verts.new((1.0, 0.0, 0.0))
+        bm.verts.ensure_lookup_table()
+        left.select = True
+        original_registry = selection.VertexRegistry
+        original_builder = selection.build_vertex_pair_table
+        build_calls = 0
+        setattr(selection, "VertexRegistry", UnavailableRegistry)
+        setattr(selection, "build_vertex_pair_table", count_build)
+        try:
+            added = core.extend_selection_to_mirror(bm, 0, TOLERANCE)
+        finally:
+            setattr(selection, "build_vertex_pair_table", original_builder)
+            setattr(selection, "VertexRegistry", original_registry)
+        assert build_calls == 1
+        assert added == 1
+        assert bm.verts[1].select
+    finally:
+        bm.free()
+
+
 def _check_selection_snapshot_bulk_equivalence():
     """capture_selection_snapshot bulk and BMesh paths agree bit-for-bit."""
 
@@ -1689,9 +1990,7 @@ def _check_selection_snapshot_bulk_equivalence():
         mesh_object = _BulkMeshObject(bulk_data)
         original_foreach = _install_bulk_polygon_loop_hooks(bulk_data)
         try:
-            compat = core.capture_selection_snapshot(
-                bm, domains=("VERT", "EDGE", "FACE"), include_history=True
-            )
+            compat = core.capture_selection_snapshot(bm, domains=("VERT", "EDGE", "FACE"), include_history=True)
             captured = core.capture_selection_snapshot(
                 bulk,
                 mesh_object=mesh_object,
@@ -1737,9 +2036,7 @@ def _check_selection_snapshot_bulk_equivalence():
 
             # build_element_pair_maps: vert/edge/face pair tables match.
             maps_compat = delete_dissolve.build_element_pair_maps(bm, 0, TOLERANCE, mesh_object=None)
-            maps_bulk = delete_dissolve.build_element_pair_maps(
-                bulk, 0, TOLERANCE, mesh_object=mesh_object
-            )
+            maps_bulk = delete_dissolve.build_element_pair_maps(bulk, 0, TOLERANCE, mesh_object=mesh_object)
             assert maps_compat.vert_pairs == maps_bulk.vert_pairs
             assert maps_compat.edge_pair_by_index == maps_bulk.edge_pair_by_index
             assert maps_compat.face_pair_by_index == maps_bulk.face_pair_by_index
@@ -1747,17 +2044,11 @@ def _check_selection_snapshot_bulk_equivalence():
             # classify via _vertex_snapshot bulk/compat agreement.
             bulk_data.sync_selection_from(bulk)
             coords_c, selected_c, history_c, history_i_c = replay_module._vertex_snapshot(bm)
-            coords_b, selected_b, history_b, history_i_b = replay_module._vertex_snapshot(
-                bulk, mesh_object=mesh_object
-            )
+            coords_b, selected_b, history_b, history_i_b = replay_module._vertex_snapshot(bulk, mesh_object=mesh_object)
             assert selected_c == selected_b
             assert history_i_c == history_i_b
-            snap_c = replay_module.classify_mirror_selection(
-                coords_c, selected_c, axis_index=0, tolerance=TOLERANCE
-            )
-            snap_b = replay_module.classify_mirror_selection(
-                coords_b, selected_b, axis_index=0, tolerance=TOLERANCE
-            )
+            snap_c = replay_module.classify_mirror_selection(coords_c, selected_c, axis_index=0, tolerance=TOLERANCE)
+            snap_b = replay_module.classify_mirror_selection(coords_b, selected_b, axis_index=0, tolerance=TOLERANCE)
             assert snap_c.selected == snap_b.selected
             assert snap_c.pairs == snap_b.pairs
             assert snap_c.mirror_by_source == snap_b.mirror_by_source
@@ -2032,9 +2323,7 @@ def _check_selection_bulk_guard_fallbacks():
                 bm.select_history.clear()
                 bm.select_history.add(bm.verts[0])
 
-            expected = core.capture_selection_snapshot(
-                bm, domains=domains, include_history=True
-            )
+            expected = core.capture_selection_snapshot(bm, domains=domains, include_history=True)
             data = _BulkMeshData(bm)
             if kind == "shape_keys":
                 data.shape_keys = object()
@@ -2882,6 +3171,9 @@ def run():
     _check_batch_candidate_contract_edges()
     _check_extend_selection_matrix()
     _check_extend_selection_lazy_indices()
+    _check_u6_scoped_selection_equivalence()
+    _check_u6_face_duplicate_vertex_set_tie()
+    _check_u6_registry_fallback()
     _check_extend_selection_wrapper_matrix()
     _check_selection_snapshot_bulk_equivalence()
     _check_topology_equivalence()
