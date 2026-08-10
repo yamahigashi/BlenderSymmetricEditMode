@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import defaultdict
 from collections.abc import Iterator
 from typing import cast
 
@@ -17,42 +16,29 @@ from ._types import (
     MirrorFaceMap,
     TopologyPreparation,
 )
+from .face_mapping import _snapshot_face_map
+from .layer_names import (
+    EDGE_HIDDEN_LAYER,
+    EDGE_ORIGINAL_LAYER,
+    EDGE_SELECTION_LAYER,
+    FACE_HIDDEN_LAYER,
+    FACE_ID_LAYER,
+    FACE_MIRROR_ID_LAYER,
+    FACE_SELECTION_LAYER,
+    HISTORY_TOKEN_LAYER,
+    TEMP_LAYER_NAMES,
+    VERT_BACKUP_ID_LAYER,
+    VERT_COLLAPSE_GROUP_LAYER,
+    VERT_HIDDEN_LAYER,
+    VERT_MERGE_GROUP_LAYER,
+    VERT_RIP_ID_LAYER,
+    VERT_SELECTION_LAYER,
+)
 from .matching import (
     VertexMirrorLookup,
     _coordinate_3d,
-    _solve_injective_component,
+    _one_sided_pair_table,
     build_vertex_pair_table,
-)
-
-EDGE_ORIGINAL_LAYER = ".yse_original_edge"
-FACE_ID_LAYER = ".yse_original_face_id"
-FACE_MIRROR_ID_LAYER = ".yse_mirror_face_id"
-FACE_HIDDEN_LAYER = ".yse_face_hidden"
-HISTORY_TOKEN_LAYER = ".yse_history_token"
-VERT_SELECTION_LAYER = ".yse_vertex_selection"
-EDGE_SELECTION_LAYER = ".yse_edge_selection"
-FACE_SELECTION_LAYER = ".yse_face_selection"
-VERT_HIDDEN_LAYER = ".yse_vertex_hidden"
-EDGE_HIDDEN_LAYER = ".yse_edge_hidden"
-VERT_BACKUP_ID_LAYER = ".yse_backup_vertex_id"
-VERT_RIP_ID_LAYER = ".yse_rip_vertex_id"
-VERT_MERGE_GROUP_LAYER = ".yse_merge_group"
-VERT_COLLAPSE_GROUP_LAYER = ".yse_collapse_group"
-TEMP_LAYER_NAMES = (
-    EDGE_ORIGINAL_LAYER,
-    FACE_ID_LAYER,
-    FACE_MIRROR_ID_LAYER,
-    FACE_HIDDEN_LAYER,
-    HISTORY_TOKEN_LAYER,
-    VERT_SELECTION_LAYER,
-    EDGE_SELECTION_LAYER,
-    FACE_SELECTION_LAYER,
-    VERT_HIDDEN_LAYER,
-    EDGE_HIDDEN_LAYER,
-    VERT_BACKUP_ID_LAYER,
-    VERT_RIP_ID_LAYER,
-    VERT_MERGE_GROUP_LAYER,
-    VERT_COLLAPSE_GROUP_LAYER,
 )
 
 
@@ -239,152 +225,6 @@ def _carrier_frame_snapshot(face: bmesh.types.BMFace) -> CarrierFrameSnapshot:
     return _carrier_frame_from_coords(tuple(_coordinate_3d(vertex.co) for vertex in face.verts))
 
 
-def _one_sided_candidate_arrays(coords64: numpy.ndarray, axis_index: int, tolerance: float):
-    """Build sorted mirror candidate arrays with one off-plane probe."""
-
-    count = len(coords64)
-    if count == 0 or not numpy.isfinite(coords64).all():
-        return None
-    axis = coords64[:, axis_index]
-    on_plane = numpy.abs(axis) <= tolerance
-    positive = ~on_plane & (axis > tolerance)
-    negative = ~on_plane & (axis < -tolerance)
-    inverse = 1.0 / max(tolerance, 1.0e-12)
-    scaled = coords64 * inverse
-    if numpy.any(numpy.abs(scaled) >= 2**62):
-        return None
-    bins = numpy.floor(scaled).astype(numpy.int64)
-    mins = bins.min(axis=0)
-    spans = bins.max(axis=0) - mins + 1
-    if int(spans[0]) * int(spans[1]) * int(spans[2]) >= 2**63:
-        return None
-    stride_y = int(spans[2])
-    stride_x = int(spans[1]) * stride_y
-    shifted = bins - mins
-    keys = shifted[:, 0] * stride_x + shifted[:, 1] * stride_y + shifted[:, 2]
-    order = numpy.argsort(keys, kind="stable")
-    sorted_keys = keys[order]
-    offsets = numpy.asarray([(x, y) for x in (-1, 0, 1) for y in (-1, 0, 1)], dtype=numpy.int64)
-    span_z = int(spans[2])
-    span_xy = numpy.asarray((int(spans[0]), int(spans[1])), dtype=numpy.int64)
-
-    def probe(query_indices, query_points, side_mask):
-        if len(query_indices) == 0:
-            empty_i = numpy.empty(0, dtype=numpy.int64)
-            return empty_i, empty_i.copy(), numpy.empty(0, dtype=numpy.float64)
-        query_bins = numpy.floor(query_points * inverse).astype(numpy.int64)
-        shifted_xy = (query_bins[:, None, :2] + offsets[None, :, :]).reshape(-1, 2) - mins[:2]
-        shifted_z = numpy.repeat(query_bins[:, 2] - mins[2], len(offsets))
-        valid = numpy.flatnonzero(
-            (shifted_xy >= 0).all(axis=1)
-            & (shifted_xy < span_xy).all(axis=1)
-            & (shifted_z >= -1)
-            & (shifted_z <= span_z)
-        )
-        if len(valid) == 0:
-            empty_i = numpy.empty(0, dtype=numpy.int64)
-            return empty_i, empty_i.copy(), numpy.empty(0, dtype=numpy.float64)
-        low = numpy.clip(shifted_z[valid] - 1, 0, span_z - 1)
-        high = numpy.clip(shifted_z[valid] + 1, 0, span_z - 1)
-        row = shifted_xy[valid][:, 0] * stride_x + shifted_xy[valid][:, 1] * stride_y
-        left = numpy.searchsorted(sorted_keys, row + low, side="left")
-        right = numpy.searchsorted(sorted_keys, row + high, side="right")
-        counts = right - left
-        total = int(counts.sum())
-        if total == 0:
-            empty_i = numpy.empty(0, dtype=numpy.int64)
-            return empty_i, empty_i.copy(), numpy.empty(0, dtype=numpy.float64)
-        windows = numpy.repeat(numpy.arange(len(counts), dtype=numpy.int64), counts)
-        starts = numpy.repeat(numpy.cumsum(counts) - counts, counts)
-        within = numpy.arange(total, dtype=numpy.int64) - starts
-        targets = order[left[windows] + within]
-        local_queries = valid[windows] // len(offsets)
-        queries = query_indices[local_queries]
-        distances = numpy.max(numpy.abs(coords64[targets] - query_points[local_queries]), axis=1)
-        keep = (distances <= tolerance) & side_mask[targets]
-        return queries[keep], targets[keep], distances[keep]
-
-    positive_indices = numpy.flatnonzero(positive)
-    mirrored_positive = coords64[positive].copy()
-    mirrored_positive[:, axis_index] = -mirrored_positive[:, axis_index]
-    positive_queries, positive_targets, positive_distances = probe(positive_indices, mirrored_positive, negative)
-    plane_indices = numpy.flatnonzero(on_plane)
-    plane_queries, plane_targets, plane_distances = probe(plane_indices, coords64[on_plane], on_plane)
-    queries = numpy.concatenate((positive_queries, positive_targets, plane_queries))
-    targets = numpy.concatenate((positive_targets, positive_queries, plane_targets))
-    distances = numpy.concatenate((positive_distances, positive_distances, plane_distances))
-    if len(queries):
-        order_all = numpy.lexsort((targets, distances, queries))
-        queries = queries[order_all]
-        targets = targets[order_all]
-        distances = distances[order_all]
-    return queries, targets, distances
-
-
-def _one_sided_pair_table(coords64: numpy.ndarray, axis_index: int, tolerance: float):
-    """Build mirror candidates with one off-plane probe and its transpose."""
-
-    arrays = _one_sided_candidate_arrays(coords64, axis_index, tolerance)
-    if arrays is None:
-        return None
-    count = len(coords64)
-    queries, targets, distances = arrays
-    query_counts = numpy.bincount(queries, minlength=count)
-    target_counts = numpy.bincount(targets, minlength=count)
-    starts = numpy.cumsum(query_counts) - query_counts
-    assigned = numpy.full(count, -1, dtype=numpy.int64)
-    singles = numpy.flatnonzero(query_counts == 1)
-    if len(singles):
-        single_targets = targets[starts[singles]]
-        unique = target_counts[single_targets] == 1
-        assigned[singles[unique]] = single_targets[unique]
-    remainder_mask = query_counts > 0
-    remainder_mask[assigned >= 0] = False
-    candidate_lists: dict[int, list[tuple[float, int]]] = {}
-    for query in numpy.flatnonzero(remainder_mask).tolist():
-        begin = int(starts[query])
-        end = begin + int(query_counts[query])
-        candidate_lists[query] = [
-            (float(distance), int(target))
-            for distance, target in zip(distances[begin:end], targets[begin:end], strict=True)
-        ]
-    if candidate_lists:
-        queries_by_target: dict[int, list[int]] = defaultdict(list)
-        for query, candidates in candidate_lists.items():
-            for _distance, target in candidates:
-                queries_by_target[target].append(query)
-        visited: set[int] = set()
-        for start_query in candidate_lists:
-            if start_query in visited or not candidate_lists[start_query]:
-                visited.add(start_query)
-                continue
-            component = []
-            component_targets: set[int] = set()
-            pending = [start_query]
-            visited.add(start_query)
-            while pending:
-                query = pending.pop()
-                component.append(query)
-                for _distance, target in candidate_lists[query]:
-                    if target in component_targets:
-                        continue
-                    component_targets.add(target)
-                    for other in queries_by_target[target]:
-                        if other not in visited:
-                            visited.add(other)
-                            pending.append(other)
-            assignment = _solve_injective_component(component, candidate_lists)
-            if assignment is not None:
-                for query, target in assignment.items():
-                    assigned[query] = target
-    pairs = {
-        source: int(target)
-        for source, target in enumerate(assigned.tolist())
-        if target >= 0 and int(assigned[target]) == source
-    }
-    return pairs
-
-
 class LazyTopologyResolution:
     """Pure captured topology snapshot with a memoized resolution."""
 
@@ -469,8 +309,6 @@ class LazyTopologyResolution:
         return not self == other
 
     def resolve(self) -> LazyTopologyResolution:
-        from .face_mapping import _snapshot_face_map
-
         if self._resolved:
             return self
         self._resolve_count += 1

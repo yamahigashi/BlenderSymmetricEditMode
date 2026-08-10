@@ -1877,6 +1877,133 @@ def _check_one_sided_candidate_arrays_contract():
             assert actual[2].tolist() == expected[2].tolist()
 
 
+def _check_phase4_u2_dependency_direction():
+    ast = __import__("ast")
+    package_dir = PACKAGE_PARENT / "ydd_symmetric_edit"
+    module_names = ("snapshot", "face_mapping", "matching", "layer_names")
+    sources = {
+        module_name: (package_dir / f"{module_name}.py").read_text(encoding="utf-8") for module_name in module_names
+    }
+
+    face_mapping_source = sources["face_mapping"]
+    assert "from .snapshot import" not in face_mapping_source
+    assert "import .snapshot" not in face_mapping_source
+
+    for module_name, forbidden_imports in (
+        ("face_mapping", {"snapshot"}),
+        ("matching", {"snapshot", "face_mapping"}),
+        ("layer_names", {"snapshot", "face_mapping"}),
+    ):
+        tree = ast.parse(sources[module_name])
+        imported_modules = {
+            node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module is not None
+        }
+        imported_modules.update(
+            alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names
+        )
+        imported_modules.update(
+            alias.name for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) for alias in node.names
+        )
+        assert forbidden_imports.isdisjoint(imported_modules)
+
+    for module_name, source in sources.items():
+        tree = ast.parse(source)
+        for function in (node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))):
+            delayed_imports = [node for node in ast.walk(function) if isinstance(node, (ast.Import, ast.ImportFrom))]
+            assert not delayed_imports, f"{module_name}.{function.name} contains a delayed import"
+
+
+def _candidate_multiset(arrays):
+    assert arrays is not None
+    queries, targets, distances = arrays
+    return sorted(
+        (int(query), int(target), float(distance))
+        for query, target, distance in zip(queries, targets, distances, strict=True)
+    )
+
+
+def _check_vertex_registry_plane_split_oracle():
+    tolerance = 0.125
+    coords = numpy.asarray(
+        (
+            (1.0, 0.5, -0.5),
+            (-1.0, 0.5, -0.5),
+            (0.0, 0.0, 0.0),
+            (tolerance, tolerance, 0.0),
+            (-tolerance, 0.0, 0.0),
+            (-2.0, 2.0, 0.0),
+            (3.0, 1.0, 0.0),
+            (-3.0 - tolerance, 1.0, 0.0),
+            (2.0 * tolerance, 0.0, 0.0),
+        ),
+        dtype=numpy.float64,
+    )
+    registry = core.VertexRegistry(coords, 0, tolerance)
+
+    assert registry.on_plane_indices.tolist() == [2, 3, 4]
+    assert _candidate_multiset(registry.candidates_on_plane(numpy.asarray((2,), dtype=numpy.int64))) == [
+        (2, 2, 0.0),
+        (2, 3, tolerance),
+        (2, 4, tolerance),
+    ]
+    assert _candidate_multiset(registry.candidates_off_plane(numpy.asarray((0, 5, 6, 8), dtype=numpy.int64))) == [
+        (0, 1, 0.0),
+        (6, 7, tolerance),
+    ]
+    assert _candidate_multiset(registry.claimants_on_plane(numpy.asarray((3,), dtype=numpy.int64))) == [
+        (2, 3, tolerance),
+        (3, 3, 0.0),
+    ]
+    assert _candidate_multiset(registry.claimants_off_plane(numpy.asarray((1, 7), dtype=numpy.int64))) == [
+        (0, 1, 0.0),
+        (6, 7, tolerance),
+    ]
+
+
+def _check_vertex_registry_dense_candidates():
+    tolerance = TOLERANCE
+    positive = [(1.0 + 0.3 * tolerance * index, 0.0, 0.0) for index in range(4)]
+    negative = [(-coordinate[0], coordinate[1], coordinate[2]) for coordinate in positive]
+    registry = core.VertexRegistry(numpy.asarray(positive + negative, dtype=numpy.float64), 0, tolerance)
+
+    forward = _candidate_multiset(registry.candidates_off_plane(registry.positive_indices))
+    assert len(forward) == 16
+    assert {(query, target) for query, target, _distance in forward} == {
+        (query, target) for query in range(4) for target in range(4, 8)
+    }
+    reverse = _candidate_multiset(registry.claimants_off_plane(registry.negative_indices))
+    assert reverse == forward
+
+
+def _check_vertex_registry_matches_one_sided_candidate_multiset():
+    tolerance = 0.125
+    coords = numpy.asarray(
+        (
+            (1.0, 0.0, 0.0),
+            (1.0 + 0.25 * tolerance, 0.0, 0.0),
+            (-1.0, 0.0, 0.0),
+            (-1.0 - 0.25 * tolerance, 0.0, 0.0),
+            (0.0, 0.0, 0.0),
+            (tolerance, tolerance, 0.0),
+            (-tolerance, 0.0, 0.0),
+            (-4.0, 2.0, 0.0),
+        ),
+        dtype=numpy.float64,
+    )
+    for axis_index in range(3):
+        axis_coords = numpy.roll(coords, axis_index, axis=1)
+        registry = core.VertexRegistry(axis_coords, axis_index, tolerance)
+        parts = (
+            registry.candidates_off_plane(registry.positive_indices),
+            registry.claimants_off_plane(registry.positive_indices),
+            registry.candidates_on_plane(registry.on_plane_indices),
+        )
+        candidate_rows = [row for arrays in parts for row in _candidate_multiset(arrays)]
+
+        expected = core._one_sided_candidate_arrays(axis_coords, axis_index, tolerance)
+        assert sorted(candidate_rows) == _candidate_multiset(expected)
+
+
 def _check_lazy_restore_state_matrix():
     bm = _build_deformed_grid(3)
     try:
@@ -2123,6 +2250,10 @@ def run():
     _check_bulk_guard_fallbacks()
     _check_nonfinite_one_sided_fallback()
     _check_one_sided_candidate_arrays_contract()
+    _check_phase4_u2_dependency_direction()
+    _check_vertex_registry_plane_split_oracle()
+    _check_vertex_registry_dense_candidates()
+    _check_vertex_registry_matches_one_sided_candidate_multiset()
     _check_lazy_restore_state_matrix()
     _check_prepare_session_invoke_does_not_resolve()
     # Duplicate COMMITTED records and F9 ABSENT are exercised by the existing

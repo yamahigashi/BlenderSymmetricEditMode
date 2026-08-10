@@ -17,16 +17,17 @@ from ._types import (
     MirrorFaceMap,
     QuantizedCoordinate,
 )
+from .layer_names import FACE_ID_LAYER
 from .matching import (
     _coordinate_3d,
     _coords_match_chebyshev,
     _iter_quantized_neighborhood,
+    _one_sided_pair_table,
     _quantized_coordinate,
     build_vertex_pair_table,
     coordinates_match,
     mirror_coordinate,
 )
-from .snapshot import FACE_ID_LAYER, _one_sided_pair_table
 
 
 def _snapshot_face_map(

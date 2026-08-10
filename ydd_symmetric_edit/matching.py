@@ -535,6 +535,171 @@ class VertexMirrorLookup:
         return candidates
 
 
+class VertexRegistry:
+    """Resolution-free float64 vertex index for the plane-split oracle.
+
+    The registry captures only coordinates, side masks, and the packed-bin
+    search index. Candidate and claimant methods return parallel arrays of
+    ``(query index, target index, Chebyshev distance)`` and never retain an
+    assignment or any other resolution result. They return ``None`` when the
+    vectorized index cannot represent non-finite or out-of-range coordinates.
+    """
+
+    def __init__(self, coords64: numpy.ndarray, axis_index: int, tolerance: float) -> None:
+        coords = numpy.asarray(coords64, dtype=numpy.float64)
+        if coords.ndim != 2 or coords.shape[1:] != (3,):
+            raise ValueError("coords64 must have shape (count, 3)")
+        if axis_index not in (0, 1, 2):
+            raise ValueError("axis_index must be 0, 1, or 2")
+
+        self.coords64 = coords
+        self.axis_index = int(axis_index)
+        self.tolerance = float(tolerance)
+        axis = coords[:, self.axis_index]
+        self._on_plane = numpy.abs(axis) <= self.tolerance
+        self._positive = ~self._on_plane & (axis > self.tolerance)
+        self._negative = ~self._on_plane & (axis < -self.tolerance)
+        self.on_plane_indices = numpy.flatnonzero(self._on_plane)
+        self.positive_indices = numpy.flatnonzero(self._positive)
+        self.negative_indices = numpy.flatnonzero(self._negative)
+        self._offsets = numpy.asarray(
+            [(x, y) for x in (-1, 0, 1) for y in (-1, 0, 1)],
+            dtype=numpy.int64,
+        )
+        self._index = self._build_index()
+
+    @staticmethod
+    def _empty_candidate_arrays():
+        empty_indices = numpy.empty(0, dtype=numpy.int64)
+        return empty_indices, empty_indices.copy(), numpy.empty(0, dtype=numpy.float64)
+
+    def _build_index(self):
+        count = len(self.coords64)
+        if count == 0:
+            return {}
+        if not numpy.isfinite(self.coords64).all():
+            return None
+        inverse = 1.0 / max(self.tolerance, 1.0e-12)
+        scaled = self.coords64 * inverse
+        if numpy.any(numpy.abs(scaled) >= 2**62):
+            return None
+        bins = numpy.floor(scaled).astype(numpy.int64)
+        mins = bins.min(axis=0)
+        spans = bins.max(axis=0) - mins + 1
+        span_x, span_y, span_z = (int(span) for span in spans)
+        if span_x * span_y * span_z >= 2**63:
+            return None
+        stride_y = span_z
+        stride_x = span_y * span_z
+        shifted = bins - mins
+        keys = shifted[:, 0] * stride_x + shifted[:, 1] * stride_y + shifted[:, 2]
+        order = numpy.argsort(keys, kind="stable")
+        return {
+            "inverse": inverse,
+            "mins": mins,
+            "spans": numpy.asarray((span_x, span_y, span_z), dtype=numpy.int64),
+            "stride_x": stride_x,
+            "stride_y": stride_y,
+            "order": order,
+            "sorted_keys": keys[order],
+        }
+
+    def _query_indices(self, indices) -> numpy.ndarray:
+        query_indices = numpy.asarray(indices, dtype=numpy.int64).reshape(-1)
+        if len(query_indices) and (numpy.any(query_indices < 0) or numpy.any(query_indices >= len(self.coords64))):
+            raise IndexError("vertex query index out of range")
+        return query_indices
+
+    @staticmethod
+    def _sorted_candidate_arrays(queries, targets, distances):
+        if len(queries):
+            order = numpy.lexsort((targets, distances, queries))
+            queries = queries[order]
+            targets = targets[order]
+            distances = distances[order]
+        return queries, targets, distances
+
+    def _probe(self, query_indices: numpy.ndarray, query_points: numpy.ndarray, target_mask: numpy.ndarray):
+        if len(query_indices) == 0:
+            return self._empty_candidate_arrays()
+        index = self._index
+        if index is None:
+            return None
+        if not index:
+            return self._empty_candidate_arrays()
+
+        query_bins = numpy.floor(query_points * index["inverse"]).astype(numpy.int64)
+        offsets = self._offsets
+        shifted_xy = (query_bins[:, None, :2] + offsets[None, :, :]).reshape(-1, 2) - index["mins"][:2]
+        shifted_z = numpy.repeat(query_bins[:, 2] - index["mins"][2], len(offsets))
+        span_z = int(index["spans"][2])
+        valid = numpy.flatnonzero(
+            (shifted_xy >= 0).all(axis=1)
+            & (shifted_xy < index["spans"][:2]).all(axis=1)
+            & (shifted_z >= -1)
+            & (shifted_z <= span_z)
+        )
+        if len(valid) == 0:
+            return self._empty_candidate_arrays()
+
+        low = numpy.clip(shifted_z[valid] - 1, 0, span_z - 1)
+        high = numpy.clip(shifted_z[valid] + 1, 0, span_z - 1)
+        row = shifted_xy[valid][:, 0] * index["stride_x"] + shifted_xy[valid][:, 1] * index["stride_y"]
+        left = numpy.searchsorted(index["sorted_keys"], row + low, side="left")
+        right = numpy.searchsorted(index["sorted_keys"], row + high, side="right")
+        counts = right - left
+        total = int(counts.sum())
+        if total == 0:
+            return self._empty_candidate_arrays()
+
+        windows = numpy.repeat(numpy.arange(len(counts), dtype=numpy.int64), counts)
+        starts = numpy.repeat(numpy.cumsum(counts) - counts, counts)
+        within = numpy.arange(total, dtype=numpy.int64) - starts
+        targets = index["order"][left[windows] + within]
+        local_queries = valid[windows] // len(offsets)
+        queries = query_indices[local_queries]
+        distances = numpy.max(numpy.abs(self.coords64[targets] - query_points[local_queries]), axis=1)
+        keep = (distances <= self.tolerance) & target_mask[targets]
+        return self._sorted_candidate_arrays(queries[keep], targets[keep], distances[keep])
+
+    def candidates_on_plane(self, query_indices):
+        """Return C0(q) for the on-plane members of *query_indices*."""
+
+        queries = self._query_indices(query_indices)
+        queries = queries[self._on_plane[queries]]
+        return self._probe(queries, self.coords64[queries], self._on_plane)
+
+    def candidates_off_plane(self, query_indices):
+        """Return Coff(q) for the off-plane members of *query_indices*."""
+
+        queries = self._query_indices(query_indices)
+        queries = queries[~self._on_plane[queries]]
+        points = self.coords64[queries].copy()
+        points[:, self.axis_index] = -points[:, self.axis_index]
+        return self._probe(queries, points, ~self._on_plane)
+
+    # Both claimant methods rely on Chebyshev mirror symmetry
+    # d∞(ρ(q), t) == d∞(ρ(t), q): the reverse relation is the forward
+    # relation with columns swapped, so no separate reverse index exists.
+    def claimants_on_plane(self, target_indices):
+        """Return on-plane queries whose C0 set contains each requested target."""
+
+        arrays = self.candidates_on_plane(target_indices)
+        if arrays is None:
+            return None
+        targets, queries, distances = arrays
+        return self._sorted_candidate_arrays(queries, targets, distances)
+
+    def claimants_off_plane(self, target_indices):
+        """Return off-plane queries whose Coff set contains each requested target."""
+
+        arrays = self.candidates_off_plane(target_indices)
+        if arrays is None:
+            return None
+        targets, queries, distances = arrays
+        return self._sorted_candidate_arrays(queries, targets, distances)
+
+
 _INJECTIVE_STEP_LIMIT = 2_000
 
 
@@ -632,6 +797,152 @@ def _injective_tie_margin(cost: float, best_cost: float | None) -> float:
 
     reference = max(abs(cost), abs(best_cost) if best_cost is not None else 0.0, 1.0e-12)
     return reference * 1.0e-9
+
+
+def _one_sided_candidate_arrays(coords64: numpy.ndarray, axis_index: int, tolerance: float):
+    """Build sorted mirror candidate arrays with one off-plane probe."""
+
+    count = len(coords64)
+    if count == 0 or not numpy.isfinite(coords64).all():
+        return None
+    axis = coords64[:, axis_index]
+    on_plane = numpy.abs(axis) <= tolerance
+    positive = ~on_plane & (axis > tolerance)
+    negative = ~on_plane & (axis < -tolerance)
+    inverse = 1.0 / max(tolerance, 1.0e-12)
+    scaled = coords64 * inverse
+    if numpy.any(numpy.abs(scaled) >= 2**62):
+        return None
+    bins = numpy.floor(scaled).astype(numpy.int64)
+    mins = bins.min(axis=0)
+    spans = bins.max(axis=0) - mins + 1
+    if int(spans[0]) * int(spans[1]) * int(spans[2]) >= 2**63:
+        return None
+    stride_y = int(spans[2])
+    stride_x = int(spans[1]) * stride_y
+    shifted = bins - mins
+    keys = shifted[:, 0] * stride_x + shifted[:, 1] * stride_y + shifted[:, 2]
+    order = numpy.argsort(keys, kind="stable")
+    sorted_keys = keys[order]
+    offsets = numpy.asarray([(x, y) for x in (-1, 0, 1) for y in (-1, 0, 1)], dtype=numpy.int64)
+    span_z = int(spans[2])
+    span_xy = numpy.asarray((int(spans[0]), int(spans[1])), dtype=numpy.int64)
+
+    def probe(query_indices, query_points, side_mask):
+        if len(query_indices) == 0:
+            empty_i = numpy.empty(0, dtype=numpy.int64)
+            return empty_i, empty_i.copy(), numpy.empty(0, dtype=numpy.float64)
+        query_bins = numpy.floor(query_points * inverse).astype(numpy.int64)
+        shifted_xy = (query_bins[:, None, :2] + offsets[None, :, :]).reshape(-1, 2) - mins[:2]
+        shifted_z = numpy.repeat(query_bins[:, 2] - mins[2], len(offsets))
+        valid = numpy.flatnonzero(
+            (shifted_xy >= 0).all(axis=1)
+            & (shifted_xy < span_xy).all(axis=1)
+            & (shifted_z >= -1)
+            & (shifted_z <= span_z)
+        )
+        if len(valid) == 0:
+            empty_i = numpy.empty(0, dtype=numpy.int64)
+            return empty_i, empty_i.copy(), numpy.empty(0, dtype=numpy.float64)
+        low = numpy.clip(shifted_z[valid] - 1, 0, span_z - 1)
+        high = numpy.clip(shifted_z[valid] + 1, 0, span_z - 1)
+        row = shifted_xy[valid][:, 0] * stride_x + shifted_xy[valid][:, 1] * stride_y
+        left = numpy.searchsorted(sorted_keys, row + low, side="left")
+        right = numpy.searchsorted(sorted_keys, row + high, side="right")
+        counts = right - left
+        total = int(counts.sum())
+        if total == 0:
+            empty_i = numpy.empty(0, dtype=numpy.int64)
+            return empty_i, empty_i.copy(), numpy.empty(0, dtype=numpy.float64)
+        windows = numpy.repeat(numpy.arange(len(counts), dtype=numpy.int64), counts)
+        starts = numpy.repeat(numpy.cumsum(counts) - counts, counts)
+        within = numpy.arange(total, dtype=numpy.int64) - starts
+        targets = order[left[windows] + within]
+        local_queries = valid[windows] // len(offsets)
+        queries = query_indices[local_queries]
+        distances = numpy.max(numpy.abs(coords64[targets] - query_points[local_queries]), axis=1)
+        keep = (distances <= tolerance) & side_mask[targets]
+        return queries[keep], targets[keep], distances[keep]
+
+    positive_indices = numpy.flatnonzero(positive)
+    mirrored_positive = coords64[positive].copy()
+    mirrored_positive[:, axis_index] = -mirrored_positive[:, axis_index]
+    positive_queries, positive_targets, positive_distances = probe(positive_indices, mirrored_positive, negative)
+    plane_indices = numpy.flatnonzero(on_plane)
+    plane_queries, plane_targets, plane_distances = probe(plane_indices, coords64[on_plane], on_plane)
+    queries = numpy.concatenate((positive_queries, positive_targets, plane_queries))
+    targets = numpy.concatenate((positive_targets, positive_queries, plane_targets))
+    distances = numpy.concatenate((positive_distances, positive_distances, plane_distances))
+    if len(queries):
+        order_all = numpy.lexsort((targets, distances, queries))
+        queries = queries[order_all]
+        targets = targets[order_all]
+        distances = distances[order_all]
+    return queries, targets, distances
+
+
+def _one_sided_pair_table(coords64: numpy.ndarray, axis_index: int, tolerance: float):
+    """Build mirror candidates with one off-plane probe and its transpose."""
+
+    arrays = _one_sided_candidate_arrays(coords64, axis_index, tolerance)
+    if arrays is None:
+        return None
+    count = len(coords64)
+    queries, targets, distances = arrays
+    query_counts = numpy.bincount(queries, minlength=count)
+    target_counts = numpy.bincount(targets, minlength=count)
+    starts = numpy.cumsum(query_counts) - query_counts
+    assigned = numpy.full(count, -1, dtype=numpy.int64)
+    singles = numpy.flatnonzero(query_counts == 1)
+    if len(singles):
+        single_targets = targets[starts[singles]]
+        unique = target_counts[single_targets] == 1
+        assigned[singles[unique]] = single_targets[unique]
+    remainder_mask = query_counts > 0
+    remainder_mask[assigned >= 0] = False
+    candidate_lists: dict[int, list[tuple[float, int]]] = {}
+    for query in numpy.flatnonzero(remainder_mask).tolist():
+        begin = int(starts[query])
+        end = begin + int(query_counts[query])
+        candidate_lists[query] = [
+            (float(distance), int(target))
+            for distance, target in zip(distances[begin:end], targets[begin:end], strict=True)
+        ]
+    if candidate_lists:
+        queries_by_target: dict[int, list[int]] = defaultdict(list)
+        for query, candidates in candidate_lists.items():
+            for _distance, target in candidates:
+                queries_by_target[target].append(query)
+        visited: set[int] = set()
+        for start_query in candidate_lists:
+            if start_query in visited or not candidate_lists[start_query]:
+                visited.add(start_query)
+                continue
+            component = []
+            component_targets: set[int] = set()
+            pending = [start_query]
+            visited.add(start_query)
+            while pending:
+                query = pending.pop()
+                component.append(query)
+                for _distance, target in candidate_lists[query]:
+                    if target in component_targets:
+                        continue
+                    component_targets.add(target)
+                    for other in queries_by_target[target]:
+                        if other not in visited:
+                            visited.add(other)
+                            pending.append(other)
+            assignment = _solve_injective_component(component, candidate_lists)
+            if assignment is not None:
+                for query, target in assignment.items():
+                    assigned[query] = target
+    pairs = {
+        source: int(target)
+        for source, target in enumerate(assigned.tolist())
+        if target >= 0 and int(assigned[target]) == source
+    }
+    return pairs
 
 
 def build_vertex_mirror_lookup(
