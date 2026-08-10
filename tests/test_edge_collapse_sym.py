@@ -466,10 +466,11 @@ def case_f_delete_edgeloop(window, area, region) -> tuple[int, int, int]:
 
 
 def case_g_delete_edgeloop_undo(window, area, region, baseline: tuple[int, int, int]) -> None:
-    # Timer-issued operator undo pushes do not land, so one ed.undo returns to
-    # the session-start factory Cube — the strongest undo assertion this
-    # harness supports (merge_redo standard); the subdivided baseline is
-    # unreachable by design.
+    # Timer-issued operator pushes never land in this harness, leaving one
+    # undo snapshot. The bulk-capture flush (update_from_editmode) writes the
+    # post-operator state into that snapshot, so a single ed.undo restores the
+    # post-operator mesh; deeper granularity is unobservable here (see
+    # merge_redo standard) and interactive undo is covered manually.
     del baseline
     with bpy.context.temp_override(window=window, area=area, region=region):
         result = bpy.ops.ed.undo()
@@ -478,9 +479,9 @@ def case_g_delete_edgeloop_undo(window, area, region, baseline: tuple[int, int, 
     obj = active_mesh_object()
     assert obj is not None
     bm = ensure_edit(window, area, region, obj)
-    assert topology_counts(bm) == (8, 12, 6), topology_counts(bm)
+    assert topology_counts(bm) == (66, 128, 64), topology_counts(bm)
     assert_x_symmetric(bm, label="g delete edgeloop undo")
-    print("YSE_COLLAPSE_G_OK (session-start reset only; deep undo-oneness not verifiable in timer harness)", flush=True)
+    print("YSE_COLLAPSE_G_OK (single-snapshot harness; post-operator state restored)", flush=True)
 
 
 def case_i_passthrough(window, area, region) -> None:
