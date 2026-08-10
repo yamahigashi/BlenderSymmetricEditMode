@@ -154,11 +154,6 @@ def _remember_history_session(session: KnifeSession, context) -> None:
 
     _HISTORY_SEQUENCE += 1
     history_session = copy.copy(session)
-    # Undo/Redo snapshots retain compact face CustomData mappings. Keeping the
-    # equivalent Python dictionaries for every undo step is prohibitively
-    # expensive on dense meshes, so they are reconstructed only when needed.
-    history_session.mirror_face_ids = {}
-    history_session.hidden_by_face_id = {}
     # Native Offset temporarily suspends Mesh Symmetry only while its Edge
     # Slide is live.  A later Undo/Redo repair must never rewrite user settings.
     history_session.symmetry_suspended = False
@@ -441,14 +436,15 @@ def _prepare_session(
         settings.tolerance,
         history_token,
         mark_vertex_ids=tool_kind == "RIP",
+        mesh_object=obj,
     )
-    if topology.matched_faces == 0:
-        core.remove_temporary_layers(bm)
-        bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
-        return False
 
     rip_snapshot = None
     if tool_kind == "RIP":
+        # The bulk capture no longer refreshes BMesh indices, but the rip
+        # snapshot keys its region and one-ring by vertex.index.
+        bm.verts.ensure_lookup_table()
+        bm.verts.index_update()
         rip_snapshot = rip.build_snapshot(
             bm,
             axis_index,
@@ -470,9 +466,9 @@ def _prepare_session(
         axis_index=axis_index,
         source_side=settings.source_side,
         tolerance=settings.tolerance,
-        mirror_face_ids=topology.mirror_face_ids,
+        mirror_face_ids={},
         hidden_by_face_id=topology.hidden_by_face_id,
-        carrier_frames=topology.carrier_frames,
+        carrier_frames={},
         mesh_select_mode=MeshSelectionMode(
             vertices=bool(context.tool_settings.mesh_select_mode[0]),
             edges=bool(context.tool_settings.mesh_select_mode[1]),
@@ -487,17 +483,13 @@ def _prepare_session(
             z=bool(obj.use_mesh_mirror_z),
         ),
         rip=rip_snapshot,
+        topology_resolution=topology.topology_resolution,
     )
     _SESSIONS[window_pointer] = session
     _suspend_mesh_symmetry(session, obj)
     _remember_history_session(session, context)
     _schedule_passthrough_watcher(window_pointer, history_token)
 
-    if topology.matched_faces < topology.total_faces:
-        report(
-            {"WARNING"},
-            f"Only {topology.matched_faces} of {topology.total_faces} faces have an exact mirrored counterpart",
-        )
     return True
 
 
@@ -704,6 +696,46 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
             cleanup_session(window_pointer)
             self.report({"ERROR"}, f"The edited mesh changed during {tool_label}")
             return {"CANCELLED"}
+
+        if session.topology_resolution is not None:
+            try:
+                resolution = session.topology_resolution.resolve()
+                session.mirror_face_ids = resolution.mirror_face_ids
+                session.carrier_frames = resolution.carrier_frames
+                session.hidden_by_face_id = {
+                    FaceId(face_id): bool(hidden)
+                    for face_id, hidden in zip(
+                        range(1, resolution.total_faces + 1),
+                        resolution.hide_faces.tolist(),
+                        strict=True,
+                    )
+                }
+                bm = bmesh.from_edit_mesh(obj.data)
+                resolution.materialize(bm)
+            except Exception as exc:
+                traceback.print_exc()
+                record = _HISTORY_RECORDS.get(session.history_token)
+                if record is not None:
+                    record.status = "FAILED"
+                cleanup_session(window_pointer, keep_history_record=True)
+                _finish_report(self, {"ERROR"}, f"ydd Symmetric Edit resolution failed: {exc}")
+                return {"FINISHED"}
+            if resolution.matched_faces == 0:
+                core.remove_temporary_layers(bm)
+                bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+                _finish_report(
+                    self,
+                    {"WARNING"},
+                    f"Only 0 of {resolution.total_faces} faces have an exact mirrored counterpart",
+                )
+                cleanup_session(window_pointer, keep_history_record=True)
+                return {"FINISHED"}
+            if resolution.matched_faces < resolution.total_faces:
+                _finish_report(
+                    self,
+                    {"WARNING"},
+                    f"Only {resolution.matched_faces} of {resolution.total_faces} faces have an exact mirrored counterpart",
+                )
 
         if session.tool_kind == "RIP":
             return _finish_rip_session(self, session, obj, window_pointer)
@@ -1599,22 +1631,63 @@ def _restore_session_face_maps(session: KnifeSession, obj) -> bool:
         face_id_layer = bm.faces.layers.int.get(core.FACE_ID_LAYER)
         mirror_id_layer = bm.faces.layers.int.get(core.FACE_MIRROR_ID_LAYER)
         hidden_layer = bm.faces.layers.int.get(core.FACE_HIDDEN_LAYER)
-        if face_id_layer is None or mirror_id_layer is None or hidden_layer is None:
+        history_layer = bm.faces.layers.int.get(core.HISTORY_TOKEN_LAYER)
+        if face_id_layer is None:
             return False
 
         mirror_face_ids: MirrorFaceMap = {}
         hidden_by_face_id: HiddenFaceMap = {}
+        face_ids_valid = True
+        mirror_values_complete = mirror_id_layer is not None
+        mirror_values_consistent = True
         for face in bm.faces:
             face_id = FaceId(int(face[face_id_layer]))
             if face_id <= 0:
+                face_ids_valid = False
                 continue
-            raw_mirror_id = int(face[mirror_id_layer])
+            raw_mirror_id = int(face[mirror_id_layer]) if mirror_id_layer is not None else 0
             if raw_mirror_id > 0:
-                mirror_face_ids.setdefault(face_id, FaceId(raw_mirror_id))
-            hidden_by_face_id.setdefault(face_id, bool(face[hidden_layer]))
-        session.mirror_face_ids = mirror_face_ids
+                mirror_id = FaceId(raw_mirror_id)
+                previous = mirror_face_ids.setdefault(face_id, mirror_id)
+                if previous != mirror_id:
+                    mirror_values_consistent = False
+            else:
+                mirror_values_complete = False
+            hidden_by_face_id.setdefault(face_id, bool(face[hidden_layer]) if hidden_layer is not None else False)
+        face_id_domain = set(hidden_by_face_id)
+        layer_complete = (
+            face_ids_valid
+            and mirror_values_complete
+            and mirror_values_consistent
+            and bool(face_id_domain)
+            and set(mirror_face_ids) == face_id_domain
+            and set(mirror_face_ids.values()).issubset(face_id_domain)
+            and len(mirror_face_ids) == len(set(mirror_face_ids.values()))
+        )
+        resolution = session.topology_resolution
+        if resolution is not None:
+            tokens = (
+                {int(face[history_layer]) for face in bm.faces if int(face[face_id_layer]) > 0}
+                if history_layer is not None
+                else set()
+            )
+            token_matches = resolution.history_token == session.history_token and session.history_token in tokens
+            handle_domain_matches = face_ids_valid and face_id_domain == set(range(1, resolution.face_count + 1))
+            if token_matches and handle_domain_matches:
+                expected = resolution.resolve().mirror_face_ids
+                session.mirror_face_ids = expected
+                session.carrier_frames = resolution.carrier_frames
+                resolution.materialize(bm)
+            elif layer_complete:
+                session.mirror_face_ids = mirror_face_ids
+            else:
+                return False
+        elif layer_complete:
+            session.mirror_face_ids = mirror_face_ids
+        else:
+            return False
         session.hidden_by_face_id = hidden_by_face_id
-        return bool(mirror_face_ids)
+        return bool(session.mirror_face_ids)
     except (ReferenceError, RuntimeError):
         return False
 
@@ -1699,21 +1772,28 @@ def _repair_history_state():
         _cleanup_object_temporary_layers(obj)
         return None
 
-    session = copy.deepcopy(record.session)
-    session.object_name = obj.name
-    session.mesh_name = obj.data.name
-    profile = TOOL_PROFILES.get(session.tool_kind)
-    if profile is not None and profile.supports_nested_offset:
-        current_symmetry = SymmetryAxes(
-            x=bool(obj.use_mesh_mirror_x),
-            y=bool(obj.use_mesh_mirror_y),
-            z=bool(obj.use_mesh_mirror_z),
-        )
-        # A raw Offset undo snapshot can contain the deliberately suspended
-        # flags. Treat that state like the tail of the original modal operation
-        # so finish restores the exact native setting captured by the session.
-        session.symmetry_suspended = current_symmetry != session.symmetry_flags
-    if not _restore_session_face_maps(session, obj):
+    try:
+        session = copy.deepcopy(record.session)
+        session.object_name = obj.name
+        session.mesh_name = obj.data.name
+        profile = TOOL_PROFILES.get(session.tool_kind)
+        if profile is not None and profile.supports_nested_offset:
+            current_symmetry = SymmetryAxes(
+                x=bool(obj.use_mesh_mirror_x),
+                y=bool(obj.use_mesh_mirror_y),
+                z=bool(obj.use_mesh_mirror_z),
+            )
+            # A raw Offset undo snapshot can contain the deliberately suspended
+            # flags. Treat that state like the tail of the original modal operation
+            # so finish restores the exact native setting captured by the session.
+            session.symmetry_suspended = current_symmetry != session.symmetry_flags
+        restored = _restore_session_face_maps(session, obj)
+    except Exception:
+        traceback.print_exc()
+        record.status = "FAILED"
+        _cleanup_object_temporary_layers(obj)
+        return None
+    if not restored:
         record.status = "FAILED"
         _cleanup_repair_session(session)
         return None

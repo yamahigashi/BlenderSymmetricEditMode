@@ -1043,6 +1043,34 @@ def _build_duplicate_faces():
     return bm
 
 
+def _build_loose_ngon_fixture():
+    bm = bmesh.new()
+    left = [
+        bm.verts.new(co)
+        for co in ((-3.0, -1.0, 0.0), (-2.0, -1.0, 0.0), (-1.5, 0.0, 0.0), (-2.0, 1.0, 0.0), (-3.0, 1.0, 0.0))
+    ]
+    right = [
+        bm.verts.new((-co[0], co[1], co[2]))
+        for co in ((-3.0, -1.0, 0.0), (-2.0, -1.0, 0.0), (-1.5, 0.0, 0.0), (-2.0, 1.0, 0.0), (-3.0, 1.0, 0.0))
+    ]
+    bm.faces.new(left)
+    bm.faces.new(list(reversed(right)))
+    bm.verts.new((0.25, 3.0, 0.0))
+    return bm
+
+
+def _build_fallback_bin_order_fixture():
+    bm = bmesh.new()
+    source_values = ((-2.0, 0.5, 0.0), (-3.0, 2.5, 0.0), (-2.0, 0.5, 1.0))
+    source = [bm.verts.new(value) for value in source_values]
+    earlier = [bm.verts.new((-value[0], value[1] + 0.6, value[2])) for value in source_values]
+    later = [bm.verts.new((-value[0], value[1] - 0.6, value[2])) for value in source_values]
+    bm.faces.new(source)
+    bm.faces.new(earlier)
+    bm.faces.new(later)
+    return bm
+
+
 def _check_topology_equivalence():
     bm = _build_deformed_grid(7)
     original_face_key = core._face_key
@@ -1090,6 +1118,9 @@ def _check_topology_equivalence():
         face_key_name = "_face_key"
         setattr(core, face_key_name, count_fallback_key)
         topology = core.prepare_topology(perturbed, 0, TOLERANCE)
+        # The geometric fallback runs at lazy resolve time, so force it
+        # while the counting patch is still installed.
+        _ = topology.mirror_face_ids
     finally:
         setattr(core, face_key_name, original_face_key)
     try:
@@ -1120,6 +1151,15 @@ def _check_topology_equivalence():
         assert topology.matched_faces < topology.total_faces
     finally:
         asymmetric.free()
+
+    fallback_order = _build_fallback_bin_order_fixture()
+    try:
+        expected = _reference_eager_face_map(fallback_order, 0, 1.0)
+        topology = core.prepare_topology(fallback_order, 0, 1.0)
+        assert expected[FaceId(1)] == FaceId(3)
+        assert topology.mirror_face_ids == expected
+    finally:
+        fallback_order.free()
 
 
 def _reference_carrier_frame(vertices):
@@ -1266,6 +1306,19 @@ def _check_history_and_single_object_guard():
     lazy_type_name = "LazyCarrierFrameMap"
     lazy_type = cast(Any, getattr(core, lazy_type_name))
     carrier_frames = lazy_type(vertex_coords, face_vertex_ids)
+    history_token = operators._new_history_token()
+    resolution = core.LazyTopologyResolution(
+        numpy.asarray(vertex_coords, dtype=numpy.float64),
+        numpy.asarray((0,), dtype=numpy.int64),
+        numpy.asarray((0,), dtype=numpy.int64),
+        numpy.asarray((1,), dtype=numpy.int64),
+        numpy.zeros(1, dtype=bool),
+        numpy.empty(0, dtype=bool),
+        numpy.zeros(1, dtype=bool),
+        0,
+        TOLERANCE,
+        history_token,
+    )
     session = KnifeSession(
         window_pointer=1,
         area_pointer=2,
@@ -1280,18 +1333,31 @@ def _check_history_and_single_object_guard():
         carrier_frames=carrier_frames,
         mesh_select_mode=MeshSelectionMode(True, False, False),
         started_at=1.0,
-        history_token=operators._new_history_token(),
+        history_token=history_token,
+        topology_resolution=resolution,
     )
     context = SimpleNamespace(preferences=SimpleNamespace(edit=SimpleNamespace(undo_steps=32)))
     try:
         operators._remember_history_session(session, context)
         record = operators._HISTORY_RECORDS[session.history_token]
         assert record.session.carrier_frames is carrier_frames
+        assert record.session.topology_resolution is resolution
+        assert resolution.resolve_count == 0
         deep_session = copy.deepcopy(record.session)
         assert deep_session.carrier_frames is not carrier_frames
         assert deep_session.carrier_frames == carrier_frames
+        assert deep_session.topology_resolution is not resolution
+        assert deep_session.topology_resolution == resolution
+        assert resolution.resolve_count == deep_session.topology_resolution.resolve_count == 0
         expected = carrier_frames.get(FaceId(1))
         assert deep_session.carrier_frames.get(FaceId(1)) == expected
+        eviction_context = SimpleNamespace(preferences=SimpleNamespace(edit=SimpleNamespace(undo_steps=0)))
+        for _ in range(8):
+            later = copy.copy(session)
+            later.history_token = operators._new_history_token()
+            operators._remember_history_session(later, eviction_context)
+        assert history_token not in operators._HISTORY_RECORDS
+        assert len(operators._HISTORY_RECORDS) == 8
     finally:
         operators.clear_history_records()
 
@@ -1355,10 +1421,12 @@ def _check_rip_lookup_validation():
     bmesh.ops.create_grid(bm, x_segments=2, y_segments=1, size=2.0)
     try:
         topology = core.prepare_topology(bm, 0, TOLERANCE, mark_vertex_ids=True)
+        assert topology.topology_resolution.resolve_count == 0
         bm.verts.ensure_lookup_table()
         bm.verts[0].select = True
         coords = tuple(vertex.co.copy() for vertex in bm.verts)
         valid = topology.vertex_lookup
+        assert topology.topology_resolution.resolve_count == 1
         variants = {
             "axis": core.build_vertex_mirror_lookup(coords, 1, TOLERANCE),
             "tolerance": core.build_vertex_mirror_lookup(coords, 0, TOLERANCE * 2.0),
@@ -1423,6 +1491,618 @@ def _check_rip_lookup_validation():
         bm.free()
 
 
+class _BulkCollection:
+    def __init__(self, values):
+        self._values = values
+
+    def __len__(self):
+        return len(self._values)
+
+    def foreach_get(self, name, target):
+        if name == "co":
+            target[:] = numpy.asarray(self._values, dtype=numpy.float32).reshape(-1)
+            return
+        target[:] = numpy.asarray(self._values, dtype=target.dtype)
+
+
+class _BulkVertexCollection(_BulkCollection):
+    def foreach_get(self, name, target):
+        if name == "hide":
+            target[:] = False
+            return
+        super().foreach_get(name, target)
+
+
+class _BulkMeshData:
+    def __init__(self, bm):
+        bm.verts.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        starts = []
+        totals = []
+        loops = []
+        offset = 0
+        for face in bm.faces:
+            values = tuple(vertex.index for vertex in face.verts)
+            loops.extend(values)
+            starts.append(offset)
+            totals.append(len(values))
+            offset += len(values)
+        self.shape_keys = None
+        self.vertices = _BulkVertexCollection([tuple(float(value) for value in vertex.co) for vertex in bm.verts])
+        self.edges = _BulkCollection([bool(edge.hide) for edge in bm.edges])
+        self.polygons = _BulkCollection([bool(face.hide) for face in bm.faces])
+        self.loops = _BulkCollection(loops)
+        self._starts = _BulkCollection(starts)
+        self._totals = _BulkCollection(totals)
+
+    def polygon_starts(self, name):
+        return self._starts if name == "loop_start" else self._totals
+
+
+class _BulkMeshObject:
+    def __init__(self, data):
+        self.data = data
+        self.update_calls = 0
+
+    def update_from_editmode(self):
+        self.update_calls += 1
+
+
+def _check_capture_resolve_contract():
+    """Bulk and compatibility snapshots agree before/after lazy resolution."""
+
+    original_foreach = _BulkCollection.foreach_get
+
+    def foreach_get(self, name, target):
+        if self is bulk_data.polygons:
+            if name == "loop_start":
+                return bulk_data._starts.foreach_get(name, target)
+            if name == "loop_total":
+                return bulk_data._totals.foreach_get(name, target)
+        return original_foreach(self, name, target)
+
+    fixtures = []
+    for builder in (_build_deformed_grid, _build_duplicate_faces, _build_loose_ngon_fixture):
+        source = builder(5) if builder is _build_deformed_grid else builder()
+        fixtures.append(source)
+    for source in fixtures:
+        compat = source
+        compat.verts.ensure_lookup_table()
+        compat.verts.index_update()
+        bulk = bmesh.new()
+        for vertex in compat.verts:
+            bulk.verts.new(tuple(vertex.co))
+        bulk.verts.ensure_lookup_table()
+        bulk.verts.index_update()
+        for face in compat.faces:
+            bulk.faces.new([bulk.verts[vertex.index] for vertex in face.verts])
+        bulk_data = _BulkMeshData(bulk)
+        mesh_object = _BulkMeshObject(bulk_data)
+        _BulkCollection.foreach_get = foreach_get
+        try:
+            compatibility = core.prepare_topology(compat, 0, TOLERANCE)
+            captured = core.prepare_topology(bulk, 0, TOLERANCE, mesh_object=mesh_object)
+            assert mesh_object.update_calls == 1
+            assert compatibility.total_faces == captured.total_faces
+            assert compatibility.mirror_face_ids == captured.mirror_face_ids
+            assert compatibility.hidden_by_face_id == captured.hidden_by_face_id
+            assert compatibility.topology_resolution.coords64.dtype == numpy.float64
+            assert captured.topology_resolution.loop_verts.dtype == numpy.int64
+            assert captured.topology_resolution.vertex_count == len(bulk.verts)
+            assert captured.topology_resolution.edge_count == len(bulk.edges)
+            assert captured.topology_resolution.face_count == len(bulk.faces)
+            coords_matrix = captured.topology_resolution.coords64
+            assert core._one_sided_pair_table(coords_matrix, 0, TOLERANCE) == core.build_vertex_pair_table(
+                tuple(Vector(tuple(row)) for row in coords_matrix.tolist()), 0, TOLERANCE
+            )
+            bulk_data.shape_keys = object()
+            shape_key_object = _BulkMeshObject(bulk_data)
+            shape_key_topology = core.prepare_topology(bulk, 0, TOLERANCE, mesh_object=shape_key_object)
+            assert shape_key_object.update_calls == 0
+            assert shape_key_topology.total_faces == captured.total_faces
+            bulk_data.shape_keys = None
+            shared_object = _BulkMeshObject(bulk_data)
+            shared = core.prepare_topology(bulk, 0, TOLERANCE, mesh_object=shared_object)
+            assert shared.mirror_face_ids == compatibility.mirror_face_ids
+        finally:
+            _BulkCollection.foreach_get = original_foreach
+            bulk.free()
+            compat.free()
+
+    empty = bmesh.new()
+    try:
+        data = _BulkMeshData(empty)
+        compatibility = core.prepare_topology(empty, 0, TOLERANCE)
+        captured = core.prepare_topology(empty, 0, TOLERANCE, mesh_object=_BulkMeshObject(data))
+        assert compatibility.topology_resolution.coords64.shape == (0, 3)
+        assert captured.topology_resolution.coords64.shape == (0, 3)
+        assert compatibility.mirror_face_ids == captured.mirror_face_ids == {}
+    finally:
+        empty.free()
+
+
+def _assert_bulk_snapshot_matches_edit_bmesh(obj, bm):
+    for index, vertex in enumerate(bm.verts):
+        vertex.hide = index % 3 == 1
+    for index, edge in enumerate(bm.edges):
+        edge.hide = index % 3 == 2
+    for index, face in enumerate(bm.faces):
+        face.hide = index % 2 == 1
+    bulk = core._capture_mesh_snapshot(obj, bm)
+    compatibility = core._capture_bmesh_snapshot(bm)
+    assert bulk is not None
+    assert len(bulk) == len(compatibility)
+    for actual, expected in zip(bulk, compatibility, strict=True):
+        assert numpy.array_equal(actual, expected)
+
+
+def _check_bulk_edit_mesh_order_variants():
+    builders = (_build_duplicate_faces, _build_loose_ngon_fixture, lambda: _build_deformed_grid(3))
+    for fixture_index, builder in enumerate(builders):
+        source = builder()
+        mesh = bpy.data.meshes.new(f"YSEPerfBulkOrderMesh{fixture_index}")
+        source.to_mesh(mesh)
+        source.free()
+        obj = bpy.data.objects.new(f"YSEPerfBulkOrderObject{fixture_index}", mesh)
+        shared = None
+        try:
+            if bpy.context.object is not None and bpy.context.object.mode != "OBJECT":
+                bpy.ops.object.mode_set(mode="OBJECT")
+            bpy.ops.object.select_all(action="DESELECT")
+            bpy.context.scene.collection.objects.link(obj)
+            if fixture_index == len(builders) - 1:
+                shared = bpy.data.objects.new("YSEPerfBulkOrderShared", mesh)
+                bpy.context.scene.collection.objects.link(shared)
+                assert mesh.users >= 2
+            obj.select_set(True)
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.mode_set(mode="EDIT")
+            edit_bm = bmesh.from_edit_mesh(mesh)
+            _assert_bulk_snapshot_matches_edit_bmesh(obj, edit_bm)
+            if fixture_index == len(builders) - 1:
+                bmesh.ops.create_cube(edit_bm, size=0.25)
+                _assert_bulk_snapshot_matches_edit_bmesh(obj, edit_bm)
+                bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=True)
+                edit_bm = bmesh.from_edit_mesh(mesh)
+                _assert_bulk_snapshot_matches_edit_bmesh(obj, edit_bm)
+        finally:
+            if obj.mode != "OBJECT":
+                bpy.ops.object.mode_set(mode="OBJECT")
+            if shared is not None:
+                bpy.data.objects.remove(shared, do_unlink=True)
+            bpy.data.objects.remove(obj, do_unlink=True)
+            if mesh.name in bpy.data.meshes:
+                bpy.data.meshes.remove(mesh)
+
+
+def _check_finish_zero_match_decline():
+    source = bmesh.new()
+    vertices = [source.verts.new(value) for value in ((1.0, 0.0, 0.0), (2.0, 0.0, 0.0), (1.0, 1.0, 0.0))]
+    source.faces.new(vertices)
+    mesh = bpy.data.meshes.new("YSEPerfZeroMatchMesh")
+    source.to_mesh(mesh)
+    source.free()
+    obj = bpy.data.objects.new("YSEPerfZeroMatchObject", mesh)
+    window_pointer = operators._window_key(bpy.context)
+    try:
+        if bpy.context.object is not None and bpy.context.object.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.object.select_all(action="DESELECT")
+        bpy.context.scene.collection.objects.link(obj)
+        obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
+        bpy.ops.object.mode_set(mode="EDIT")
+        bm = bmesh.from_edit_mesh(mesh)
+        token = operators._new_history_token()
+        topology = core.prepare_topology(bm, 0, TOLERANCE, token, mesh_object=obj)
+        bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+        bm.edges.ensure_lookup_table()
+        bmesh.ops.subdivide_edges(bm, edges=(bm.edges[0],), cuts=1, use_grid_fill=False)
+        native_vertex_count = len(bm.verts)
+        assert native_vertex_count > 3
+        bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=True)
+        session = KnifeSession(
+            window_pointer=window_pointer,
+            area_pointer=0,
+            region_pointer=0,
+            object_name=obj.name,
+            mesh_name=mesh.name,
+            axis_index=0,
+            source_side="NEGATIVE",
+            tolerance=TOLERANCE,
+            mirror_face_ids={},
+            hidden_by_face_id=topology.hidden_by_face_id,
+            carrier_frames={},
+            mesh_select_mode=MeshSelectionMode(True, False, False),
+            started_at=1.0,
+            history_token=token,
+            topology_resolution=topology.topology_resolution,
+        )
+        operators._SESSIONS[window_pointer] = session
+        reports = []
+        fake_operator = SimpleNamespace(report=lambda level, message: reports.append((level, message)))
+        result = operators.MESH_OT_ydd_symmetric_edit_finish.execute(fake_operator, bpy.context)
+        assert result == {"FINISHED"}
+        assert reports == [
+            (
+                {"WARNING"},
+                "Only 0 of 1 faces have an exact mirrored counterpart",
+            )
+        ]
+        restored = bmesh.from_edit_mesh(mesh)
+        assert len(restored.verts) == native_vertex_count
+        assert restored.faces.layers.int.get(core.FACE_ID_LAYER) is None
+    finally:
+        operators._SESSIONS.pop(window_pointer, None)
+        if obj.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.data.objects.remove(obj, do_unlink=True)
+        if mesh.name in bpy.data.meshes:
+            bpy.data.meshes.remove(mesh)
+
+
+def _check_hide_layer_omission_and_consumers():
+    bm = _build_deformed_grid(3)
+    try:
+        topology = core.prepare_topology(bm, 0, TOLERANCE)
+        assert bm.verts.layers.int.get(core.VERT_HIDDEN_LAYER) is None
+        assert bm.edges.layers.int.get(core.EDGE_HIDDEN_LAYER) is None
+        assert bm.faces.layers.int.get(core.FACE_HIDDEN_LAYER) is None
+        assert not core.path_ring_includes_pre_hidden_edges(bm)
+        snapshot = core.SelectionSnapshot(False, False, False, [])
+        core.restore_visibility_and_selection(bm, topology.hidden_by_face_id, snapshot)
+    finally:
+        bm.free()
+
+
+def _check_bulk_guard_fallbacks():
+    original_foreach = _BulkCollection.foreach_get
+    for kind in ("counts", "coordinates", "faces"):
+        bm = _build_deformed_grid(2)
+        try:
+            data = _BulkMeshData(bm)
+
+            def foreach_get(self, name, target):
+                if self is data.polygons:
+                    if name == "loop_start":
+                        return data._starts.foreach_get(name, target)
+                    if name == "loop_total":
+                        return data._totals.foreach_get(name, target)
+                return original_foreach(self, name, target)
+
+            _BulkCollection.foreach_get = foreach_get
+            expected = core.prepare_topology(bm, 0, TOLERANCE)
+            expected_map = expected.mirror_face_ids
+            if kind == "counts":
+                data.vertices._values.append((9.0, 9.0, 9.0))
+            elif kind == "coordinates":
+                first = list(data.vertices._values[0])
+                first[0] += 0.5
+                data.vertices._values[0] = tuple(first)
+            else:
+                data._starts._values[0] = 1
+            obj = _BulkMeshObject(data)
+            topology = core.prepare_topology(bm, 0, TOLERANCE, mesh_object=obj)
+            assert obj.update_calls == 1
+            assert topology.total_faces == len(bm.faces)
+            assert topology.topology_resolution.vertex_count == len(bm.verts)
+            assert topology.mirror_face_ids == expected_map
+            expected_resolution = expected.topology_resolution
+            actual_resolution = topology.topology_resolution
+            assert numpy.array_equal(actual_resolution.coords64, expected_resolution.coords64)
+            assert numpy.array_equal(actual_resolution.loop_verts, expected_resolution.loop_verts)
+            assert numpy.array_equal(actual_resolution.loop_starts, expected_resolution.loop_starts)
+            assert numpy.array_equal(actual_resolution.loop_totals, expected_resolution.loop_totals)
+        finally:
+            _BulkCollection.foreach_get = original_foreach
+            bm.free()
+
+
+def _check_nonfinite_one_sided_fallback():
+    coords = numpy.asarray(((numpy.nan, 0.0, 0.0), (1.0, 0.0, 0.0)), dtype=numpy.float64)
+    assert core._one_sided_pair_table(coords, 0, TOLERANCE) is None
+    empty = numpy.empty(0, dtype=numpy.int64)
+    handle = core.LazyTopologyResolution(
+        coords,
+        empty,
+        empty,
+        empty,
+        numpy.zeros(2, dtype=bool),
+        empty,
+        empty,
+        0,
+        TOLERANCE,
+        1,
+    )
+
+    def outcome(call):
+        try:
+            return "ok", call()
+        except Exception as exc:
+            return "error", type(exc)
+
+    expected = outcome(
+        lambda: core.build_vertex_pair_table(tuple(Vector(tuple(row)) for row in coords.tolist()), 0, TOLERANCE)
+    )
+    actual = outcome(handle.resolve)
+    assert actual[0] == expected[0]
+    if actual[0] == "ok":
+        assert actual[1].pairs == expected[1]
+
+
+def _expected_mirror_candidate_arrays(coords, axis_index: int):
+    lookup = core.build_vertex_mirror_lookup(coords, axis_index, TOLERANCE)
+    matrix = numpy.asarray([_vector_tuple(coordinate) for coordinate in coords], dtype=numpy.float64)
+    on_plane = numpy.abs(matrix[:, axis_index]) <= TOLERANCE
+    parts = []
+    plane_indices = numpy.flatnonzero(on_plane)
+    if len(plane_indices):
+        arrays = lookup._batch_candidate_arrays(matrix[on_plane], True)
+        assert arrays is not None
+        queries, targets, distances = arrays
+        parts.append((plane_indices[queries], targets, distances))
+    off_indices = numpy.flatnonzero(~on_plane)
+    if len(off_indices):
+        mirrored = matrix[~on_plane].copy()
+        mirrored[:, axis_index] = -mirrored[:, axis_index]
+        arrays = lookup._batch_candidate_arrays(mirrored, False)
+        assert arrays is not None
+        queries, targets, distances = arrays
+        parts.append((off_indices[queries], targets, distances))
+    if not parts:
+        empty_i = numpy.empty(0, dtype=numpy.int64)
+        return empty_i, empty_i.copy(), numpy.empty(0, dtype=numpy.float64)
+    queries = numpy.concatenate([part[0] for part in parts])
+    targets = numpy.concatenate([part[1] for part in parts])
+    distances = numpy.concatenate([part[2] for part in parts])
+    order = numpy.lexsort((targets, distances, queries))
+    return queries[order], targets[order], distances[order]
+
+
+def _check_one_sided_candidate_arrays_contract():
+    for axis_index in (core.AXIS_INDEX["X"], core.AXIS_INDEX["Y"], core.AXIS_INDEX["Z"]):
+        for seed in SEEDS:
+            coords = _make_lookup_case(axis_index, seed)
+            expected = _expected_mirror_candidate_arrays(coords, axis_index)
+            actual = core._one_sided_candidate_arrays(
+                numpy.asarray([_vector_tuple(coordinate) for coordinate in coords], dtype=numpy.float64),
+                axis_index,
+                TOLERANCE,
+            )
+            assert actual is not None
+            assert actual[0].tolist() == expected[0].tolist()
+            assert actual[1].tolist() == expected[1].tolist()
+            assert actual[2].tolist() == expected[2].tolist()
+
+
+def _check_lazy_restore_state_matrix():
+    bm = _build_deformed_grid(3)
+    try:
+        topology = core.prepare_topology(bm, 0, TOLERANCE, 19)
+        session = KnifeSession(
+            window_pointer=1,
+            area_pointer=2,
+            region_pointer=3,
+            object_name="object",
+            mesh_name="mesh",
+            axis_index=0,
+            source_side="NEGATIVE",
+            tolerance=TOLERANCE,
+            mirror_face_ids={},
+            hidden_by_face_id=topology.hidden_by_face_id,
+            carrier_frames={},
+            mesh_select_mode=MeshSelectionMode(True, False, False),
+            started_at=1.0,
+            history_token=19,
+            topology_resolution=topology.topology_resolution,
+        )
+        obj = SimpleNamespace(mode="EDIT", data=SimpleNamespace())
+        original_from_edit = operators.bmesh.from_edit_mesh
+        setattr(operators.bmesh, "from_edit_mesh", lambda _data: bm)
+        try:
+            unresolved_materialize = core.LazyTopologyResolution(
+                topology.topology_resolution.coords64,
+                topology.topology_resolution.loop_verts,
+                topology.topology_resolution.loop_starts,
+                topology.topology_resolution.loop_totals,
+                topology.topology_resolution.hide_vertices,
+                topology.topology_resolution.hide_edges,
+                topology.topology_resolution.hide_faces,
+                0,
+                TOLERANCE,
+                19,
+            )
+            try:
+                unresolved_materialize.materialize(bm)
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("materialize must reject unresolved handles")
+            assert operators._restore_session_face_maps(session, obj)
+            assert topology.topology_resolution.resolve_count == 1
+            assert session.carrier_frames is topology.topology_resolution.carrier_frames
+            assert session.mirror_face_ids == topology.mirror_face_ids
+            assert copy.deepcopy(topology.topology_resolution) == topology.topology_resolution
+            assert not any(
+                isinstance(value, core.VertexMirrorLookup) for value in topology.topology_resolution.__dict__.values()
+            )
+            assert not any(name in {"bm", "mesh_object", "callback"} for name in topology.topology_resolution.__dict__)
+            mirror_layer = bm.faces.layers.int.get(core.FACE_MIRROR_ID_LAYER)
+            face_id_layer = bm.faces.layers.int.get(core.FACE_ID_LAYER)
+            token_layer = bm.faces.layers.int.get(core.HISTORY_TOKEN_LAYER)
+            assert mirror_layer is not None and face_id_layer is not None and token_layer is not None
+            first_face = next(iter(bm.faces))
+            for face in bm.faces:
+                face[mirror_layer] = int(face[face_id_layer])
+            assert operators._restore_session_face_maps(session, obj)
+            assert topology.topology_resolution.resolve_count == 1
+            assert int(first_face[mirror_layer]) == int(
+                topology.mirror_face_ids[FaceId(int(first_face[face_id_layer]))]
+            )
+            first_face[mirror_layer] = 0
+            last_face = list(bm.faces)[-1]
+            if last_face is not first_face:
+                last_face[token_layer] = 77
+            assert operators._restore_session_face_maps(session, obj)
+            assert topology.topology_resolution.resolve_count == 1
+            assert int(first_face[mirror_layer]) == int(
+                topology.mirror_face_ids[FaceId(int(first_face[face_id_layer]))]
+            )
+            no_handle = copy.copy(session)
+            no_handle.topology_resolution = None
+            for face in bm.faces:
+                face[mirror_layer] = 0
+            assert not operators._restore_session_face_maps(no_handle, obj)
+            first_face[mirror_layer] = int(topology.mirror_face_ids.get(FaceId(1), FaceId(1)))
+            assert not operators._restore_session_face_maps(no_handle, obj)
+            for face in bm.faces:
+                face[mirror_layer] = int(topology.mirror_face_ids.get(FaceId(int(face[face_id_layer])), FaceId(0)))
+            assert operators._restore_session_face_maps(no_handle, obj)
+
+            for face in bm.faces:
+                face[token_layer] = 77
+                face[mirror_layer] = 0
+            foreign_handle = copy.copy(session)
+            foreign_handle.topology_resolution = core.LazyTopologyResolution(
+                topology.topology_resolution.coords64,
+                topology.topology_resolution.loop_verts,
+                topology.topology_resolution.loop_starts,
+                topology.topology_resolution.loop_totals,
+                topology.topology_resolution.hide_vertices,
+                topology.topology_resolution.hide_edges,
+                topology.topology_resolution.hide_faces,
+                0,
+                TOLERANCE,
+                19,
+            )
+            assert not operators._restore_session_face_maps(foreign_handle, obj)
+            assert foreign_handle.topology_resolution.resolve_count == 0
+
+            for face in bm.faces:
+                face[token_layer] = 19
+                face[mirror_layer] = 0
+            original_face_id = int(first_face[face_id_layer])
+            first_face[face_id_layer] = 999
+            invalid_domain = copy.copy(session)
+            invalid_domain.topology_resolution = core.LazyTopologyResolution(
+                topology.topology_resolution.coords64,
+                topology.topology_resolution.loop_verts,
+                topology.topology_resolution.loop_starts,
+                topology.topology_resolution.loop_totals,
+                topology.topology_resolution.hide_vertices,
+                topology.topology_resolution.hide_edges,
+                topology.topology_resolution.hide_faces,
+                0,
+                TOLERANCE,
+                19,
+            )
+            assert not operators._restore_session_face_maps(invalid_domain, obj)
+            assert invalid_domain.topology_resolution.resolve_count == 0
+            first_face[face_id_layer] = original_face_id
+            first_face[face_id_layer] = 0
+            assert not operators._restore_session_face_maps(invalid_domain, obj)
+            assert invalid_domain.topology_resolution.resolve_count == 0
+            first_face[face_id_layer] = original_face_id
+            for face in bm.faces:
+                face_id = FaceId(int(face[face_id_layer]))
+                face[mirror_layer] = int(topology.mirror_face_ids[face_id])
+            extra_vertices = [
+                bm.verts.new(coordinate) for coordinate in ((10.0, 0.0, 0.0), (11.0, 0.0, 0.0), (10.0, 1.0, 0.0))
+            ]
+            conflicting_face = bm.faces.new(extra_vertices)
+            expected_mirror = int(topology.mirror_face_ids[FaceId(original_face_id)])
+            conflicting_face[face_id_layer] = original_face_id
+            conflicting_face[mirror_layer] = original_face_id if expected_mirror != original_face_id else 2
+            conflicting_face[token_layer] = 19
+            conflict = copy.copy(session)
+            conflict.topology_resolution = None
+            assert not operators._restore_session_face_maps(conflict, obj)
+            bm.faces.layers.int.remove(face_id_layer)
+            assert not operators._restore_session_face_maps(session, obj)
+        finally:
+            setattr(operators.bmesh, "from_edit_mesh", original_from_edit)
+
+        unresolved = core.LazyTopologyResolution(
+            topology.topology_resolution.coords64,
+            topology.topology_resolution.loop_verts,
+            topology.topology_resolution.loop_starts,
+            topology.topology_resolution.loop_totals,
+            topology.topology_resolution.hide_vertices,
+            topology.topology_resolution.hide_edges,
+            topology.topology_resolution.hide_faces,
+            0,
+            TOLERANCE,
+            19,
+        )
+        cloned = copy.deepcopy(unresolved)
+        assert not unresolved._resolved and not cloned._resolved
+        assert unresolved.resolve_count == cloned.resolve_count == 0
+        assert unresolved == cloned
+    finally:
+        bm.free()
+
+
+def _check_prepare_session_invoke_does_not_resolve():
+    bm = _build_deformed_grid(2)
+    try:
+        prepared = core.prepare_topology(bm, 0, TOLERANCE, 23)
+        obj = SimpleNamespace(
+            name="object",
+            type="MESH",
+            data=SimpleNamespace(name="mesh"),
+            use_mesh_mirror_x=True,
+            use_mesh_mirror_y=False,
+            use_mesh_mirror_z=False,
+        )
+        context = SimpleNamespace(
+            scene=SimpleNamespace(ydd_symmetric_edit=SimpleNamespace(source_side="NEGATIVE", tolerance=TOLERANCE)),
+            edit_object=obj,
+            window=SimpleNamespace(as_pointer=lambda: 11),
+            area=SimpleNamespace(as_pointer=lambda: 12),
+            region=SimpleNamespace(as_pointer=lambda: 13),
+            tool_settings=SimpleNamespace(mesh_select_mode=(True, False, False)),
+            preferences=SimpleNamespace(edit=SimpleNamespace(undo_steps=8)),
+        )
+        original_prepare = core.prepare_topology
+        original_from_edit = operators.bmesh.from_edit_mesh
+        original_remove = core.remove_temporary_layers
+        original_update = operators.bmesh.update_edit_mesh
+        original_cleanup = operators.cleanup_session
+        original_suspend = operators._suspend_mesh_symmetry
+        original_schedule = operators._schedule_passthrough_watcher
+        calls = []
+
+        def spy_prepare(*args, **kwargs):
+            calls.append(kwargs.get("mesh_object"))
+            return prepared
+
+        setattr(core, "prepare_topology", spy_prepare)
+        setattr(operators.bmesh, "from_edit_mesh", lambda _data: bm)
+        setattr(core, "remove_temporary_layers", lambda _bm: None)
+        setattr(operators.bmesh, "update_edit_mesh", lambda *_args, **_kwargs: None)
+        setattr(operators, "cleanup_session", lambda *_args, **_kwargs: None)
+        setattr(operators, "_suspend_mesh_symmetry", lambda *_args, **_kwargs: None)
+        setattr(operators, "_schedule_passthrough_watcher", lambda *_args, **_kwargs: None)
+        try:
+            assert operators._prepare_session(context, lambda *_args: None)
+            assert calls == [obj]
+            session = operators._SESSIONS[11]
+            assert session.topology_resolution is prepared.topology_resolution
+            assert session.topology_resolution.resolve_count == 0
+        finally:
+            operators._SESSIONS.pop(11, None)
+            operators.clear_history_records()
+            setattr(core, "prepare_topology", original_prepare)
+            setattr(operators.bmesh, "from_edit_mesh", original_from_edit)
+            setattr(core, "remove_temporary_layers", original_remove)
+            setattr(operators.bmesh, "update_edit_mesh", original_update)
+            setattr(operators, "cleanup_session", original_cleanup)
+            setattr(operators, "_suspend_mesh_symmetry", original_suspend)
+            setattr(operators, "_schedule_passthrough_watcher", original_schedule)
+    finally:
+        bm.free()
+
+
 def run():
     _check_vertex_lookup_equivalence()
     _check_batch_candidate_contract_edges()
@@ -1434,6 +2114,17 @@ def run():
     _check_history_and_single_object_guard()
     _check_multi_object_native_passthrough()
     _check_rip_lookup_validation()
+    _check_capture_resolve_contract()
+    _check_bulk_edit_mesh_order_variants()
+    _check_finish_zero_match_decline()
+    _check_hide_layer_omission_and_consumers()
+    _check_bulk_guard_fallbacks()
+    _check_nonfinite_one_sided_fallback()
+    _check_one_sided_candidate_arrays_contract()
+    _check_lazy_restore_state_matrix()
+    _check_prepare_session_invoke_does_not_resolve()
+    # Duplicate COMMITTED records and F9 ABSENT are exercised by the existing
+    # GUI-only history and discriminator suites.
     print("YSE_PERF_EQUIV_OK", flush=True)
 
 

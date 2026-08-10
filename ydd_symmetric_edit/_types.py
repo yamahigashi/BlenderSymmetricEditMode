@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from bpy.stub_internal.rna_enums import OperatorReturnItems
     from mathutils import Quaternion, Vector
 
-    from .core import VertexMirrorLookup
+    from .core import LazyTopologyResolution, VertexMirrorLookup
 
 
 FaceId = NewType("FaceId", int)
@@ -192,16 +192,29 @@ class FaceMatchRecord:
     centroid: Coordinate3D
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class TopologyPreparation:
     """Topology metadata captured before the native cutting operator runs."""
 
-    mirror_face_ids: MirrorFaceMap
+    topology_resolution: LazyTopologyResolution
     hidden_by_face_id: HiddenFaceMap
-    carrier_frames: CarrierFrameMap
-    vertex_lookup: VertexMirrorLookup
-    matched_faces: int
     total_faces: int
+
+    @property
+    def mirror_face_ids(self) -> MirrorFaceMap:
+        return self.topology_resolution.mirror_face_ids
+
+    @property
+    def carrier_frames(self) -> CarrierFrameMap:
+        return self.topology_resolution.carrier_frames
+
+    @property
+    def vertex_lookup(self) -> VertexMirrorLookup:
+        return self.topology_resolution.vertex_lookup
+
+    @property
+    def matched_faces(self) -> int:
+        return self.topology_resolution.matched_faces
 
 
 class PointerLike(Protocol):
@@ -297,6 +310,7 @@ class KnifeSession:
     offset_use_cap_endpoint: bool = False
     native_operator_pointer: int = 0
     rip: RipSnapshot | None = None
+    topology_resolution: LazyTopologyResolution | None = None
 
 
 @dataclass
