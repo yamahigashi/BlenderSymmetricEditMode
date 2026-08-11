@@ -1472,6 +1472,25 @@ def unit_nontransitive_tol_clustering() -> None:
     print("YSE_KNIFE_BOTH_SIDES_UNIT_TOL=OK", flush=True)
 
 
+def unit_knife_path_edge_cache() -> None:
+    """Cached edge metadata reclassifies safely and rejects stale topology."""
+
+    print("YSE_KNIFE_BOTH_SIDES_UNIT=knife_path_edge_cache", flush=True)
+    bm = bmesh.new()
+    positive = bm.edges.new((bm.verts.new((1.0, 0.0, 0.0)), bm.verts.new((2.0, 0.0, 0.0))))
+    negative = bm.edges.new((bm.verts.new((-2.0, 0.0, 0.0)), bm.verts.new((-1.0, 0.0, 0.0))))
+    cache = core.capture_knife_path_edge_cache(bm, (positive, negative))
+    assert cache is not None
+    by_side, total = core.reclassify_knife_path_edge_cache(bm, core.AXIS_INDEX["X"], 1.0e-5, cache) or ({}, 0)
+    assert total == 2, total
+    assert len(by_side["POSITIVE"]) == 1 and len(by_side["NEGATIVE"]) == 1, by_side
+
+    positive.verts[0].co.x = 1.25
+    assert core.reclassify_knife_path_edge_cache(bm, core.AXIS_INDEX["X"], 1.0e-5, cache) is None
+    bm.free()
+    print("YSE_KNIFE_BOTH_SIDES_UNIT_CACHE=OK", flush=True)
+
+
 def run_test() -> None:
     addon.register()
     window, area, region = viewport_context()
@@ -1482,6 +1501,7 @@ def run_test() -> None:
     unit_host_edge_selection()
     unit_three_crosses_pointmerge_survivor()
     unit_nontransitive_tol_clustering()
+    unit_knife_path_edge_cache()
 
     case_a_straddle(window, area, region)
     case_b_crosses(window, area, region)

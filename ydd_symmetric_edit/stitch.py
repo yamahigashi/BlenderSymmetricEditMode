@@ -228,6 +228,68 @@ def classify_path_edges_by_side(
     return by_side
 
 
+_KnifePathEdgeCacheEntry = tuple[
+    int,
+    tuple[float, float, float],
+    tuple[float, float, float],
+]
+_KnifePathEdgeCache = tuple[_KnifePathEdgeCacheEntry, ...]
+
+
+def capture_knife_path_edge_cache(
+    bm: bmesh.types.BMesh,
+    path_edges: Iterable[bmesh.types.BMEdge],
+) -> _KnifePathEdgeCache | None:
+    """Capture metadata for reclassifying an unchanged Knife path.
+
+    No ``BMEdge`` proxy is retained: the edit BMesh may be rebuilt between
+    calls.  Reuse verifies both the edge index and endpoint coordinates.
+    """
+
+    bm.edges.ensure_lookup_table()
+    bm.edges.index_update()
+    entries: list[_KnifePathEdgeCacheEntry] = []
+    for edge in path_edges:
+        index = int(edge.index)
+        if index < 0:
+            return None
+        first = _coordinate_tuple(edge.verts[0].co)
+        second = _coordinate_tuple(edge.verts[1].co)
+        if second < first:
+            first, second = second, first
+        entries.append((index, first, second))
+    return tuple(entries)
+
+
+def reclassify_knife_path_edge_cache(
+    bm: bmesh.types.BMesh,
+    axis_index: int,
+    tolerance: float,
+    cache: _KnifePathEdgeCache | None,
+) -> tuple[dict[str, list[bmesh.types.BMEdge]], int] | None:
+    """Reclassify cached path edges, or return ``None`` when unverifiable."""
+
+    if cache is None:
+        return None
+    bm.edges.ensure_lookup_table()
+    path_edges: list[bmesh.types.BMEdge] = []
+    for index, expected_first, expected_second in cache:
+        if index >= len(bm.edges):
+            return None
+        edge = bm.edges[index]
+        if not edge.is_valid:
+            return None
+        first = _coordinate_tuple(edge.verts[0].co)
+        second = _coordinate_tuple(edge.verts[1].co)
+        if second < first:
+            first, second = second, first
+        if first != expected_first or second != expected_second:
+            return None
+        path_edges.append(edge)
+    by_side = classify_path_edges_by_side(path_edges, axis_index, tolerance)
+    return by_side, len(path_edges)
+
+
 def collect_knife_path_edges_by_side(
     bm: bmesh.types.BMesh,
     axis_index: int,

@@ -380,6 +380,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                 raise SymmetricKnifeError("Temporary topology markers are missing")
 
             materialized_face_scope: set[FaceId] = set()
+            knife_path_edge_cache = None
 
             def _resolve_scope_overlay_and_materialize(edit_bm, path_edges):
                 current_face_layer = edit_bm.faces.layers.int.get(core.FACE_ID_LAYER)
@@ -427,16 +428,6 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                 # Both-sides mirror. CROSSES are p-stitched first, then
                 # half-edges join the POSITIVE/NEGATIVE mirror path inside
                 # one backup transaction.
-                by_side, total_path_edges = core.collect_knife_path_edges_by_side(
-                    bm,
-                    session.axis_index,
-                    session.tolerance,
-                )
-                if total_path_edges == 0:
-                    result = {"FINISHED"}
-                    self.report({"INFO"}, f"{tool_label} made no new cut")
-                    return result
-
                 def _all_path_edges(sides: dict) -> list:
                     return (
                         list(sides.get("POSITIVE", ()))
@@ -445,15 +436,39 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                         + list(sides.get("PLANE", ()))
                     )
 
+                def _collect_knife_path_edges(edit_bm, *, topology_changed: bool = False):
+                    nonlocal knife_path_edge_cache
+                    if not topology_changed:
+                        cached = core.reclassify_knife_path_edge_cache(
+                            edit_bm,
+                            session.axis_index,
+                            session.tolerance,
+                            knife_path_edge_cache,
+                        )
+                        if cached is not None:
+                            return cached
+                    result = core.collect_knife_path_edges_by_side(
+                        edit_bm,
+                        session.axis_index,
+                        session.tolerance,
+                    )
+                    knife_path_edge_cache = core.capture_knife_path_edge_cache(
+                        edit_bm,
+                        _all_path_edges(result[0]),
+                    )
+                    return result
+
+                by_side, total_path_edges = _collect_knife_path_edges(bm, topology_changed=True)
+                if total_path_edges == 0:
+                    result = {"FINISHED"}
+                    self.report({"INFO"}, f"{tool_label} made no new cut")
+                    return result
+
                 crossing_count = len(by_side["CROSSES"])
                 side = "BOTH"
                 live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, _all_path_edges(by_side))
                 _edge_layer, face_layer = core.get_required_layers(bm)
-                by_side, total_path_edges = core.collect_knife_path_edges_by_side(
-                    bm,
-                    session.axis_index,
-                    session.tolerance,
-                )
+                by_side, total_path_edges = _collect_knife_path_edges(bm)
                 live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, _all_path_edges(by_side))
 
                 if crossing_count:
@@ -461,11 +476,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     selection_state = core.add_selection_layers(bm)
                     backup_mesh = _create_backup(bm)
                     bm = bmesh.from_edit_mesh(obj.data)
-                    by_side, total_path_edges = core.collect_knife_path_edges_by_side(
-                        bm,
-                        session.axis_index,
-                        session.tolerance,
-                    )
+                    by_side, total_path_edges = _collect_knife_path_edges(bm)
                     live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, _all_path_edges(by_side))
                     stitched, stitch_reason = core.apply_crosses_p_stitch(
                         bm,
@@ -476,11 +487,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     if stitch_reason:
                         raise SymmetricKnifeError(stitch_reason)
                     # Half-edges reclassify as POSITIVE/NEGATIVE after the split.
-                    by_side, total_path_edges = core.collect_knife_path_edges_by_side(
-                        bm,
-                        session.axis_index,
-                        session.tolerance,
-                    )
+                    by_side, total_path_edges = _collect_knife_path_edges(bm, topology_changed=True)
                     live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, _all_path_edges(by_side))
                     crossing_count = len(by_side["CROSSES"])
                     # Remaining CROSSES are self-mirrored (skipped by stitch) or
@@ -493,11 +500,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
 
                         bm = bmesh.from_edit_mesh(obj.data)
                         _edge_layer, face_layer = core.get_required_layers(bm)
-                        by_side, total_path_edges = core.collect_knife_path_edges_by_side(
-                            bm,
-                            session.axis_index,
-                            session.tolerance,
-                        )
+                        by_side, total_path_edges = _collect_knife_path_edges(bm, topology_changed=True)
                         live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, _all_path_edges(by_side))
 
                 crossing_plan, crossing_reason = core.plan_mirrored_path_crossings(
@@ -516,11 +519,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                         backup_mesh = _create_backup(bm)
                         bm = bmesh.from_edit_mesh(obj.data)
                         _edge_layer, face_layer = core.get_required_layers(bm)
-                        by_side, total_path_edges = core.collect_knife_path_edges_by_side(
-                            bm,
-                            session.axis_index,
-                            session.tolerance,
-                        )
+                        by_side, total_path_edges = _collect_knife_path_edges(bm)
                         live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, _all_path_edges(by_side))
                         crossing_plan, crossing_reason = core.plan_mirrored_path_crossings(
                             bm,
@@ -541,11 +540,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     )
                     if crossing_reason:
                         raise SymmetricKnifeError(crossing_reason)
-                    by_side, total_path_edges = core.collect_knife_path_edges_by_side(
-                        bm,
-                        session.axis_index,
-                        session.tolerance,
-                    )
+                    by_side, total_path_edges = _collect_knife_path_edges(bm, topology_changed=True)
                     live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, _all_path_edges(by_side))
                     _edge_layer, face_layer = core.get_required_layers(bm)
 
@@ -584,11 +579,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                         selection_state = core.add_selection_layers(bm)
                         backup_mesh = _create_backup(bm)
                         bm = bmesh.from_edit_mesh(obj.data)
-                        by_side, total_path_edges = core.collect_knife_path_edges_by_side(
-                            bm,
-                            session.axis_index,
-                            session.tolerance,
-                        )
+                        by_side, total_path_edges = _collect_knife_path_edges(bm)
                         live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, _all_path_edges(by_side))
                         source_edges = by_side["POSITIVE"] + by_side["NEGATIVE"]
                     if not source_edges:
