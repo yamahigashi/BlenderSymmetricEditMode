@@ -3511,8 +3511,19 @@ def _check_face_registry_preserves_global_rows_and_lazy_geometry():
     direct_candidates = direct_registry.exact_geometry_candidates(
         tuple(FaceId(index) for index in range(1, len(faces) + 1))
     )
+    direct_batch = direct_registry.exact_geometry_batch(tuple(FaceId(index) for index in range(1, len(faces) + 1)))
     assert direct_candidates is not None
+    assert direct_batch is not None
     assert all(direct_candidates.values())
+    expected_batch_targets = []
+    for face_id in range(1, len(faces) + 1):
+        candidates = direct_candidates[FaceId(face_id)]
+        selected = candidates[0]
+        if selected == FaceId(face_id) and abs(direct_registry.face_centroid(FaceId(face_id)).component(0)) > TOLERANCE:
+            selected = next((candidate for candidate in candidates if candidate != FaceId(face_id)), selected)
+        expected_batch_targets.append(int(selected))
+    assert direct_batch.hits.all()
+    assert direct_batch.targets.tolist() == expected_batch_targets
     assert direct_registry._coordinates is None
     assert direct_registry._face_key_buckets is None
     core._snapshot_face_map(
@@ -3673,6 +3684,47 @@ def _check_face_geometry_snapshot_oracle_edges():
         )
         assert self_map == {FaceId(1): FaceId(1)}
         assert self_registry._coordinates is None
+
+    centroid_order_x = numpy.asarray(
+        (
+            -0.32065773,
+            74546.0078125,
+            0.32065773,
+            17491.48828125,
+            -17491.48828125,
+            -74546.0078125,
+            2.5967834,
+            -2.5967834,
+        ),
+        dtype=numpy.float64,
+    )
+    centroid_order_coords = numpy.column_stack(
+        (centroid_order_x, numpy.zeros(len(centroid_order_x)), numpy.zeros(len(centroid_order_x)))
+    )
+    centroid_order_loops = numpy.tile(numpy.arange(len(centroid_order_x), dtype=numpy.int64), 2)
+    centroid_order_starts = numpy.asarray((0, len(centroid_order_x)), dtype=numpy.int64)
+    centroid_order_totals = numpy.asarray((len(centroid_order_x), len(centroid_order_x)), dtype=numpy.int64)
+    centroid_order_registry = core.FaceRegistry(
+        centroid_order_coords,
+        centroid_order_loops,
+        centroid_order_starts,
+        centroid_order_totals,
+        0,
+        TOLERANCE,
+    )
+    centroid_order_batch = centroid_order_registry.exact_geometry_batch((FaceId(1), FaceId(2)))
+    assert centroid_order_batch is not None
+    assert centroid_order_batch.targets.tolist() == [2, 1]
+    assert core._snapshot_face_map(
+        centroid_order_coords,
+        centroid_order_loops,
+        centroid_order_starts,
+        centroid_order_totals,
+        0,
+        TOLERANCE,
+        vertex_pairs={},
+        face_registry=centroid_order_registry,
+    ) == {FaceId(1): FaceId(2), FaceId(2): FaceId(1)}
 
     empty = numpy.empty((0, 3), dtype=numpy.float64)
     empty_faces = numpy.empty(0, dtype=numpy.int64)

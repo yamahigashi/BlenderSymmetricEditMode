@@ -68,6 +68,13 @@ class _GeometryRowGroup:
         self.members = members
 
 
+class _ExactGeometryBatch:
+    def __init__(self, face_ids: numpy.ndarray, hits: numpy.ndarray, targets: numpy.ndarray) -> None:
+        self.face_ids = face_ids
+        self.hits = hits
+        self.targets = targets
+
+
 class FaceRegistry:
     """Resolution-free face topology and geometry indices."""
 
@@ -433,6 +440,58 @@ class FaceRegistry:
             for coordinate in values
         )
 
+    def exact_geometry_batch(self, face_ids: Sequence[FaceId]):
+        """Resolve exact mirrored rows into array targets and hit masks."""
+
+        self._ensure_geometry_index()
+        groups = self._geometry_groups
+        float32_coordinates = self._float32_coordinates
+        if groups is None or float32_coordinates is None:
+            return None
+        requested = numpy.asarray([int(face_id) for face_id in face_ids], dtype=numpy.int64)
+        hits = numpy.zeros(len(requested), dtype=bool)
+        targets = numpy.full(len(requested), -1, dtype=numpy.int64)
+        inverse_tolerance = 1.0 / max(self.tolerance, 1.0e-12)
+        requested_totals = self.loop_totals[requested - 1]
+        for raw_total in numpy.unique(requested_totals):
+            total = int(raw_total)
+            requested_positions = numpy.flatnonzero(requested_totals == total)
+            requested_ids = requested[requested_positions]
+            group = groups[total]
+            if total == 0:
+                targets[requested_positions] = group.members[0]
+                hits[requested_positions] = True
+                continue
+            indices = requested_ids - 1
+            starts = self.loop_starts[indices]
+            positions = starts[:, None] + numpy.arange(total, dtype=numpy.int64)
+            coordinates = float32_coordinates[self.loop_verts[positions]].copy()
+            coordinates[:, :, self.axis_index] *= -1.0
+            rows = numpy.floor(coordinates.astype(numpy.float64) * inverse_tolerance).astype(numpy.int64)
+            row_order = numpy.lexsort((rows[:, :, 2], rows[:, :, 1], rows[:, :, 0]), axis=1)
+            rows = numpy.take_along_axis(rows, row_order[:, :, None], axis=1)
+            assert group.unique_keys is not None
+            row_dtype = group.unique_keys.dtype
+            keys = numpy.ascontiguousarray(rows).reshape(len(requested_ids), total * 3).view(row_dtype).reshape(-1)
+            destinations = numpy.searchsorted(group.unique_keys, keys)
+            found = destinations < len(group.unique_keys)
+            found[found] = group.unique_keys[destinations[found]] == keys[found]
+            valid_positions = numpy.flatnonzero(found)
+            if not len(valid_positions):
+                continue
+            bucket_starts = group.member_starts[destinations[valid_positions]]
+            bucket_counts = group.member_starts[destinations[valid_positions] + 1] - bucket_starts
+            selected = group.members[bucket_starts].copy()
+            self_candidates = numpy.flatnonzero((selected == requested_ids[valid_positions]) & (bucket_counts > 1))
+            for candidate_position in self_candidates.tolist():
+                face_id = FaceId(int(requested_ids[valid_positions[candidate_position]]))
+                if abs(self.face_centroid(face_id).component(self.axis_index)) > self.tolerance:
+                    selected[candidate_position] = group.members[bucket_starts[candidate_position] + 1]
+            output_positions = requested_positions[valid_positions]
+            targets[output_positions] = selected
+            hits[output_positions] = True
+        return _ExactGeometryBatch(requested, hits, targets)
+
     def exact_geometry_candidates(self, face_ids: Sequence[FaceId]):
         """Return exact mirrored quantized-row buckets without Python keys.
 
@@ -577,9 +636,12 @@ def _snapshot_face_map(
             axis_index,
             tolerance,
         )
-    exact_candidates = geometry_registry.exact_geometry_candidates(fallback)
+    exact_batch = geometry_registry.exact_geometry_batch(fallback)
 
-    if exact_candidates is not None:
+    if exact_batch is not None:
+        exact_hit_sources = exact_batch.face_ids[exact_batch.hits]
+        exact_hit_targets = exact_batch.targets[exact_batch.hits]
+        geometry_fallback = [FaceId(int(face_id)) for face_id in exact_batch.face_ids[~exact_batch.hits].tolist()]
         faces_by_count_centroid = None
         face_coords = geometry_registry.face_coordinates
         centroid_for = geometry_registry.face_centroid
@@ -590,6 +652,9 @@ def _snapshot_face_map(
                 faces_by_count_centroid = geometry_registry.centroid_buckets
 
     elif face_registry is None:
+        exact_hit_sources = numpy.empty(0, dtype=numpy.int64)
+        exact_hit_targets = numpy.empty(0, dtype=numpy.int64)
+        geometry_fallback = fallback
         coordinates = tuple(tuple(float(value) for value in row) for row in coords64.tolist())
         face_vertex_ids = {
             FaceId(face_index + 1): tuple(
@@ -665,6 +730,9 @@ def _snapshot_face_map(
             fallback_index_ready = True
 
     else:
+        exact_hit_sources = numpy.empty(0, dtype=numpy.int64)
+        exact_hit_targets = numpy.empty(0, dtype=numpy.int64)
+        geometry_fallback = fallback
         key_to_face_ids = face_registry.face_key_buckets
         # Exact mirrored keys resolve without the global centroid index. Build
         # that index only when a key miss enters geometric fallback.
@@ -679,12 +747,12 @@ def _snapshot_face_map(
                 faces_by_count_centroid = face_registry.centroid_buckets
 
     fallback_assignments: dict[FaceId, FaceId] = {}
-    for face_id in fallback:
-        if exact_candidates is not None:
-            candidates = exact_candidates.get(face_id, ())
-        else:
+    for face_id in geometry_fallback:
+        if exact_batch is None:
             mirrored_key = mirrored_face_key_for(face_id)
             candidates = key_to_face_ids.get(mirrored_key)
+        else:
+            candidates = ()
         if not candidates:
             values = face_coords(face_id)
             ensure_fallback_index()
@@ -726,12 +794,19 @@ def _snapshot_face_map(
                 candidate = next((item for item in candidates if item != face_id), candidate)
             fallback_assignments[face_id] = candidate
 
-    primary_targets = set(mirror_face_ids.values())
-    fallback_target_counts: dict[FaceId, int] = defaultdict(int)
+    primary_targets = numpy.zeros(face_count + 1, dtype=bool)
+    if mirror_face_ids:
+        primary_targets[numpy.fromiter((int(target) for target in mirror_face_ids.values()), dtype=numpy.int64)] = True
+    fallback_target_counts = numpy.zeros(face_count + 1, dtype=numpy.int64)
+    if len(exact_hit_targets):
+        numpy.add.at(fallback_target_counts, exact_hit_targets, 1)
     for counterpart in fallback_assignments.values():
-        fallback_target_counts[counterpart] += 1
+        fallback_target_counts[int(counterpart)] += 1
+    for source, counterpart in zip(exact_hit_sources.tolist(), exact_hit_targets.tolist(), strict=True):
+        if not primary_targets[counterpart] and fallback_target_counts[counterpart] == 1:
+            mirror_face_ids[FaceId(int(source))] = FaceId(int(counterpart))
     for face_id, counterpart in fallback_assignments.items():
-        if counterpart in primary_targets or fallback_target_counts[counterpart] > 1:
+        if primary_targets[int(counterpart)] or fallback_target_counts[int(counterpart)] > 1:
             continue
         mirror_face_ids[face_id] = counterpart
 
