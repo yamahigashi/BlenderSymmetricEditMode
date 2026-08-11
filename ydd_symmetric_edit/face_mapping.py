@@ -282,12 +282,64 @@ class FaceRegistry:
             return
         coordinates = tuple((float(row[0]), float(row[1]), float(row[2])) for row in self.coords64.tolist())
         key_buckets: dict[FaceKey, list[FaceId]] = defaultdict(list)
-        for face_index in range(1, self.face_count + 1):
-            face_id = FaceId(face_index)
-            vertex_ids = self.vertices(face_id)
-            values = tuple(coordinates[vertex_id] for vertex_id in vertex_ids)
-            snapshot_face = cast(bmesh.types.BMFace, _SnapshotFace(values))
-            key_buckets[_face_key(snapshot_face, self.axis_index, self.tolerance, mirrored=False)].append(face_id)
+
+        inverse_tolerance = 1.0 / max(self.tolerance, 1.0e-12)
+        scaled_coordinates = self.coords64 * inverse_tolerance
+        int64_info = numpy.iinfo(numpy.int64)
+        use_array_keys = bool(
+            numpy.isfinite(scaled_coordinates).all()
+            and numpy.all(scaled_coordinates >= int64_info.min)
+            and numpy.all(scaled_coordinates <= int64_info.max)
+        )
+        if use_array_keys:
+            quantized_coordinates = numpy.floor(scaled_coordinates).astype(numpy.int64)
+            for raw_total in numpy.unique(self.loop_totals):
+                total = int(raw_total)
+                face_indices = numpy.flatnonzero(self.loop_totals == total)
+                if total == 0:
+                    key_buckets[FaceKey(vertex_count=0, coordinates=())].extend(
+                        FaceId(int(face_index) + 1) for face_index in face_indices.tolist()
+                    )
+                    continue
+
+                positions = self.loop_starts[face_indices, None] + numpy.arange(total, dtype=numpy.int64)
+                rows = quantized_coordinates[self.loop_verts[positions]]
+                row_order = numpy.lexsort((rows[:, :, 2], rows[:, :, 1], rows[:, :, 0]), axis=1)
+                rows = numpy.take_along_axis(rows, row_order[:, :, None], axis=1)
+                row_dtype = numpy.dtype((numpy.void, rows.dtype.itemsize * total * 3))
+                flat_rows = numpy.ascontiguousarray(rows).reshape(len(rows), total * 3)
+                row_keys = flat_rows.view(row_dtype).reshape(-1)
+                unique_keys, _first_rows, inverse, counts = numpy.unique(
+                    row_keys,
+                    return_index=True,
+                    return_inverse=True,
+                    return_counts=True,
+                )
+                member_order = numpy.argsort(inverse, kind="stable")
+                member_starts = numpy.concatenate(
+                    (numpy.asarray((0,), dtype=numpy.int64), numpy.cumsum(counts, dtype=numpy.int64))
+                )
+                unique_rows = unique_keys.view(numpy.int64).reshape(-1, total, 3)
+                for unique_index, row in enumerate(unique_rows):
+                    key = FaceKey(
+                        vertex_count=total,
+                        coordinates=tuple(
+                            QuantizedCoordinate(int(vertex[0]), int(vertex[1]), int(vertex[2]))
+                            for vertex in row.tolist()
+                        ),
+                    )
+                    start = int(member_starts[unique_index])
+                    end = int(member_starts[unique_index + 1])
+                    key_buckets[key].extend(
+                        FaceId(int(face_index) + 1) for face_index in face_indices[member_order[start:end]].tolist()
+                    )
+        else:
+            for face_index in range(1, self.face_count + 1):
+                face_id = FaceId(face_index)
+                vertex_ids = self.vertices(face_id)
+                values = tuple(coordinates[vertex_id] for vertex_id in vertex_ids)
+                snapshot_face = cast(bmesh.types.BMFace, _SnapshotFace(values))
+                key_buckets[_face_key(snapshot_face, self.axis_index, self.tolerance, mirrored=False)].append(face_id)
         self._coordinates = coordinates
         self._face_key_buckets = {key: tuple(face_ids) for key, face_ids in key_buckets.items()}
 
