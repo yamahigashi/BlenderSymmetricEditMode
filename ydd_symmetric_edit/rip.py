@@ -94,8 +94,11 @@ def build_snapshot(
 ) -> RipSnapshot | None:
     """Capture the selection and its one-ring before the native Rip runs.
 
-    Requires ``prepare_topology(..., mark_vertex_ids=True)`` to have assigned
-    the unique vertex IDs and face IDs already.
+    Requires ``prepare_topology(..., mark_vertex_ids=True)`` to have created
+    the vertex ID layer and assigned the face IDs. Vertex IDs are assigned
+    here after the selected region and its mirror targets are resolved. This
+    is single-use per fresh prepare; rerun prepare before reusing it with a
+    different selection.
     """
 
     # Snapshot records index into bm.verts; the table must be valid on every
@@ -121,6 +124,7 @@ def build_snapshot(
         if not region_vertices:
             return None
 
+    _mark_snapshot_vertex_ids(bm, vertex_id_layer, region_vertices, mirror_indices)
     return _build_snapshot_records(
         bm,
         axis_index,
@@ -130,6 +134,20 @@ def build_snapshot(
         region_vertices,
         mirror_indices,
     )
+
+
+def _mark_snapshot_vertex_ids(
+    bm: bmesh.types.BMesh,
+    vertex_id_layer,
+    region_vertices: tuple[bmesh.types.BMVert, ...],
+    mirror_indices: tuple[int | None, ...],
+) -> None:
+    """Mark only the RIP region and resolved mirror vertices."""
+
+    marked_indices = {vertex.index for vertex in region_vertices}
+    marked_indices.update(index for index in mirror_indices if index is not None)
+    for index in marked_indices:
+        bm.verts[int(index)][vertex_id_layer] = int(index) + 1
 
 
 def _snapshot_region_vertices(

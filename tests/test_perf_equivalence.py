@@ -1504,6 +1504,68 @@ def _check_rip_lookup_validation():
         bm.free()
 
 
+def _check_rip_scoped_vertex_ids():
+    """RIP IDs are zero until snapshot resolution and scoped to its region."""
+
+    bm = _build_deformed_grid(4)
+    try:
+        bm.verts.ensure_lookup_table()
+        bm.verts.index_update()
+        for vertex in bm.verts:
+            vertex.select = False
+        bm.verts[1].select = True
+
+        topology = core.prepare_topology(bm, 0, TOLERANCE, mark_vertex_ids=True)
+        vertex_layer = bm.verts.layers.int.get(core.VERT_RIP_ID_LAYER)
+        assert vertex_layer is not None
+        assert all(int(vertex[vertex_layer]) == 0 for vertex in bm.verts)
+
+        lookup = topology.topology_resolution.vertex_lookup_unresolved
+        # This 5x5 grid has row-major indices. Vertex 1's selected source
+        # region is {0, 1, 2, 6}; its X mirrors are {4, 3, 2, 8}.
+        expected_region_indices = {0, 1, 2, 6}
+        expected_mirror_indices = {2, 3, 4, 8}
+        expected_marked_indices = {0, 1, 2, 3, 4, 6, 8}
+
+        snapshot = rip_module.build_snapshot(bm, 0, TOLERANCE, lookup=lookup)
+        assert snapshot is not None
+        marked = {
+            vertex.index
+            for vertex in bm.verts
+            if int(vertex[vertex_layer]) > 0
+        }
+        assert marked == expected_marked_indices
+        assert 0 < len(marked) < len(bm.verts)
+        assert all(int(bm.verts[index][vertex_layer]) == index + 1 for index in expected_marked_indices)
+        assert all(int(bm.verts[index][vertex_layer]) == 0 for index in {5, 7, 9, 10, 24})
+        assert expected_region_indices | expected_mirror_indices == expected_marked_indices
+        assert {record.vertex_id for record in snapshot.vertices} == {
+            index + 1 for index in expected_region_indices
+        }
+        assert {record.mirror_vertex_id for record in snapshot.vertices if record.mirror_vertex_id is not None} == {
+            index + 1 for index in expected_mirror_indices
+        }
+
+        # The lookup=None compatibility path resolves the same selected
+        # region and must produce the same snapshot IDs.
+        topology = core.prepare_topology(bm, 0, TOLERANCE, mark_vertex_ids=True)
+        snapshot_without_lookup = rip_module.build_snapshot(bm, 0, TOLERANCE)
+        assert snapshot_without_lookup == snapshot
+
+        # Re-preparing must not retain positive IDs from the prior scoped run.
+        topology = core.prepare_topology(bm, 0, TOLERANCE, mark_vertex_ids=True)
+        vertex_layer = bm.verts.layers.int.get(core.VERT_RIP_ID_LAYER)
+        assert vertex_layer is not None
+        assert all(int(vertex[vertex_layer]) == 0 for vertex in bm.verts)
+        for vertex in bm.verts:
+            vertex.select = False
+        assert rip_module.build_snapshot(bm, 0, TOLERANCE) is None
+        assert all(int(vertex[vertex_layer]) == 0 for vertex in bm.verts)
+        del topology
+    finally:
+        bm.free()
+
+
 def _check_rip_resolution_free_lookup_equivalence():
     """RIP's captured-array lookup stays lazy and bit-identical to the eager path."""
 
@@ -3490,6 +3552,7 @@ def run():
     _check_history_and_single_object_guard()
     _check_multi_object_native_passthrough()
     _check_rip_lookup_validation()
+    _check_rip_scoped_vertex_ids()
     _check_rip_resolution_free_lookup_equivalence()
     _check_capture_resolve_contract()
     _check_bulk_edit_mesh_order_variants()

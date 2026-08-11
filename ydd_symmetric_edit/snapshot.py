@@ -789,17 +789,23 @@ def prepare_topology(
     edge_hidden_layer = _reuse(bm.edges.layers.int, EDGE_HIDDEN_LAYER, bool(hide_edges.any()))
     vertex_hidden_layer = _reuse(bm.verts.layers.int, VERT_HIDDEN_LAYER, bool(hide_vertices.any()))
     face_hidden_layer = _reuse(bm.faces.layers.int, FACE_HIDDEN_LAYER, bool(hide_faces.any()))
-    rip_layer = _reuse(bm.verts.layers.int, VERT_RIP_ID_LAYER, mark_vertex_ids)
+    if mark_vertex_ids:
+        # RIP IDs are populated only after its snapshot has resolved the
+        # selected region. Recreate the layer so a repeated prepare cannot
+        # leak positive IDs from an earlier, differently scoped snapshot.
+        stale_rip_layer = bm.verts.layers.int.get(VERT_RIP_ID_LAYER)
+        if stale_rip_layer is not None:
+            bm.verts.layers.int.remove(stale_rip_layer)
+        bm.verts.layers.int.new(VERT_RIP_ID_LAYER)
+    else:
+        _reuse(bm.verts.layers.int, VERT_RIP_ID_LAYER, False)
     for edge_id, edge in enumerate(bm.edges, start=1):
         edge[edge_layer] = edge_id
         if edge_hidden_layer is not None:
             edge[edge_hidden_layer] = int(edge.hide)
-    if vertex_hidden_layer is not None or rip_layer is not None:
-        for vertex_id, vertex in enumerate(bm.verts, start=1):
-            if vertex_hidden_layer is not None:
-                vertex[vertex_hidden_layer] = int(vertex.hide)
-            if rip_layer is not None:
-                vertex[rip_layer] = vertex_id
+    if vertex_hidden_layer is not None:
+        for vertex in bm.verts:
+            vertex[vertex_hidden_layer] = int(vertex.hide)
     if face_hidden_layer is None:
         hidden_by_face_id: HiddenFaceMap = dict.fromkeys(map(FaceId, range(1, len(loop_starts) + 1)), False)
         for face_id, face in enumerate(bm.faces, start=1):
