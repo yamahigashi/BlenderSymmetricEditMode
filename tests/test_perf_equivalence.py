@@ -1138,7 +1138,10 @@ def _check_topology_equivalence():
         setattr(face_mapping, face_key_name, original_face_key)
     try:
         expected = _reference_eager_face_map(perturbed, 0, TOLERANCE)
-        assert fallback_calls > 0
+        # Exact geometry fallback is resolved by FaceRegistry's NumPy row
+        # index; Python FaceKey construction is reserved for the compatibility
+        # property and must not run on this path.
+        assert fallback_calls == 0
         assert topology.mirror_face_ids == expected
         assert topology.hidden_by_face_id[FaceId(1)] is True
         assert topology.matched_faces == len(expected) < topology.total_faces
@@ -3484,6 +3487,19 @@ def _check_face_registry_preserves_global_rows_and_lazy_geometry():
     assert registry.centroid_geometry_ready
     assert registry.geometry_ready
 
+    lazy_centroid_registry = core.FaceRegistry(
+        handle.coords64,
+        handle.loop_verts,
+        handle.loop_starts,
+        handle.loop_totals,
+        handle.axis_index,
+        handle.tolerance,
+    )
+    assert not lazy_centroid_registry.geometry_ready
+    assert lazy_centroid_registry.centroid_buckets
+    assert lazy_centroid_registry.centroid_geometry_ready
+    assert not lazy_centroid_registry.geometry_ready
+
     direct_registry = core.FaceRegistry(
         handle.coords64,
         handle.loop_verts,
@@ -3492,6 +3508,13 @@ def _check_face_registry_preserves_global_rows_and_lazy_geometry():
         handle.axis_index,
         handle.tolerance,
     )
+    direct_candidates = direct_registry.exact_geometry_candidates(
+        tuple(FaceId(index) for index in range(1, len(faces) + 1))
+    )
+    assert direct_candidates is not None
+    assert all(direct_candidates.values())
+    assert direct_registry._coordinates is None
+    assert direct_registry._face_key_buckets is None
     core._snapshot_face_map(
         handle.coords64,
         handle.loop_verts,
@@ -3503,6 +3526,157 @@ def _check_face_registry_preserves_global_rows_and_lazy_geometry():
         face_registry=direct_registry,
     )
     assert not direct_registry.centroid_geometry_ready
+    assert direct_registry._coordinates is None
+
+
+def _check_face_geometry_array_index_global_oracle():
+    rng = random.Random(2_026_081_1)
+    coords = []
+    faces = []
+    for _ in range(48):
+        y = rng.uniform(-4.0, 4.0)
+        z = rng.uniform(-4.0, 4.0)
+        width = rng.uniform(0.1, 1.5)
+        height = rng.uniform(0.1, 1.5)
+        left = [
+            (-rng.uniform(0.2, 3.0), y, z),
+            (-rng.uniform(0.2, 3.0), y + height, z),
+            (-rng.uniform(0.2, 3.0), y + height, z + width),
+            (-rng.uniform(0.2, 3.0), y, z + width),
+        ]
+        right = [(-co[0] + rng.uniform(-0.2, 0.2) * TOLERANCE, co[1], co[2]) for co in left]
+        left_ids = tuple(range(len(coords), len(coords) + len(left)))
+        coords.extend(left)
+        right_ids = tuple(range(len(coords), len(coords) + len(right)))
+        coords.extend(right)
+        faces.extend((left_ids, tuple(reversed(right_ids))))
+
+    plane_start = len(coords)
+    coords.extend(((-0.25, -0.5, 0.0), (0.25, -0.5, 0.0), (0.25, 0.5, 0.0), (-0.25, 0.5, 0.0)))
+    faces.append(tuple(range(plane_start, plane_start + 4)))
+    faces.append(faces[0])
+
+    coords64 = numpy.asarray(coords, dtype=numpy.float64)
+    loop_totals = numpy.asarray([len(face) for face in faces], dtype=numpy.int64)
+    loop_starts = numpy.concatenate(
+        (numpy.asarray((0,), dtype=numpy.int64), numpy.cumsum(loop_totals[:-1], dtype=numpy.int64))
+    )
+    loop_verts = numpy.asarray([vertex_id for face in faces for vertex_id in face], dtype=numpy.int64)
+    registry = core.FaceRegistry(coords64, loop_verts, loop_starts, loop_totals, 0, TOLERANCE)
+    actual = registry.exact_geometry_candidates(tuple(FaceId(index) for index in range(1, len(faces) + 1)))
+
+    buckets = defaultdict(list)
+    for face_index, face in enumerate(faces, start=1):
+        key = (
+            len(face),
+            tuple(sorted(core._quantized_coordinate(Vector(coords64[vertex_id]), TOLERANCE) for vertex_id in face)),
+        )
+        buckets[key].append(FaceId(face_index))
+    expected = {}
+    for face_index, face in enumerate(faces, start=1):
+        mirrored = [list(coords64[vertex_id]) for vertex_id in face]
+        for coordinate in mirrored:
+            coordinate[0] *= -1.0
+        key = (
+            len(face),
+            tuple(sorted(core._quantized_coordinate(Vector(coordinate), TOLERANCE) for coordinate in mirrored)),
+        )
+        expected[FaceId(face_index)] = tuple(buckets[key])
+    assert actual == expected
+
+    invalid_coords = numpy.asarray(
+        ((numpy.nan, 0.0, 0.0), (numpy.inf, 0.0, 0.0), (-numpy.inf, 1.0, 0.0)), dtype=numpy.float64
+    )
+    invalid_registry = core.FaceRegistry(
+        invalid_coords,
+        numpy.asarray((0, 1, 2), dtype=numpy.int64),
+        numpy.asarray((0,), dtype=numpy.int64),
+        numpy.asarray((3,), dtype=numpy.int64),
+        0,
+        TOLERANCE,
+    )
+    assert invalid_registry.exact_geometry_candidates((FaceId(1),)) is None
+
+    overflow_coords = numpy.asarray(
+        (
+            (2**63 * TOLERANCE, 0.0, 0.0),
+            (-(2**63) * TOLERANCE, 1.0, 0.0),
+            (0.0, 2**63 * TOLERANCE, 1.0),
+        ),
+        dtype=numpy.float64,
+    )
+    overflow_registry = core.FaceRegistry(
+        overflow_coords,
+        numpy.asarray((0, 1, 2), dtype=numpy.int64),
+        numpy.asarray((0,), dtype=numpy.int64),
+        numpy.asarray((3,), dtype=numpy.int64),
+        0,
+        TOLERANCE,
+    )
+    assert overflow_registry.exact_geometry_candidates((FaceId(1),)) is None
+
+
+def _check_face_geometry_snapshot_oracle_edges():
+    boundary = float(numpy.nextafter(TOLERANCE, numpy.inf))
+    rounded = float(numpy.float32(TOLERANCE))
+    raw_coords = numpy.asarray(
+        (
+            (boundary, 1024.0, -0.0),
+            (0.75, 1024.5, -0.5),
+            (-0.4, 1025.0, 0.0),
+            (boundary, 1024.0, -0.0),
+            (0.75, 1024.5, -0.5),
+            (-0.4, 1025.0, 0.0),
+            (-rounded, 1024.0 + 2.0 * TOLERANCE, -0.0),
+            (-0.75, 1024.5 + 2.0 * TOLERANCE, -0.5),
+            (0.4, 1025.0 + 2.0 * TOLERANCE, 0.0),
+        ),
+        dtype=numpy.float64,
+    )
+    raw_loop_verts = numpy.asarray(
+        (0, 1, 2, 3, 4, 5, 6, 7, 8),
+        dtype=numpy.int64,
+    )
+    raw_loop_starts = numpy.asarray((0, 3, 6), dtype=numpy.int64)
+    raw_loop_totals = numpy.asarray((3, 3, 3), dtype=numpy.int64)
+    raw_actual = core._snapshot_face_map(
+        raw_coords,
+        raw_loop_verts,
+        raw_loop_starts,
+        raw_loop_totals,
+        0,
+        TOLERANCE,
+        vertex_pairs={},
+    )
+    assert raw_actual == {FaceId(3): FaceId(1)}
+
+    for axis_index in range(3):
+        self_coords = numpy.asarray(((0.0, 0.0, 0.0), (0.3, 0.5, 0.7), (0.8, -0.2, 0.4)), dtype=numpy.float64)
+        self_coords[:, axis_index] = 0.0
+        self_registry = core.FaceRegistry(
+            self_coords,
+            numpy.asarray((0, 1, 2), dtype=numpy.int64),
+            numpy.asarray((0,), dtype=numpy.int64),
+            numpy.asarray((3,), dtype=numpy.int64),
+            axis_index,
+            TOLERANCE,
+        )
+        self_map = core._snapshot_face_map(
+            self_coords,
+            numpy.asarray((0, 1, 2), dtype=numpy.int64),
+            numpy.asarray((0,), dtype=numpy.int64),
+            numpy.asarray((3,), dtype=numpy.int64),
+            axis_index,
+            TOLERANCE,
+            vertex_pairs={},
+            face_registry=self_registry,
+        )
+        assert self_map == {FaceId(1): FaceId(1)}
+        assert self_registry._coordinates is None
+
+    empty = numpy.empty((0, 3), dtype=numpy.float64)
+    empty_faces = numpy.empty(0, dtype=numpy.int64)
+    assert core._snapshot_face_map(empty, empty_faces, empty_faces, empty_faces, 0, TOLERANCE) == {}
 
 
 def _check_partial_face_resolution_duplicate_row_orderings():
@@ -3720,6 +3894,8 @@ def run():
     _check_partial_vertex_resolution_non_power_tolerance_boundary()
     _check_partial_vertex_resolution_registry_fallback_and_empty_guard()
     _check_face_registry_preserves_global_rows_and_lazy_geometry()
+    _check_face_geometry_array_index_global_oracle()
+    _check_face_geometry_snapshot_oracle_edges()
     _check_partial_face_resolution_duplicate_row_orderings()
     _check_partial_face_resolution_randomized_sets()
     _check_partial_face_resolution_fallback_preserves_primary_values()
