@@ -258,8 +258,9 @@ class FaceRegistry:
         memo: dict[FaceId, FaceId | None] = {}
         targets: dict[FaceId, FaceId | None] = {}
         frontier = set(closure)
+        additions: set[FaceId] = set()
         while frontier:
-            additions: set[FaceId] = set()
+            additions.clear()
             for face_id in frontier:
                 additions.update(self._row_bucket(face_id))
                 target = self._memoized_target(face_id, pairs, memo)
@@ -271,7 +272,7 @@ class FaceRegistry:
                 additions.update(self._exact_claimants(target, pairs, pair_sources, memo))
             additions.difference_update(closure)
             closure.update(additions)
-            frontier = additions
+            frontier, additions = additions, frontier
 
         target_counts: dict[FaceId, int] = defaultdict(int)
         for target in targets.values():
