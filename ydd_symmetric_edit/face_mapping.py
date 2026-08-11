@@ -225,11 +225,13 @@ class FaceRegistry:
         pair_sources: Mapping[int, tuple[int, ...]],
         memo: dict[FaceId, FaceId | None],
     ) -> set[FaceId]:
-        candidate_faces: set[FaceId] = set()
+        claimants: set[FaceId] = set()
         for target_vertex in self.vertices(target_id):
             for source_vertex in pair_sources.get(target_vertex, ()):
-                candidate_faces.update(self.faces_for_vertex(source_vertex))
-        return {face_id for face_id in candidate_faces if self._memoized_target(face_id, pairs, memo) == target_id}
+                for face_id in self.faces_for_vertex(source_vertex):
+                    if face_id not in claimants and self._memoized_target(face_id, pairs, memo) == target_id:
+                        claimants.add(face_id)
+        return claimants
 
     def _memoized_target(
         self,
