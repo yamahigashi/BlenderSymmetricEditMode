@@ -413,9 +413,7 @@ class LazyTopologyResolution:
                     self.tolerance,
                 )
             unresolved_ids = tuple(FaceId(int(face_id)) for face_id in unresolved.tolist())
-            vertex_ids = tuple(
-                sorted({vertex_id for face_id in unresolved_ids for vertex_id in self._face_registry.vertices(face_id)})
-            )
+            vertex_ids = self._face_registry.vertices_for_faces(unresolved_ids)
             vertex_resolution = self._resolve_vertex_closure(vertex_ids)
             if vertex_resolution is None:
                 self.resolve()

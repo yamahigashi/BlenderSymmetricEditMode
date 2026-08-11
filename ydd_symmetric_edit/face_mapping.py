@@ -149,6 +149,19 @@ class FaceRegistry:
         total = int(self.loop_totals[face_index])
         return tuple(int(vertex_id) for vertex_id in self.loop_verts[start : start + total].tolist())
 
+    def vertices_for_faces(self, face_ids: Sequence[FaceId]) -> numpy.ndarray:
+        """Return the unique vertex ids for a face sequence in sorted order."""
+
+        indices = numpy.fromiter((int(face_id) - 1 for face_id in face_ids), dtype=numpy.int64, count=len(face_ids))
+        if not len(indices):
+            return numpy.empty(0, dtype=numpy.int64)
+        starts = self.loop_starts[indices]
+        totals = self.loop_totals[indices]
+        output_starts = numpy.cumsum(totals, dtype=numpy.int64) - totals
+        loop_count = int(totals.sum())
+        positions = numpy.arange(loop_count, dtype=numpy.int64) + numpy.repeat(starts - output_starts, totals)
+        return numpy.unique(self.loop_verts[positions])
+
     def _row_bucket(self, face_id: FaceId) -> tuple[FaceId, ...]:
         face_index = int(face_id) - 1
         total = int(self.loop_totals[face_index])
