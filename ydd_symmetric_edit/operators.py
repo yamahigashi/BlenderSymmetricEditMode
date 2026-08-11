@@ -578,9 +578,12 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     if backup_mesh is None:
                         selection_state = core.add_selection_layers(bm)
                         backup_mesh = _create_backup(bm)
+                        # Layer creation invalidates the held BMesh proxies, so
+                        # reclassify the unchanged path against a fresh view.
+                        # The backup only serializes the existing topology; it
+                        # cannot change carrier scope or the live mirror map.
                         bm = bmesh.from_edit_mesh(obj.data)
                         by_side, total_path_edges = _collect_knife_path_edges(bm)
-                        live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, _all_path_edges(by_side))
                         source_edges = by_side["POSITIVE"] + by_side["NEGATIVE"]
                     if not source_edges:
                         raise SymmetricKnifeError("The native cut path was lost before mirroring")
