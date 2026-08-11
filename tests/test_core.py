@@ -470,6 +470,168 @@ def check_collapsed_offset_prefers_geometrically_closer_marker():
         bm.free()
 
 
+def check_reflected_path_lazy_existing_edge_store():
+    """All identity hits must avoid building the geometric edge store."""
+
+    bm = build_two_symmetric_quads()
+    try:
+        topology = core.prepare_topology(bm, core.AXIS_INDEX["X"], 1.0e-5)
+        path_edge = split_left_face_like_native_knife(bm)
+        marker = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+        assert marker is not None
+        path_edge[marker] = 0
+        first = core.apply_reflected_path_topology(
+            bm,
+            [path_edge],
+            core.AXIS_INDEX["X"],
+            1.0e-5,
+            topology.mirror_face_ids,
+        )
+        assert first == (1, 0, "")
+
+        registrations = 0
+        original_register = stitch._register_edge_endpoint_pair
+
+        def count_registration(*args, **kwargs):
+            nonlocal registrations
+            registrations += 1
+            return original_register(*args, **kwargs)
+
+        stitch._register_edge_endpoint_pair = count_registration
+        try:
+            second = core.apply_reflected_path_topology(
+                bm,
+                [path_edge],
+                core.AXIS_INDEX["X"],
+                1.0e-5,
+                topology.mirror_face_ids,
+            )
+        finally:
+            stitch._register_edge_endpoint_pair = original_register
+        assert second == (0, 1, "")
+        assert registrations == 0
+    finally:
+        bm.free()
+
+
+def check_reflected_path_lazy_store_falls_back_after_identity_miss():
+    """A later geometric miss still uses the full store after prior hits."""
+
+    bm = build_two_symmetric_quads()
+    try:
+        topology = core.prepare_topology(bm, core.AXIS_INDEX["X"], 1.0e-5)
+
+        def add_vertical_cut(x):
+            bottom = next(
+                edge
+                for edge in bm.edges
+                if all(abs(vertex.co.y + 1.0) < 1.0e-8 for vertex in edge.verts)
+                and min(vertex.co.x for vertex in edge.verts) < x < max(vertex.co.x for vertex in edge.verts)
+            )
+            _edge, bottom_vertex = bmesh.utils.edge_split(
+                bottom,
+                bottom.verts[0],
+                (x - bottom.verts[0].co.x) / (bottom.verts[1].co.x - bottom.verts[0].co.x),
+            )
+            top = next(
+                edge
+                for edge in bm.edges
+                if all(abs(vertex.co.y - 1.0) < 1.0e-8 for vertex in edge.verts)
+                and min(vertex.co.x for vertex in edge.verts) < x < max(vertex.co.x for vertex in edge.verts)
+            )
+            _edge, top_vertex = bmesh.utils.edge_split(
+                top,
+                top.verts[0],
+                (x - top.verts[0].co.x) / (top.verts[1].co.x - top.verts[0].co.x),
+            )
+            face = next(face for face in bm.faces if bottom_vertex in face.verts and top_vertex in face.verts)
+            bmesh.utils.face_split(face, bottom_vertex, top_vertex)
+            return bm.edges.get((bottom_vertex, top_vertex))
+
+        first = add_vertical_cut(-1.6)
+        second = add_vertical_cut(-1.3)
+        marker = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+        assert marker is not None
+        first[marker] = 0
+        second[marker] = 0
+
+        initial = core.apply_reflected_path_topology(
+            bm,
+            [first],
+            core.AXIS_INDEX["X"],
+            1.0e-5,
+            topology.mirror_face_ids,
+        )
+        assert initial == (1, 0, "")
+
+        # Materialize the later target endpoints without creating their edge.
+        # This keeps the mixed call's lazy-store boundary free of endpoint
+        # splits, making the pre-call BMesh snapshot its exact bulk oracle.
+        target_vertices = []
+        for y in (-1.0, 1.0):
+            boundary = next(
+                edge
+                for edge in bm.edges
+                if all(abs(vertex.co.y - y) < 1.0e-8 for vertex in edge.verts)
+                and min(vertex.co.x for vertex in edge.verts) < 1.3 < max(vertex.co.x for vertex in edge.verts)
+                and all(vertex.co.x > 0.0 for vertex in edge.verts)
+            )
+            _new_edge, target_vertex = bmesh.utils.edge_split(
+                boundary,
+                boundary.verts[0],
+                (1.3 - boundary.verts[0].co.x) / (boundary.verts[1].co.x - boundary.verts[0].co.x),
+            )
+            target_vertices.append(target_vertex)
+
+        face_layer = bm.faces.layers.int.get(core.FACE_ID_LAYER)
+        assert face_layer is not None
+        expected_bulk = [
+            (
+                tuple(float(component) for component in edge.verts[0].co),
+                tuple(float(component) for component in edge.verts[1].co),
+                frozenset(int(face[face_layer]) for face in edge.link_faces),
+            )
+            for edge in bm.edges
+            if edge.is_valid
+        ]
+
+        registrations = []
+        original_register = stitch._register_edge_endpoint_pair
+
+        def count_registration(*args, **kwargs):
+            registrations.append(
+                (
+                    tuple(float(component) for component in args[1]),
+                    tuple(float(component) for component in args[2]),
+                    frozenset(int(face_id) for face_id in kwargs["face_ids"]),
+                )
+            )
+            return original_register(*args, **kwargs)
+
+        stitch._register_edge_endpoint_pair = count_registration
+        try:
+            mixed = core.apply_reflected_path_topology(
+                bm,
+                [first, second],
+                core.AXIS_INDEX["X"],
+                1.0e-5,
+                topology.mirror_face_ids,
+            )
+        finally:
+            stitch._register_edge_endpoint_pair = original_register
+        assert mixed == (1, 1, "")
+        assert len(registrations) == len(expected_bulk) + 1
+        assert registrations[: len(expected_bulk)] == expected_bulk
+        created_edge = bm.edges.get(target_vertices)
+        assert created_edge is not None
+        assert {registrations[-1][0], registrations[-1][1]} == {
+            tuple(float(component) for component in vertex.co) for vertex in created_edge.verts
+        }
+        assert registrations[-1][2] == frozenset(int(face[face_layer]) for face in created_edge.link_faces)
+    finally:
+        bm.free()
+
+
 def check_large_ngon_coords_match_without_recursion_error():
     """R2-2: large n-gon multiset match must not raise RecursionError."""
 
@@ -819,6 +981,8 @@ def run():
     check_interior_edge_factor_uses_absolute_distance()
     check_choose_source_side_ignores_coordinate_tolerance()
     check_collapsed_offset_prefers_geometrically_closer_marker()
+    check_reflected_path_lazy_existing_edge_store()
+    check_reflected_path_lazy_store_falls_back_after_identity_miss()
     check_large_ngon_coords_match_without_recursion_error()
     check_vertex_mirror_lookup_bin_boundary()
     check_vertex_mirror_lookup_is_on_plane_boundary()

@@ -1629,18 +1629,13 @@ def apply_reflected_path_topology(
         target_vertex_by_source_key[source_key] = target_vertex
 
     # Endpoint-tol store matches build_reflected_cutter so geometric duplicates
-    # (different BMVert pairs within tol) count as already_present.
-    existing_edges: _EdgeEndpointStore = {}
-    for edge in bm.edges:
-        if edge.is_valid:
-            _register_edge_endpoint_pair(
-                existing_edges,
-                edge.verts[0].co,
-                edge.verts[1].co,
-                tolerance,
-                face_ids={FaceId(int(face[face_layer])) for face in edge.link_faces},
-            )
-
+    # (different BMVert pairs within tol) count as already_present.  Keep it
+    # lazy: the common native-topology case resolves every segment by BMEdge
+    # identity and never needs a full-mesh geometric index.  After target
+    # vertices have been resolved, the edge loop does not mutate topology
+    # before its first identity miss, so constructing the store at that
+    # boundary observes the same mesh as the eager path.
+    existing_edges: _EdgeEndpointStore | None = None
     created_edges = 0
     already_present = 0
     pending = edge_records
@@ -1662,6 +1657,18 @@ def apply_reflected_path_topology(
                 already_present += 1
                 progress = True
                 continue
+
+            if existing_edges is None:
+                existing_edges = {}
+                for edge in bm.edges:
+                    if edge.is_valid:
+                        _register_edge_endpoint_pair(
+                            existing_edges,
+                            edge.verts[0].co,
+                            edge.verts[1].co,
+                            tolerance,
+                            face_ids={FaceId(int(face[face_layer])) for face in edge.link_faces},
+                        )
 
             endpoint_match = _match_edge_endpoint_pair_for_faces(
                 target_a.co,
@@ -1708,6 +1715,7 @@ def apply_reflected_path_topology(
             new_edge.select = False
             for face in new_edge.link_faces:
                 face.select = False
+            assert existing_edges is not None
             _register_edge_endpoint_pair(
                 existing_edges,
                 new_edge.verts[0].co,
