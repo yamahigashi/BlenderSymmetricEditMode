@@ -3479,8 +3479,30 @@ def _check_face_registry_preserves_global_rows_and_lazy_geometry():
     assert set(registry.faces_for_vertex(0)) == {FaceId(1), FaceId(9)}
     assert not registry.geometry_ready
     assert registry.face_key_buckets
+    assert not registry.centroid_geometry_ready
     assert registry.centroid_buckets
+    assert registry.centroid_geometry_ready
     assert registry.geometry_ready
+
+    direct_registry = core.FaceRegistry(
+        handle.coords64,
+        handle.loop_verts,
+        handle.loop_starts,
+        handle.loop_totals,
+        handle.axis_index,
+        handle.tolerance,
+    )
+    core._snapshot_face_map(
+        handle.coords64,
+        handle.loop_verts,
+        handle.loop_starts,
+        handle.loop_totals,
+        handle.axis_index,
+        handle.tolerance,
+        vertex_pairs={},
+        face_registry=direct_registry,
+    )
+    assert not direct_registry.centroid_geometry_ready
 
 
 def _check_partial_face_resolution_duplicate_row_orderings():

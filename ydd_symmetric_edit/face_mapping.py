@@ -273,49 +273,56 @@ class FaceRegistry:
     def geometry_ready(self) -> bool:
         return self._face_key_buckets is not None
 
-    def _ensure_geometry(self) -> None:
+    @property
+    def centroid_geometry_ready(self) -> bool:
+        return self._centroid_buckets is not None
+
+    def _ensure_key_index(self) -> None:
         if self.geometry_ready:
             return
         coordinates = tuple((float(row[0]), float(row[1]), float(row[2])) for row in self.coords64.tolist())
         key_buckets: dict[FaceKey, list[FaceId]] = defaultdict(list)
-        centroid_buckets: dict[tuple[int, QuantizedCoordinate], list[FaceId]] = defaultdict(list)
-        centroids: list[Coordinate3D] = []
         for face_index in range(1, self.face_count + 1):
             face_id = FaceId(face_index)
             vertex_ids = self.vertices(face_id)
             values = tuple(coordinates[vertex_id] for vertex_id in vertex_ids)
             snapshot_face = cast(bmesh.types.BMFace, _SnapshotFace(values))
             key_buckets[_face_key(snapshot_face, self.axis_index, self.tolerance, mirrored=False)].append(face_id)
-            center = Vector((0.0, 0.0, 0.0))
-            for value in values:
-                center += Vector(value)
-            if values:
-                center /= len(values)
-            centroid = _coordinate_3d(center)
+        self._coordinates = coordinates
+        self._face_key_buckets = {key: tuple(face_ids) for key, face_ids in key_buckets.items()}
+
+    def _ensure_centroid_index(self) -> None:
+        if self.centroid_geometry_ready:
+            return
+        self._ensure_key_index()
+        centroid_buckets: dict[tuple[int, QuantizedCoordinate], list[FaceId]] = defaultdict(list)
+        centroids: list[Coordinate3D] = []
+        for face_index in range(1, self.face_count + 1):
+            face_id = FaceId(face_index)
+            vertex_ids = self.vertices(face_id)
+            centroid = self.face_centroid(face_id)
             centroids.append(centroid)
             centroid_buckets[
                 (len(vertex_ids), _quantized_coordinate(Vector(centroid.as_tuple()), self.tolerance))
             ].append(face_id)
-        self._coordinates = coordinates
-        self._face_key_buckets = {key: tuple(face_ids) for key, face_ids in key_buckets.items()}
         self._centroid_buckets = {key: tuple(face_ids) for key, face_ids in centroid_buckets.items()}
         self._centroids = tuple(centroids)
 
     @property
     def face_key_buckets(self):
-        self._ensure_geometry()
+        self._ensure_key_index()
         return cast(dict[FaceKey, tuple[FaceId, ...]], self._face_key_buckets)
 
     @property
     def centroid_buckets(self):
-        self._ensure_geometry()
+        self._ensure_centroid_index()
         return cast(
             dict[tuple[int, QuantizedCoordinate], tuple[FaceId, ...]],
             self._centroid_buckets,
         )
 
     def face_coordinates(self, face_id: FaceId, *, mirrored: bool = False):
-        self._ensure_geometry()
+        self._ensure_key_index()
         coordinates = cast(tuple[tuple[float, float, float], ...], self._coordinates)
         values = tuple(coordinates[vertex_id] for vertex_id in self.vertices(face_id))
         if not mirrored:
@@ -330,8 +337,21 @@ class FaceRegistry:
         snapshot_face = cast(bmesh.types.BMFace, _SnapshotFace(values))
         return _face_key(snapshot_face, self.axis_index, self.tolerance, mirrored=True)
 
+    def face_centroid(self, face_id: FaceId):
+        """Compute one centroid without materializing the fallback index."""
+        if self.centroid_geometry_ready:
+            return cast(tuple[Coordinate3D, ...], self._centroids)[int(face_id) - 1]
+        self._ensure_key_index()
+        values = self.face_coordinates(face_id)
+        center = Vector((0.0, 0.0, 0.0))
+        for value in values:
+            center += Vector(value)
+        if values:
+            center /= len(values)
+        return _coordinate_3d(center)
+
     def centroid(self, face_id: FaceId):
-        self._ensure_geometry()
+        self._ensure_centroid_index()
         return cast(tuple[Coordinate3D, ...], self._centroids)[int(face_id) - 1]
 
 
@@ -464,18 +484,26 @@ def _snapshot_face_map(
             for candidate_id, vertex_ids in face_vertex_ids.items():
                 centroid = centroid_for(candidate_id)
                 key = (len(vertex_ids), _quantized_coordinate(Vector(centroid.as_tuple()), tolerance))
-                cast(list[FaceId], faces_by_count_centroid[key]).append(candidate_id)
+                centroid_index = cast(
+                    defaultdict[tuple[int, QuantizedCoordinate], list[FaceId]],
+                    faces_by_count_centroid,
+                )
+                centroid_index[key].append(candidate_id)
             fallback_index_ready = True
 
     else:
         key_to_face_ids = face_registry.face_key_buckets
-        faces_by_count_centroid = face_registry.centroid_buckets
+        # Exact mirrored keys resolve without the global centroid index. Build
+        # that index only when a key miss enters geometric fallback.
+        faces_by_count_centroid = None
         face_coords = face_registry.face_coordinates
         mirrored_face_key_for = face_registry.mirrored_face_key
-        centroid_for = face_registry.centroid
+        centroid_for = face_registry.face_centroid
 
         def ensure_fallback_index() -> None:
-            return
+            nonlocal faces_by_count_centroid
+            if faces_by_count_centroid is None:
+                faces_by_count_centroid = face_registry.centroid_buckets
 
     fallback_assignments: dict[FaceId, FaceId] = {}
     for face_id in fallback:
@@ -491,8 +519,12 @@ def _snapshot_face_map(
             seen: set[FaceId] = set()
             found_self = False
             found_other = False
+            centroid_index = cast(
+                Mapping[tuple[int, QuantizedCoordinate], Sequence[FaceId]],
+                faces_by_count_centroid,
+            )
             for centroid_key in _iter_quantized_neighborhood(mirrored_centroid, tolerance):
-                for candidate_id in faces_by_count_centroid.get((len(values), centroid_key), ()):
+                for candidate_id in centroid_index.get((len(values), centroid_key), ()):
                     if candidate_id in seen:
                         continue
                     seen.add(candidate_id)
