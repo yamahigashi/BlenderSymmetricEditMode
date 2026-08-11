@@ -649,7 +649,7 @@ def _read_polygon_loop_vertex_indices(polygons, loops, face_index: int) -> list[
         return None
 
 
-def _capture_bmesh_snapshot(bm: bmesh.types.BMesh):
+def _capture_bmesh_snapshot(bm: bmesh.types.BMesh, *, skip_vertex_edge_hides: bool = False):
     bm.verts.ensure_lookup_table()
     bm.edges.ensure_lookup_table()
     bm.faces.ensure_lookup_table()
@@ -670,13 +670,26 @@ def _capture_bmesh_snapshot(bm: bmesh.types.BMesh):
         loop_verts,
         loop_starts,
         loop_totals,
-        numpy.asarray([bool(vertex.hide) for vertex in bm.verts], dtype=bool),
-        numpy.asarray([bool(edge.hide) for edge in bm.edges], dtype=bool),
+        (
+            numpy.zeros(len(bm.verts), dtype=bool)
+            if skip_vertex_edge_hides
+            else numpy.asarray([bool(vertex.hide) for vertex in bm.verts], dtype=bool)
+        ),
+        (
+            numpy.zeros(len(bm.edges), dtype=bool)
+            if skip_vertex_edge_hides
+            else numpy.asarray([bool(edge.hide) for edge in bm.edges], dtype=bool)
+        ),
         numpy.asarray([bool(face.hide) for face in bm.faces], dtype=bool),
     )
 
 
-def _capture_mesh_snapshot(mesh_object, bm: bmesh.types.BMesh):
+def _capture_mesh_snapshot(
+    mesh_object,
+    bm: bmesh.types.BMesh,
+    *,
+    skip_vertex_edge_hides: bool = False,
+):
     if getattr(getattr(mesh_object, "data", None), "shape_keys", None) is not None:
         return None
     bm.verts.ensure_lookup_table()
@@ -698,13 +711,15 @@ def _capture_mesh_snapshot(mesh_object, bm: bmesh.types.BMesh):
     loop_starts = numpy.cumsum(loop_totals) - loop_totals
     if count_faces and int(loop_starts[-1] + loop_totals[-1]) != count_loops:
         return None
-    # mesh.attributes is filtered while in edit mode, so hide state can
-    # only be trusted through the per-element reads.
-    hide_vertices = numpy.empty(count_vertices, dtype=bool)
-    hide_edges = numpy.empty(count_edges, dtype=bool)
+    # mesh.attributes is filtered while in edit mode, so non-RIP hide state
+    # can only be trusted through the per-element reads. RIP does not consume
+    # vertex/edge hide state and intentionally keeps these arrays all-false.
+    hide_vertices = numpy.zeros(count_vertices, dtype=bool)
+    hide_edges = numpy.zeros(count_edges, dtype=bool)
     hide_faces = numpy.empty(count_faces, dtype=bool)
-    mesh.vertices.foreach_get("hide", hide_vertices)
-    mesh.edges.foreach_get("hide", hide_edges)
+    if not skip_vertex_edge_hides:
+        mesh.vertices.foreach_get("hide", hide_vertices)
+        mesh.edges.foreach_get("hide", hide_edges)
     mesh.polygons.foreach_get("hide", hide_faces)
     if len(bm.verts) != count_vertices or len(bm.edges) != count_edges or len(bm.faces) != count_faces:
         return None
@@ -745,9 +760,14 @@ def prepare_topology(
 ) -> TopologyPreparation:
     """Capture topology eagerly and defer geometric resolution until consumed."""
 
-    snapshot = _capture_mesh_snapshot(mesh_object, bm) if mesh_object is not None else None
+    skip_vertex_edge_hides = mark_vertex_ids
+    snapshot = (
+        _capture_mesh_snapshot(mesh_object, bm, skip_vertex_edge_hides=skip_vertex_edge_hides)
+        if mesh_object is not None
+        else None
+    )
     if snapshot is None:
-        snapshot = _capture_bmesh_snapshot(bm)
+        snapshot = _capture_bmesh_snapshot(bm, skip_vertex_edge_hides=skip_vertex_edge_hides)
     (
         coords64,
         loop_verts,

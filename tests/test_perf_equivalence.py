@@ -1599,11 +1599,13 @@ class _BulkCollection:
     def __init__(self, values, *, by_name=None):
         self._values = values
         self._by_name = by_name or {}
+        self.calls = []
 
     def __len__(self):
         return len(self._values)
 
     def foreach_get(self, name, target):
+        self.calls.append(name)
         if name in self._by_name:
             data = self._by_name[name]
             if name == "co":
@@ -1619,8 +1621,13 @@ class _BulkCollection:
 
 class _BulkVertexCollection(_BulkCollection):
     def foreach_get(self, name, target):
-        if name == "hide" and "hide" not in self._by_name:
+        if name == "hide":
+            self.calls.append(name)
             target[:] = False
+            values = self._by_name.get("hide")
+            if values is not None:
+                values_array = numpy.asarray(values, dtype=target.dtype).reshape(-1)
+                target[: min(len(target), len(values_array))] = values_array[: len(target)]
             return
         super().foreach_get(name, target)
 
@@ -1648,9 +1655,11 @@ class _BulkPolygonCollection(_BulkCollection):
 
     def foreach_get(self, name, target):
         if name == "loop_start":
+            self.calls.append(name)
             target[:] = numpy.asarray(self._starts, dtype=target.dtype)
             return
         if name == "loop_total":
+            self.calls.append(name)
             target[:] = numpy.asarray(self._totals, dtype=target.dtype)
             return
         super().foreach_get(name, target)
@@ -1673,14 +1682,15 @@ class _BulkMeshData:
             offset += len(values)
         cos = [tuple(float(value) for value in vertex.co) for vertex in bm.verts]
         vert_select = [bool(vertex.select) for vertex in bm.verts]
+        vert_hide = [bool(vertex.hide) for vertex in bm.verts]
         edge_select = [bool(edge.select) for edge in bm.edges]
         edge_hide = [bool(edge.hide) for edge in bm.edges]
         face_select = [bool(face.select) for face in bm.faces]
         face_hide = [bool(face.hide) for face in bm.faces]
         self.shape_keys = None
-        # vertices: co lives in _values (guard tests mutate length); hide stays
-        # the default all-False path; select is optional by_name.
-        self.vertices = _BulkVertexCollection(cos, by_name={"select": vert_select})
+        # vertices: co lives in _values (guard tests mutate length); hide and
+        # select are explicit columns so capture tests have an independent oracle.
+        self.vertices = _BulkVertexCollection(cos, by_name={"hide": vert_hide, "select": vert_select})
         # edges/polygons: hide stays on _values for existing topology tests;
         # select is optional by_name for §S bulk selection capture.
         self.edges = _BulkCollection(edge_hide, by_name={"select": edge_select})
@@ -2206,6 +2216,119 @@ def _check_capture_resolve_contract():
         assert compatibility.mirror_face_ids == captured.mirror_face_ids == {}
     finally:
         empty.free()
+
+
+def _check_rip_capture_omits_vertex_edge_hides():
+    """RIP capture skips vertex/edge hide reads but keeps face hide semantics."""
+
+    bm = _build_deformed_grid(3)
+    try:
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        for index, vertex in enumerate(bm.verts):
+            vertex.hide = index % 3 == 1
+        for index, edge in enumerate(bm.edges):
+            edge.hide = index % 3 == 2
+        for index, face in enumerate(bm.faces):
+            face.hide = index % 2 == 1
+
+        non_rip = core.prepare_topology(bm, 0, TOLERANCE)
+        assert non_rip.topology_resolution.hide_vertices.any()
+        assert non_rip.topology_resolution.hide_edges.any()
+        assert non_rip.topology_resolution.hide_faces.any()
+
+        hide_before_rip = (
+            tuple(bool(vertex.hide) for vertex in bm.verts),
+            tuple(bool(edge.hide) for edge in bm.edges),
+            tuple(bool(face.hide) for face in bm.faces),
+        )
+        for vertex in bm.verts:
+            vertex.select = False
+        for index in (0, 2, 3):
+            bm.verts[index].select = True
+
+        data = _BulkMeshData(bm)
+        rip_topology = core.prepare_topology(
+            bm,
+            0,
+            TOLERANCE,
+            mark_vertex_ids=True,
+            mesh_object=_BulkMeshObject(data),
+        )
+        resolution = rip_topology.topology_resolution
+        assert "hide" not in data.vertices.calls
+        assert "hide" not in data.edges.calls
+        assert "hide" in data.polygons.calls
+        assert numpy.array_equal(resolution.hide_vertices, numpy.zeros(len(bm.verts), dtype=bool))
+        assert numpy.array_equal(resolution.hide_edges, numpy.zeros(len(bm.edges), dtype=bool))
+        assert numpy.array_equal(
+            resolution.hide_faces,
+            numpy.asarray([bool(face.hide) for face in bm.faces], dtype=bool),
+        )
+        assert bm.verts.layers.int.get(core.VERT_HIDDEN_LAYER) is None
+        assert bm.edges.layers.int.get(core.EDGE_HIDDEN_LAYER) is None
+        rip_snapshot = rip_module.build_snapshot(
+            bm,
+            0,
+            TOLERANCE,
+            lookup=resolution.vertex_lookup_unresolved,
+        )
+        assert rip_snapshot is not None
+        core.remove_temporary_layers(bm)
+        hide_after_rip = (
+            tuple(bool(vertex.hide) for vertex in bm.verts),
+            tuple(bool(edge.hide) for edge in bm.edges),
+            tuple(bool(face.hide) for face in bm.faces),
+        )
+        assert hide_after_rip == hide_before_rip
+
+        fallback_bm = _clone_bmesh(bm)
+        try:
+            fallback_data = _BulkMeshData(fallback_bm)
+            fallback_data.shape_keys = object()
+            fallback_object = _BulkMeshObject(fallback_data)
+            fallback_topology = core.prepare_topology(
+                fallback_bm,
+                0,
+                TOLERANCE,
+                mark_vertex_ids=True,
+                mesh_object=fallback_object,
+            )
+            assert fallback_object.update_calls == 0
+            assert fallback_data.vertices.calls == []
+            assert fallback_data.edges.calls == []
+            assert fallback_data.polygons.calls == []
+            fallback_resolution = fallback_topology.topology_resolution
+            assert numpy.array_equal(
+                fallback_resolution.hide_vertices,
+                numpy.zeros(len(fallback_bm.verts), dtype=bool),
+            )
+            assert numpy.array_equal(
+                fallback_resolution.hide_edges,
+                numpy.zeros(len(fallback_bm.edges), dtype=bool),
+            )
+            assert numpy.array_equal(
+                fallback_resolution.hide_faces,
+                numpy.asarray([bool(face.hide) for face in fallback_bm.faces], dtype=bool),
+            )
+            assert fallback_bm.verts.layers.int.get(core.VERT_HIDDEN_LAYER) is None
+            assert fallback_bm.edges.layers.int.get(core.EDGE_HIDDEN_LAYER) is None
+        finally:
+            fallback_bm.free()
+
+        fallback = core._capture_bmesh_snapshot(bm, skip_vertex_edge_hides=True)
+        assert numpy.array_equal(fallback[4], numpy.zeros(len(bm.verts), dtype=bool))
+        assert numpy.array_equal(fallback[5], numpy.zeros(len(bm.edges), dtype=bool))
+        assert numpy.array_equal(
+            fallback[6],
+            numpy.asarray([bool(face.hide) for face in bm.faces], dtype=bool),
+        )
+        compatibility = core._capture_bmesh_snapshot(bm)
+        assert compatibility[4].any()
+        assert compatibility[5].any()
+    finally:
+        bm.free()
 
 
 def _assert_bulk_snapshot_matches_edit_bmesh(obj, bm):
@@ -3555,6 +3678,7 @@ def run():
     _check_rip_scoped_vertex_ids()
     _check_rip_resolution_free_lookup_equivalence()
     _check_capture_resolve_contract()
+    _check_rip_capture_omits_vertex_edge_hides()
     _check_bulk_edit_mesh_order_variants()
     _check_finish_scope_warning_matrix()
     _check_scoped_face_overlay_and_materialize()
