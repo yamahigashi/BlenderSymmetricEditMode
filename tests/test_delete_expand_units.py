@@ -15,7 +15,7 @@ import bpy
 PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
-from ydd_symmetric_edit import delete_dissolve, matching  # noqa: E402
+from ydd_symmetric_edit import delete_dissolve, element_pairs, matching  # noqa: E402
 
 _AXIS = 0
 _TOL = 1.0e-5
@@ -74,7 +74,7 @@ def check_symmetric_grid_domains() -> None:
 
     bm = _build_symmetric_grid()
     try:
-        maps = delete_dissolve.build_element_pair_maps(bm, _AXIS, _TOL)
+        maps = element_pairs.build_element_pair_maps(bm, _AXIS, _TOL)
 
         assert maps.vert_pairs[0] == 2
         assert maps.vert_pairs[2] == 0
@@ -84,7 +84,7 @@ def check_symmetric_grid_domains() -> None:
         # VERT: select left-bottom only → add right-bottom.
         _clear_select(bm)
         bm.verts[0].select = True
-        plan = delete_dissolve.plan_leading_domain_expansion(bm, maps, domains=("VERT",))
+        plan = element_pairs.plan_leading_domain_expansion(bm, maps, domains=("VERT",))
         assert set(plan.add_vert_indices) == {2}
         assert plan.add_edge_indices == ()
         assert plan.add_face_indices == ()
@@ -96,14 +96,14 @@ def check_symmetric_grid_domains() -> None:
         left_edge = _edge_between(bm, 0, 3)
         right_edge = _edge_between(bm, 2, 5)
         left_edge.select = True
-        plan = delete_dissolve.plan_leading_domain_expansion(bm, maps, domains=("EDGE",))
+        plan = element_pairs.plan_leading_domain_expansion(bm, maps, domains=("EDGE",))
         assert set(plan.add_edge_indices) == {right_edge.index}
         assert plan.unmatched_count == 0
 
         # FACE: select left face → add right face.
         _clear_select(bm)
         bm.faces[0].select = True
-        plan = delete_dissolve.plan_leading_domain_expansion(bm, maps, domains=("FACE",))
+        plan = element_pairs.plan_leading_domain_expansion(bm, maps, domains=("FACE",))
         assert set(plan.add_face_indices) == {1}
         assert maps.face_pair_by_index[0] == 1
         assert maps.face_pair_by_index[1] == 0
@@ -117,13 +117,13 @@ def check_on_plane_self_pairs() -> None:
 
     bm = _build_symmetric_grid()
     try:
-        maps = delete_dissolve.build_element_pair_maps(bm, _AXIS, _TOL)
+        maps = element_pairs.build_element_pair_maps(bm, _AXIS, _TOL)
 
         assert maps.vert_pairs[1] == 1
         assert maps.vert_pairs[4] == 4
         _clear_select(bm)
         bm.verts[1].select = True
-        plan = delete_dissolve.plan_leading_domain_expansion(bm, maps, domains=("VERT",))
+        plan = element_pairs.plan_leading_domain_expansion(bm, maps, domains=("VERT",))
         assert plan.add_vert_indices == ()
         assert plan.unmatched_count == 0
 
@@ -131,7 +131,7 @@ def check_on_plane_self_pairs() -> None:
         assert maps.edge_pair_by_index[center.index] == center.index
         _clear_select(bm)
         center.select = True
-        plan = delete_dissolve.plan_leading_domain_expansion(bm, maps, domains=("EDGE",))
+        plan = element_pairs.plan_leading_domain_expansion(bm, maps, domains=("EDGE",))
         assert plan.add_edge_indices == ()
         assert plan.unmatched_count == 0
     finally:
@@ -152,7 +152,7 @@ def check_unmatched_asymmetric_region() -> None:
         bm.verts.index_update()
         bm.edges.index_update()
 
-        maps = delete_dissolve.build_element_pair_maps(bm, _AXIS, _TOL)
+        maps = element_pairs.build_element_pair_maps(bm, _AXIS, _TOL)
         assert maps.vert_pairs[left.index] == right.index
         assert maps.vert_pairs[right.index] == left.index
         assert outlier.index not in maps.vert_pairs
@@ -160,7 +160,7 @@ def check_unmatched_asymmetric_region() -> None:
         _clear_select(bm)
         left.select = True
         outlier.select = True
-        plan = delete_dissolve.plan_leading_domain_expansion(bm, maps, domains=("VERT",))
+        plan = element_pairs.plan_leading_domain_expansion(bm, maps, domains=("VERT",))
         assert set(plan.add_vert_indices) == {right.index}
         assert plan.unmatched_count == 1
         assert plan.hidden_counterpart_count == 0
@@ -206,13 +206,13 @@ def check_duplicate_face_keys() -> None:
             bm.faces.index_update()
             assert len(bm.faces) == 4
 
-            maps = delete_dissolve.build_element_pair_maps(bm, _AXIS, _TOL)
+            maps = element_pairs.build_element_pair_maps(bm, _AXIS, _TOL)
             for face in bm.faces:
                 assert maps.face_pair_by_index[face.index] is None
 
             _clear_select(bm)
             bm.faces[0].select = True
-            plan = delete_dissolve.plan_leading_domain_expansion(bm, maps, domains=("FACE",))
+            plan = element_pairs.plan_leading_domain_expansion(bm, maps, domains=("FACE",))
             assert plan.add_face_indices == ()
             assert plan.unmatched_count == 1
         finally:
@@ -226,11 +226,11 @@ def check_hidden_counterpart() -> None:
 
     bm = _build_symmetric_grid()
     try:
-        maps = delete_dissolve.build_element_pair_maps(bm, _AXIS, _TOL)
+        maps = element_pairs.build_element_pair_maps(bm, _AXIS, _TOL)
         _clear_select(bm)
         bm.verts[0].select = True
         bm.verts[2].hide = True
-        plan = delete_dissolve.plan_leading_domain_expansion(bm, maps, domains=("VERT",))
+        plan = element_pairs.plan_leading_domain_expansion(bm, maps, domains=("VERT",))
         assert plan.add_vert_indices == ()
         assert plan.hidden_counterpart_count == 1
         assert plan.unmatched_count == 0
@@ -243,7 +243,7 @@ def check_edge_face_composite_domain() -> None:
 
     bm = _build_symmetric_grid()
     try:
-        maps = delete_dissolve.build_element_pair_maps(bm, _AXIS, _TOL)
+        maps = element_pairs.build_element_pair_maps(bm, _AXIS, _TOL)
         _clear_select(bm)
         left_edge = _edge_between(bm, 0, 3)
         right_edge = _edge_between(bm, 2, 5)
@@ -257,7 +257,7 @@ def check_edge_face_composite_domain() -> None:
         left_edge.select = True
         assert bm.faces[0].select
 
-        plan = delete_dissolve.plan_leading_domain_expansion(bm, maps, domains=("EDGE", "FACE"))
+        plan = element_pairs.plan_leading_domain_expansion(bm, maps, domains=("EDGE", "FACE"))
         assert set(plan.add_edge_indices) == {right_edge.index}
         assert set(plan.add_face_indices) == {1}
         assert plan.add_vert_indices == ()
@@ -271,16 +271,16 @@ def check_apply_expansion_plan_no_flush() -> None:
 
     bm = _build_symmetric_grid()
     try:
-        maps = delete_dissolve.build_element_pair_maps(bm, _AXIS, _TOL)
+        maps = element_pairs.build_element_pair_maps(bm, _AXIS, _TOL)
         _clear_select(bm)
         bm.verts[0].select = True
 
         edge_select_before = {edge.index: edge.select for edge in bm.edges}
         face_select_before = {face.index: face.select for face in bm.faces}
 
-        plan = delete_dissolve.plan_leading_domain_expansion(bm, maps, domains=("VERT",))
+        plan = element_pairs.plan_leading_domain_expansion(bm, maps, domains=("VERT",))
         assert set(plan.add_vert_indices) == {2}
-        delete_dissolve.apply_expansion_plan(bm, plan)
+        element_pairs.apply_expansion_plan(bm, plan)
 
         assert bm.verts[0].select
         assert bm.verts[2].select
@@ -297,11 +297,11 @@ def check_already_selected_counterpart() -> None:
 
     bm = _build_symmetric_grid()
     try:
-        maps = delete_dissolve.build_element_pair_maps(bm, _AXIS, _TOL)
+        maps = element_pairs.build_element_pair_maps(bm, _AXIS, _TOL)
         _clear_select(bm)
         bm.verts[0].select = True
         bm.verts[2].select = True
-        plan = delete_dissolve.plan_leading_domain_expansion(bm, maps, domains=("VERT",))
+        plan = element_pairs.plan_leading_domain_expansion(bm, maps, domains=("VERT",))
         assert plan.add_vert_indices == ()
         assert plan.unmatched_count == 0
         assert plan.hidden_counterpart_count == 0
@@ -311,13 +311,13 @@ def check_already_selected_counterpart() -> None:
         right_edge = _edge_between(bm, 2, 5)
         left_edge.select = True
         right_edge.select = True
-        plan = delete_dissolve.plan_leading_domain_expansion(bm, maps, domains=("EDGE",))
+        plan = element_pairs.plan_leading_domain_expansion(bm, maps, domains=("EDGE",))
         assert plan.add_edge_indices == ()
 
         _clear_select(bm)
         bm.faces[0].select = True
         bm.faces[1].select = True
-        plan = delete_dissolve.plan_leading_domain_expansion(bm, maps, domains=("FACE",))
+        plan = element_pairs.plan_leading_domain_expansion(bm, maps, domains=("FACE",))
         assert plan.add_face_indices == ()
     finally:
         bm.free()
@@ -328,7 +328,7 @@ def check_pair_map_involution() -> None:
 
     bm = _build_symmetric_grid()
     try:
-        maps = delete_dissolve.build_element_pair_maps(bm, _AXIS, _TOL)
+        maps = element_pairs.build_element_pair_maps(bm, _AXIS, _TOL)
         for index, partner in maps.edge_pair_by_index.items():
             if partner is None:
                 continue
@@ -348,12 +348,12 @@ def check_hidden_and_selected_counterpart() -> None:
 
     bm = _build_symmetric_grid()
     try:
-        maps = delete_dissolve.build_element_pair_maps(bm, _AXIS, _TOL)
+        maps = element_pairs.build_element_pair_maps(bm, _AXIS, _TOL)
         _clear_select(bm)
         bm.verts[0].select = True
         bm.verts[2].hide = True
         bm.verts[2].select = True
-        plan = delete_dissolve.plan_leading_domain_expansion(bm, maps, domains=("VERT",))
+        plan = element_pairs.plan_leading_domain_expansion(bm, maps, domains=("VERT",))
         assert plan.add_vert_indices == ()
         assert plan.hidden_counterpart_count == 1
         assert plan.unmatched_count == 0
@@ -363,7 +363,7 @@ def check_hidden_and_selected_counterpart() -> None:
 
 def _legacy_build_element_pair_maps(
     bm: bmesh.types.BMesh,
-) -> delete_dissolve.ElementPairMaps:
+) -> element_pairs.ElementPairMaps:
     """Pre-U-7 scalar oracle for edge/face pairing."""
 
     bm.verts.ensure_lookup_table()
@@ -406,7 +406,7 @@ def _legacy_build_element_pair_maps(
             if own_key in conflicted_keys or None in mapped or counterpart_key in conflicted_keys or not counterparts
             else counterparts[0]
         )
-    return delete_dissolve.ElementPairMaps(vert_pairs, edge_pairs, face_pairs)
+    return element_pairs.ElementPairMaps(vert_pairs, edge_pairs, face_pairs)
 
 
 def _legacy_quantize(co) -> tuple[float, float, float]:
@@ -445,7 +445,7 @@ def check_u7_census_and_pair_map_equivalence() -> None:
     bm = _build_symmetric_grid()
     try:
         legacy_before_maps = _legacy_build_element_pair_maps(bm)
-        actual_before_maps = delete_dissolve.build_element_pair_maps(bm, _AXIS, _TOL)
+        actual_before_maps = element_pairs.build_element_pair_maps(bm, _AXIS, _TOL)
         _assert_pair_maps_equal(actual_before_maps, legacy_before_maps)
         legacy_before = _legacy_symmetry_census(legacy_before_maps, bm)
         actual_before = delete_dissolve._symmetry_census(actual_before_maps, bm, _TOL)
@@ -455,14 +455,14 @@ def check_u7_census_and_pair_map_equivalence() -> None:
         bm.verts[0].hide = True
         bm.edges[0].hide = True
         bm.faces[0].hide = True
-        hidden_maps = delete_dissolve.build_element_pair_maps(bm, _AXIS, _TOL)
+        hidden_maps = element_pairs.build_element_pair_maps(bm, _AXIS, _TOL)
         _assert_pair_maps_equal(hidden_maps, legacy_before_maps)
         assert delete_dissolve._symmetry_census(hidden_maps, bm, _TOL) == legacy_before
 
         # One asymmetric point makes the global pre/post census comparison fail.
         bm.verts[0].co.x += 0.37
         legacy_after_maps = _legacy_build_element_pair_maps(bm)
-        actual_after_maps = delete_dissolve.build_element_pair_maps(bm, _AXIS, _TOL)
+        actual_after_maps = element_pairs.build_element_pair_maps(bm, _AXIS, _TOL)
         _assert_pair_maps_equal(actual_after_maps, legacy_after_maps)
         legacy_after = _legacy_symmetry_census(legacy_after_maps, bm)
         actual_after = delete_dissolve._symmetry_census(actual_after_maps, bm, _TOL)

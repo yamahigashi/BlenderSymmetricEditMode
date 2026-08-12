@@ -2079,7 +2079,7 @@ def _check_u6_registry_fallback():
 def _check_selection_snapshot_bulk_equivalence():
     """capture_selection_snapshot bulk and BMesh paths agree bit-for-bit."""
 
-    from ydd_symmetric_edit import delete_dissolve
+    from ydd_symmetric_edit import element_pairs
 
     bm = bmesh.new()
     try:
@@ -2154,8 +2154,8 @@ def _check_selection_snapshot_bulk_equivalence():
             assert right[0].select and right_face.select
 
             # build_element_pair_maps: vert/edge/face pair tables match.
-            maps_compat = delete_dissolve.build_element_pair_maps(bm, 0, TOLERANCE, mesh_object=None)
-            maps_bulk = delete_dissolve.build_element_pair_maps(bulk, 0, TOLERANCE, mesh_object=mesh_object)
+            maps_compat = element_pairs.build_element_pair_maps(bm, 0, TOLERANCE, mesh_object=None)
+            maps_bulk = element_pairs.build_element_pair_maps(bulk, 0, TOLERANCE, mesh_object=mesh_object)
             assert maps_compat.vert_pairs == maps_bulk.vert_pairs
             assert maps_compat.edge_pair_by_index == maps_bulk.edge_pair_by_index
             assert maps_compat.face_pair_by_index == maps_bulk.face_pair_by_index
@@ -3882,7 +3882,7 @@ def _check_partial_face_resolution_vertex_registry_fallback():
 def _check_u7_unselected_topology_bulk_capture():
     """U-7 topology arrays remain global when every selection column is empty."""
 
-    from ydd_symmetric_edit import delete_dissolve
+    from ydd_symmetric_edit import delete_dissolve, element_pairs
 
     bm = _build_deformed_grid(4)
     bulk = _clone_bmesh(bm)
@@ -3908,8 +3908,8 @@ def _check_u7_unselected_topology_bulk_capture():
         assert numpy.array_equal(captured.loop_totals, compatibility.loop_totals)
         assert len(captured.loop_starts) == len(bulk.faces)
 
-        maps_compat = delete_dissolve.build_element_pair_maps(bm, 0, TOLERANCE)
-        maps_bulk = delete_dissolve.build_element_pair_maps(
+        maps_compat = element_pairs.build_element_pair_maps(bm, 0, TOLERANCE)
+        maps_bulk = element_pairs.build_element_pair_maps(
             bulk,
             0,
             TOLERANCE,
