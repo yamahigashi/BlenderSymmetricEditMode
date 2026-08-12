@@ -2208,15 +2208,14 @@ def apply_reflected_path_topology(
     # Endpoint-tol store matches build_reflected_cutter so geometric duplicates
     # (different BMVert pairs within tol) count as already_present.  Keep it
     # lazy: the common native-topology case resolves every segment by BMEdge
-    # identity and never needs a full-mesh geometric index.  After target
-    # vertices have been resolved, the edge loop does not mutate topology
-    # before its first identity miss, so constructing the store at that
-    # boundary observes the same mesh as the eager path.
-    pending = [
-        record
-        for record in edge_records
-        if frozenset((record[0], record[1])) not in chain_edge_keys
-    ]
+    # identity and never needs a geometric index.  Freeze the complete target
+    # FaceId scope before processing; deferred/retry must not shrink it.  After
+    # target vertices have been resolved, the edge loop does not mutate
+    # topology before its first identity miss, so constructing the scoped store
+    # at that boundary observes the same mesh as the eager path.
+    initial_pending = [record for record in edge_records if frozenset((record[0], record[1])) not in chain_edge_keys]
+    scoped_target_ids = frozenset().union(*(record[2] for record in initial_pending))
+    pending = initial_pending
     while pending:
         deferred = []
         progress = False
@@ -2238,15 +2237,28 @@ def apply_reflected_path_topology(
 
             if existing_edges is None:
                 existing_edges = {}
-                for edge in bm.edges:
-                    if edge.is_valid:
-                        _register_edge_endpoint_pair(
-                            existing_edges,
-                            edge.verts[0].co,
-                            edge.verts[1].co,
-                            tolerance,
-                            face_ids={FaceId(int(face[face_layer])) for face in edge.link_faces},
-                        )
+                scoped_faces_by_id: dict[FaceId, list[bmesh.types.BMFace]] = defaultdict(list)
+                for face in bm.faces:
+                    if not face.is_valid:
+                        continue
+                    face_id = FaceId(int(face[face_layer]))
+                    if face_id in scoped_target_ids:
+                        scoped_faces_by_id[face_id].append(face)
+
+                seen_edges: set[bmesh.types.BMEdge] = set()
+                for scoped_faces in scoped_faces_by_id.values():
+                    for face in scoped_faces:
+                        for edge in face.edges:
+                            if not edge.is_valid or edge in seen_edges:
+                                continue
+                            seen_edges.add(edge)
+                            _register_edge_endpoint_pair(
+                                existing_edges,
+                                edge.verts[0].co,
+                                edge.verts[1].co,
+                                tolerance,
+                                face_ids={FaceId(int(face[face_layer])) for face in edge.link_faces},
+                            )
 
             endpoint_match = _match_edge_endpoint_pair_for_faces(
                 target_a.co,
@@ -2314,7 +2326,6 @@ def apply_reflected_path_topology(
 
     bm.normal_update()
     return created_edges, already_present, ""
-
 
 
 apply_reflected_loop_topology = apply_reflected_path_topology

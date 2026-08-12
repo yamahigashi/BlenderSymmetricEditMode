@@ -515,7 +515,7 @@ def check_reflected_path_lazy_existing_edge_store():
 
 
 def check_reflected_path_lazy_store_falls_back_after_identity_miss():
-    """A later geometric miss still uses the full store after prior hits."""
+    """A later geometric miss builds the store scoped to target-face edges."""
 
     bm = build_two_symmetric_quads()
     try:
@@ -566,7 +566,7 @@ def check_reflected_path_lazy_store_falls_back_after_identity_miss():
 
         # Materialize the later target endpoints without creating their edge.
         # This keeps the mixed call's lazy-store boundary free of endpoint
-        # splits, making the pre-call BMesh snapshot its exact bulk oracle.
+        # splits, making the pre-call BMesh snapshot its exact scoped oracle.
         target_vertices = []
         for y in (-1.0, 1.0):
             boundary = next(
@@ -585,6 +585,14 @@ def check_reflected_path_lazy_store_falls_back_after_identity_miss():
 
         face_layer = bm.faces.layers.int.get(core.FACE_ID_LAYER)
         assert face_layer is not None
+        # The store only registers edges linked to a face in the pending
+        # records' target-id union (the positive quad); registration order
+        # is non-normative.
+        scoped_ids = {
+            int(face[face_layer])
+            for face in bm.faces
+            if all(vertex.co.x > 0.0 for vertex in face.verts)
+        }
         expected_bulk = [
             (
                 tuple(float(component) for component in edge.verts[0].co),
@@ -592,7 +600,7 @@ def check_reflected_path_lazy_store_falls_back_after_identity_miss():
                 frozenset(int(face[face_layer]) for face in edge.link_faces),
             )
             for edge in bm.edges
-            if edge.is_valid
+            if edge.is_valid and any(int(face[face_layer]) in scoped_ids for face in edge.link_faces)
         ]
 
         registrations = []
@@ -621,7 +629,7 @@ def check_reflected_path_lazy_store_falls_back_after_identity_miss():
             stitch._register_edge_endpoint_pair = original_register
         assert mixed == (1, 1, "")
         assert len(registrations) == len(expected_bulk) + 1
-        assert registrations[: len(expected_bulk)] == expected_bulk
+        assert set(registrations[: len(expected_bulk)]) == set(expected_bulk)
         created_edge = bm.edges.get(target_vertices)
         assert created_edge is not None
         assert {registrations[-1][0], registrations[-1][1]} == {
