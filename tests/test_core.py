@@ -903,8 +903,8 @@ def run():
     hidden_bm.free()
 
     # A multi-click Knife can place an intentional waypoint inside a face.
-    # The boundary-only direct builder must decline it before editing so the
-    # production operator can retain Knife Project as a compatibility fallback.
+    # The direct builder realizes it as a face-interior chain, so the
+    # boundary preflight must accept it instead of declining to Knife Project.
     bend_bm = build_two_symmetric_quads()
     bend_topology = core.prepare_topology(
         bend_bm,
@@ -939,13 +939,22 @@ def run():
         "AUTO",
     )
     assert bend_side == "NEGATIVE" and bend_total == 2 and bend_crossing == 0
-    assert not core.reflected_path_uses_only_target_boundaries(
+    assert core.reflected_path_uses_only_target_boundaries(
         bend_bm,
         bend_source,
         core.AXIS_INDEX["X"],
         1.0e-5,
         bend_topology.mirror_face_ids,
     )
+    bend_created, bend_already, bend_reason = core.apply_reflected_path_topology(
+        bend_bm,
+        bend_source,
+        core.AXIS_INDEX["X"],
+        1.0e-5,
+        bend_topology.mirror_face_ids,
+    )
+    assert bend_reason == "", bend_reason
+    assert bend_created == 2, (bend_created, bend_already)
     bend_bm.free()
 
     # Existing target vertices are validation anchors, never snap targets.
