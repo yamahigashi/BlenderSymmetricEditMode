@@ -2463,7 +2463,10 @@ def _check_finish_scope_warning_matrix():
         setattr(operators.backup, "remove_backup", lambda _value: None)
         operators._SESSIONS[window_pointer] = session
         reports = []
-        fake_operator = SimpleNamespace(report=lambda level, message: reports.append((level, message)))
+        fake_operator = SimpleNamespace(
+            report=lambda level, message: reports.append((level, message)),
+            preserve_history_layers=False,
+        )
         try:
             result = operators.MESH_OT_ydd_symmetric_edit_finish.execute(fake_operator, bpy.context)
             assert result == {"FINISHED"}, label
@@ -2588,7 +2591,10 @@ def _check_finish_zero_match_decline():
         )
         operators._SESSIONS[window_pointer] = session
         reports = []
-        fake_operator = SimpleNamespace(report=lambda level, message: reports.append((level, message)))
+        fake_operator = SimpleNamespace(
+            report=lambda level, message: reports.append((level, message)),
+            preserve_history_layers=False,
+        )
         result = operators.MESH_OT_ydd_symmetric_edit_finish.execute(fake_operator, bpy.context)
         assert result == {"FINISHED"}
         assert reports == [
