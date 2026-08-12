@@ -33,7 +33,7 @@ PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
 import ydd_symmetric_edit as addon  # noqa: E402
-from ydd_symmetric_edit import core, keymaps, operators  # noqa: E402
+from ydd_symmetric_edit import keymaps, layer_names, operators  # noqa: E402
 
 CASES = ("EDGE", "VERT", "FACE", "NONE")
 PHASES = tuple((selection_case, enabled) for selection_case in CASES for enabled in (False, True))
@@ -273,12 +273,12 @@ def has_temporary_layers(obj):
     return any(
         layers.get(name) is not None
         for layers, name in (
-            (bm.edges.layers.int, core.EDGE_ORIGINAL_LAYER),
-            (bm.faces.layers.int, core.FACE_ID_LAYER),
-            (bm.faces.layers.int, core.HISTORY_TOKEN_LAYER),
-            (bm.verts.layers.int, core.VERT_SELECTION_LAYER),
-            (bm.edges.layers.int, core.EDGE_SELECTION_LAYER),
-            (bm.faces.layers.int, core.FACE_SELECTION_LAYER),
+            (bm.edges.layers.int, layer_names.EDGE_ORIGINAL_LAYER),
+            (bm.faces.layers.int, layer_names.FACE_ID_LAYER),
+            (bm.faces.layers.int, layer_names.HISTORY_TOKEN_LAYER),
+            (bm.verts.layers.int, layer_names.VERT_SELECTION_LAYER),
+            (bm.edges.layers.int, layer_names.EDGE_SELECTION_LAYER),
+            (bm.faces.layers.int, layer_names.FACE_SELECTION_LAYER),
         )
     )
 

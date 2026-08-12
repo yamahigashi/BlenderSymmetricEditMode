@@ -30,7 +30,7 @@ PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
 import ydd_symmetric_edit as addon  # noqa: E402
-from ydd_symmetric_edit import core, keymaps, operators  # noqa: E402
+from ydd_symmetric_edit import keymaps, layer_names, matching, operators  # noqa: E402
 
 CUT_X_COORDINATES = (-1.65, -1.30)
 STATE = {
@@ -150,14 +150,14 @@ def assert_completed_cuts(count):
 
 
 def assert_no_temporary_layers(bm):
-    assert bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER) is None
-    assert bm.faces.layers.int.get(core.FACE_ID_LAYER) is None
-    assert bm.verts.layers.int.get(core.VERT_SELECTION_LAYER) is None
-    assert bm.edges.layers.int.get(core.EDGE_SELECTION_LAYER) is None
-    assert bm.faces.layers.int.get(core.FACE_SELECTION_LAYER) is None
-    assert bm.verts.layers.int.get(core.VERT_HIDDEN_LAYER) is None
-    assert bm.edges.layers.int.get(core.EDGE_HIDDEN_LAYER) is None
-    assert bm.verts.layers.int.get(core.VERT_BACKUP_ID_LAYER) is None
+    assert bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER) is None
+    assert bm.faces.layers.int.get(layer_names.FACE_ID_LAYER) is None
+    assert bm.verts.layers.int.get(layer_names.VERT_SELECTION_LAYER) is None
+    assert bm.edges.layers.int.get(layer_names.EDGE_SELECTION_LAYER) is None
+    assert bm.faces.layers.int.get(layer_names.FACE_SELECTION_LAYER) is None
+    assert bm.verts.layers.int.get(layer_names.VERT_HIDDEN_LAYER) is None
+    assert bm.edges.layers.int.get(layer_names.EDGE_HIDDEN_LAYER) is None
+    assert bm.verts.layers.int.get(layer_names.VERT_BACKUP_ID_LAYER) is None
 
 
 def finish_test():
@@ -297,7 +297,7 @@ def start_test():
             bpy.ops.object.mode_set(mode="EDIT")
             bpy.context.tool_settings.mesh_select_mode = (True, False, False)
 
-        assert core.enabled_mesh_symmetry_axes(obj) == (("X", 0),)
+        assert matching.enabled_mesh_symmetry_axes(obj) == (("X", 0),)
         STATE.update(window=window, area=area, region=region, object=obj)
         bpy.app.timers.register(begin_cut, first_interval=0.25)
     except BaseException:

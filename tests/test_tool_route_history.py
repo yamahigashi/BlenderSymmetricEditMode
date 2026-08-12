@@ -37,7 +37,7 @@ PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
 import ydd_symmetric_edit as addon  # noqa: E402
-from ydd_symmetric_edit import core, keymaps, operators  # noqa: E402
+from ydd_symmetric_edit import keymaps, layer_names, matching, operators, snapshot  # noqa: E402
 
 OBJECT_NAME = "YSE_ToolRouteHistoryObject"
 MESH_NAME = "YSE_ToolRouteHistoryMesh"
@@ -112,7 +112,7 @@ def temporary_layer_names():
         bm.edges.layers.int,
         bm.faces.layers.int,
     )
-    return tuple(name for name in core.TEMP_LAYER_NAMES if any(layers.get(name) is not None for layers in layer_groups))
+    return tuple(name for name in layer_names.TEMP_LAYER_NAMES if any(layers.get(name) is not None for layers in layer_groups))
 
 
 def fail(message=""):
@@ -386,10 +386,10 @@ def make_history_marker_object(name, token):
         [(0, 1, 2)],
     )
     mesh.update()
-    edge_marker = mesh.attributes.new(core.EDGE_ORIGINAL_LAYER, "INT", "EDGE")
+    edge_marker = mesh.attributes.new(layer_names.EDGE_ORIGINAL_LAYER, "INT", "EDGE")
     for item in edge_marker.data:
         item.value = 1
-    history_marker = mesh.attributes.new(core.HISTORY_TOKEN_LAYER, "INT", "FACE")
+    history_marker = mesh.attributes.new(layer_names.HISTORY_TOKEN_LAYER, "INT", "FACE")
     for item in history_marker.data:
         item.value = token
     obj = bpy.data.objects.new(name, mesh)
@@ -420,11 +420,11 @@ def assert_running_session_markers_survive_ambiguous_repair():
 
     try:
         assert operators._repair_history_state() is None
-        assert token_owned_mesh.attributes.get(core.HISTORY_TOKEN_LAYER) is not None
-        assert mesh_owned_mesh.attributes.get(core.HISTORY_TOKEN_LAYER) is not None
+        assert token_owned_mesh.attributes.get(layer_names.HISTORY_TOKEN_LAYER) is not None
+        assert mesh_owned_mesh.attributes.get(layer_names.HISTORY_TOKEN_LAYER) is not None
     finally:
         operators.cleanup_session(session.window_pointer)
-        core.remove_temporary_mesh_attributes(token_owned_mesh)
+        snapshot.remove_temporary_mesh_attributes(token_owned_mesh)
         for obj in (token_owned_obj, mesh_owned_obj):
             bpy.data.objects.remove(obj, do_unlink=True)
         for mesh in (token_owned_mesh, mesh_owned_mesh):
@@ -553,7 +553,7 @@ def start_test():
             assert tool_result == {"FINISHED"}, tool_result
             bpy.ops.ed.undo_push(message="YSE Tool Route History baseline")
 
-        assert core.enabled_mesh_symmetry_axes(obj) == (("X", 0),)
+        assert matching.enabled_mesh_symmetry_axes(obj) == (("X", 0),)
         assert keymaps._ENABLED
         STATE["deadline"] = time.monotonic() + 5.0
         bpy.app.timers.register(wait_for_toolbar_route, first_interval=0.05)

@@ -16,7 +16,8 @@ import numpy  # type: ignore
 from bpy.props import EnumProperty, FloatProperty
 from mathutils import Vector
 
-from . import backup, core
+from . import backup, layer_names, matching, selection, stitch
+from . import snapshot as snapshot_module
 from ._types import MirrorOverlap
 from .snapshot import capture_selection_snapshot
 
@@ -58,7 +59,7 @@ def classify_mirror_selection(
 ) -> MirrorSelection:
     """Classify selected coordinates and resolve every available counterpart."""
 
-    classification = core.classify_selection_overlap(
+    classification = matching.classify_selection_overlap(
         coords,
         selected_indices,
         axis_index=axis_index,
@@ -208,7 +209,7 @@ def _symmetry_parameters(context) -> tuple[bpy.types.Object, int, float] | None:
     # would double-apply to the others.  Same rule as _single_edit_mesh_poll.
     if len(context.objects_in_mode_unique_data) != 1:
         return None
-    axes = core.enabled_mesh_symmetry_axes(obj)
+    axes = matching.enabled_mesh_symmetry_axes(obj)
     if len(axes) != 1:
         return None
     _axis_name, axis_index = axes[0]
@@ -237,7 +238,7 @@ def _set_vertex_path(
     selected_coords = path_coords if selected_coords is None else selected_coords
     bm.verts.ensure_lookup_table()
     coords = tuple(vertex.co.copy() for vertex in bm.verts)
-    lookup = core.build_vertex_mirror_lookup(coords, axis_index, tolerance)
+    lookup = matching.build_vertex_mirror_lookup(coords, axis_index, tolerance)
 
     # Deduplicate exact query positions first: the injective batch resolver
     # would otherwise see two queries competing for one vertex and reject both.
@@ -300,7 +301,7 @@ def _maybe_extend_selection_to_mirror(mesh, axis_index: int, tolerance: float, *
         if settings is None or not bool(getattr(settings, "select_mirrored", False)):
             return
         bm = bmesh.from_edit_mesh(mesh)
-        core.extend_selection_to_mirror(bm, axis_index, tolerance, mesh_object=mesh_object)
+        selection.extend_selection_to_mirror(bm, axis_index, tolerance, mesh_object=mesh_object)
         bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
     except Exception:
         traceback.print_exc()
@@ -364,8 +365,8 @@ def _remove_connect_markers(bm: bmesh.types.BMesh) -> None:
     """Remove only the two Connect marker layers (EDGE_ORIGINAL / FACE_ID)."""
 
     for layers, name in (
-        (bm.edges.layers.int, core.EDGE_ORIGINAL_LAYER),
-        (bm.faces.layers.int, core.FACE_ID_LAYER),
+        (bm.edges.layers.int, layer_names.EDGE_ORIGINAL_LAYER),
+        (bm.faces.layers.int, layer_names.FACE_ID_LAYER),
     ):
         layer = layers.get(name)
         if layer is not None:
@@ -388,8 +389,8 @@ def _prepare_connect_markers(bm: bmesh.types.BMesh) -> None:
     """
 
     try:
-        edge_layer = _ensure_int_layer(bm.edges.layers.int, core.EDGE_ORIGINAL_LAYER)
-        face_layer = _ensure_int_layer(bm.faces.layers.int, core.FACE_ID_LAYER)
+        edge_layer = _ensure_int_layer(bm.edges.layers.int, layer_names.EDGE_ORIGINAL_LAYER)
+        face_layer = _ensure_int_layer(bm.faces.layers.int, layer_names.FACE_ID_LAYER)
         for edge_id, edge in enumerate(bm.edges, start=1):
             edge[edge_layer] = edge_id
         for face_id, face in enumerate(bm.faces, start=1):
@@ -405,8 +406,8 @@ def _prepare_connect_markers(bm: bmesh.types.BMesh) -> None:
 def _remark_connect_markers(bm: bmesh.types.BMesh) -> None:
     """Re-stamp every current edge/face so the next native call's novelty is clean."""
 
-    edge_layer = _ensure_int_layer(bm.edges.layers.int, core.EDGE_ORIGINAL_LAYER)
-    face_layer = _ensure_int_layer(bm.faces.layers.int, core.FACE_ID_LAYER)
+    edge_layer = _ensure_int_layer(bm.edges.layers.int, layer_names.EDGE_ORIGINAL_LAYER)
+    face_layer = _ensure_int_layer(bm.faces.layers.int, layer_names.FACE_ID_LAYER)
     for edge_id, edge in enumerate(bm.edges, start=1):
         edge[edge_layer] = edge_id
     for face_id, face in enumerate(bm.faces, start=1):
@@ -457,8 +458,8 @@ def _extract_connect_effect_edges(bm: bmesh.types.BMesh) -> tuple[_ConnectEffect
     pre-existing edges keep a non-zero parent tag and are excluded.
     """
 
-    path_edges = core._discover_path_edges(bm, selected_only=False)
-    face_layer = bm.faces.layers.int.get(core.FACE_ID_LAYER)
+    path_edges = stitch._discover_path_edges(bm, selected_only=False)
+    face_layer = bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
     records: list[_ConnectEffectEdge] = []
     for edge in path_edges:
         if face_layer is None:
@@ -492,8 +493,8 @@ def _edge_coords_match(
     tolerance: float,
 ) -> bool:
     return (
-        core.coordinates_match(first_a, second_a, tolerance) and core.coordinates_match(first_b, second_b, tolerance)
-    ) or (core.coordinates_match(first_a, second_b, tolerance) and core.coordinates_match(first_b, second_a, tolerance))
+        matching.coordinates_match(first_a, second_a, tolerance) and matching.coordinates_match(first_b, second_b, tolerance)
+    ) or (matching.coordinates_match(first_a, second_b, tolerance) and matching.coordinates_match(first_b, second_a, tolerance))
 
 
 def _quantize_co_key(co: Vector, tolerance: float) -> tuple[float, float, float]:
@@ -512,7 +513,7 @@ def _build_face_id_pairs(
 ) -> dict[int, int] | None:
     """Pre-state FACE_ID → mirror FACE_ID (involutive). ``None`` if incomplete."""
 
-    face_layer = bm.faces.layers.int.get(core.FACE_ID_LAYER)
+    face_layer = bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
     if face_layer is None:
         return {}
     by_key: dict[frozenset[tuple[float, float, float]], list[int]] = {}
@@ -530,7 +531,7 @@ def _build_face_id_pairs(
             continue
         key = face_keys[face_id]
         mirrored_key = frozenset(
-            _quantize_co_key(core.mirror_coordinate(Vector(co), axis_index), tolerance) for co in key
+            _quantize_co_key(matching.mirror_coordinate(Vector(co), axis_index), tolerance) for co in key
         )
         candidates = by_key.get(mirrored_key, [])
         if not candidates:
@@ -590,8 +591,8 @@ def _connect_effect_is_self_mirrored(
         unmatched.remove(index)
         record = r_edges[index]
         co_a, co_b = record.endpoint_vectors()
-        mirrored_a = core.mirror_coordinate(co_a, axis_index)
-        mirrored_b = core.mirror_coordinate(co_b, axis_index)
+        mirrored_a = matching.mirror_coordinate(co_a, axis_index)
+        mirrored_b = matching.mirror_coordinate(co_b, axis_index)
         mapped_faces: list[int] = []
         for face_id in record.face_ids:
             partner_face = face_id_pairs.get(face_id)
@@ -626,7 +627,7 @@ def _find_vert_at(
     tolerance: float,
 ) -> bmesh.types.BMVert | None:
     for vertex in bm.verts:
-        if core.coordinates_match(vertex.co, coordinate, tolerance):
+        if matching.coordinates_match(vertex.co, coordinate, tolerance):
             return vertex
     return None
 
@@ -650,7 +651,7 @@ def _point_on_segment_and_plane(
     delta = endpoint_b - endpoint_a
     length_squared = float(delta.length_squared)
     if length_squared <= 1.0e-30:
-        return core.coordinates_match(point, endpoint_a, tolerance)
+        return matching.coordinates_match(point, endpoint_a, tolerance)
     factor = (point - endpoint_a).dot(delta) / length_squared
     if factor < -1.0e-9 or factor > 1.0 + 1.0e-9:
         return False
@@ -669,7 +670,7 @@ def _is_new_vertex(
     pre_coords: Sequence[Vector],
     tolerance: float,
 ) -> bool:
-    return all(not core.coordinates_match(coordinate, previous, tolerance) for previous in pre_coords)
+    return all(not matching.coordinates_match(coordinate, previous, tolerance) for previous in pre_coords)
 
 
 def _match_edge_in_pool(
@@ -707,15 +708,15 @@ def _match_p_stitch_in_pool(
                     (second[0], second[1]),
                     (second[1], second[0]),
                 ):
-                    if not core.coordinates_match(p_candidate, p_other, tolerance):
+                    if not matching.coordinates_match(p_candidate, p_other, tolerance):
                         continue
                     p = p_candidate
                     ab_match = (
-                        core.coordinates_match(other_first, co_a, tolerance)
-                        and core.coordinates_match(other_second, co_b, tolerance)
+                        matching.coordinates_match(other_first, co_a, tolerance)
+                        and matching.coordinates_match(other_second, co_b, tolerance)
                     ) or (
-                        core.coordinates_match(other_first, co_b, tolerance)
-                        and core.coordinates_match(other_second, co_a, tolerance)
+                        matching.coordinates_match(other_first, co_b, tolerance)
+                        and matching.coordinates_match(other_second, co_a, tolerance)
                     )
                     if not ab_match:
                         continue
@@ -786,9 +787,9 @@ def _verify_connect_mirror_effect(
     pool: list[tuple[Vector, Vector]] = list(r_prime)
 
     for co_a, co_b in r_edges:
-        mirrored_a = core.mirror_coordinate(co_a, axis_index)
-        mirrored_b = core.mirror_coordinate(co_b, axis_index)
-        if core.coordinates_match(co_a, mirrored_b, tolerance) and core.coordinates_match(
+        mirrored_a = matching.mirror_coordinate(co_a, axis_index)
+        mirrored_b = matching.mirror_coordinate(co_b, axis_index)
+        if matching.coordinates_match(co_a, mirrored_b, tolerance) and matching.coordinates_match(
             co_b,
             mirrored_a,
             tolerance,
@@ -1029,7 +1030,7 @@ class MESH_OT_ydd_symmetric_edit_connect(bpy.types.Operator):
             try:
                 bm = bmesh.from_edit_mesh(mesh)
                 # Backup ID layer + Connect markers; best-effort on every path.
-                core.remove_temporary_layers(bm)
+                snapshot_module.remove_temporary_layers(bm)
                 bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
             except Exception:
                 traceback.print_exc()
@@ -1259,10 +1260,10 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
         # old member position.  The survivor of a native
         # merge inherits its member's marker.  Layer creation invalidates
         # wrappers, hence the fresh lookup table.
-        group_layer = bm.verts.layers.int.get(core.VERT_MERGE_GROUP_LAYER)
+        group_layer = bm.verts.layers.int.get(layer_names.VERT_MERGE_GROUP_LAYER)
         if group_layer is not None:
             bm.verts.layers.int.remove(group_layer)
-        group_layer = bm.verts.layers.int.new(core.VERT_MERGE_GROUP_LAYER)
+        group_layer = bm.verts.layers.int.new(layer_names.VERT_MERGE_GROUP_LAYER)
         bm.verts.ensure_lookup_table()
         for cluster_number, cluster in enumerate(clusters, start=1):
             for index in cluster:
@@ -1277,7 +1278,7 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
         if "FINISHED" not in result:
             try:
                 bm = bmesh.from_edit_mesh(mesh)
-                core.remove_temporary_layers(bm)
+                snapshot_module.remove_temporary_layers(bm)
                 bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
             except Exception:
                 traceback.print_exc()
@@ -1294,7 +1295,7 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
             backup_mesh = backup.create_topology_backup(bm)
             try:
                 bm = bmesh.from_edit_mesh(mesh)
-                group_layer = bm.verts.layers.int.get(core.VERT_MERGE_GROUP_LAYER)
+                group_layer = bm.verts.layers.int.get(layer_names.VERT_MERGE_GROUP_LAYER)
                 if group_layer is None:
                     raise RuntimeError("the merge group markers were lost during the native merge")
                 member_survivors: dict[int, list[bmesh.types.BMVert]] = {}
@@ -1354,7 +1355,7 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
                         mirrors.append(survivor)
                         merge_co = target
                     else:
-                        merge_co = core.mirror_coordinate(target, axis_index)
+                        merge_co = matching.mirror_coordinate(target, axis_index)
                     unique_verts = list(dict.fromkeys(vertex for vertex in mirrors if vertex.is_valid))
                     bmesh.ops.pointmerge(bm, verts=unique_verts, merge_co=merge_co)
 
@@ -1371,7 +1372,7 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
         finally:
             try:
                 bm = bmesh.from_edit_mesh(mesh)
-                core.remove_temporary_layers(bm)
+                snapshot_module.remove_temporary_layers(bm)
                 bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
             except Exception:
                 traceback.print_exc()
@@ -1497,10 +1498,10 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
         # coincident vertices.  On-plane verts stay unmarked
         # (not part of either side merge).  Layer creation invalidates
         # wrappers, hence the fresh lookup table.
-        group_layer = bm.verts.layers.int.get(core.VERT_MERGE_GROUP_LAYER)
+        group_layer = bm.verts.layers.int.get(layer_names.VERT_MERGE_GROUP_LAYER)
         if group_layer is not None:
             bm.verts.layers.int.remove(group_layer)
-        group_layer = bm.verts.layers.int.new(core.VERT_MERGE_GROUP_LAYER)
+        group_layer = bm.verts.layers.int.new(layer_names.VERT_MERGE_GROUP_LAYER)
         bm.verts.ensure_lookup_table()
         for index in sorted(source_side):
             bm.verts[index][group_layer] = 1
@@ -1525,14 +1526,14 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
             self._restore_selection_state(bm, mesh, snapshot.selected, extended_selection, history_indices)
             try:
                 bm = bmesh.from_edit_mesh(mesh)
-                core.remove_temporary_layers(bm)
+                snapshot_module.remove_temporary_layers(bm)
                 bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
             except Exception:
                 traceback.print_exc()
             return result
 
         # Step 5-7: mirror-side deterministic merge inside the transaction.
-        merge_co = core.mirror_coordinate(target_co, axis_index)
+        merge_co = matching.mirror_coordinate(target_co, axis_index)
         backup_mesh = None
         mirror_warning = None
         mirror_committed = False
@@ -1545,7 +1546,7 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
                 # through the group markers (the source survivor inherits its
                 # member's marker).
                 bm = bmesh.from_edit_mesh(mesh)
-                group_layer = bm.verts.layers.int.get(core.VERT_MERGE_GROUP_LAYER)
+                group_layer = bm.verts.layers.int.get(layer_names.VERT_MERGE_GROUP_LAYER)
                 if group_layer is None:
                     raise RuntimeError("the merge group markers were lost during the native merge")
                 source_survivors = []
@@ -1596,7 +1597,7 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
                 self._reselect_side_split_groups(mesh)
             try:
                 bm = bmesh.from_edit_mesh(mesh)
-                core.remove_temporary_layers(bm)
+                snapshot_module.remove_temporary_layers(bm)
                 bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
             except Exception:
                 traceback.print_exc()
@@ -1625,7 +1626,7 @@ class MESH_OT_ydd_symmetric_edit_merge(bpy.types.Operator):
 
         try:
             bm = bmesh.from_edit_mesh(mesh)
-            group_layer = bm.verts.layers.int.get(core.VERT_MERGE_GROUP_LAYER)
+            group_layer = bm.verts.layers.int.get(layer_names.VERT_MERGE_GROUP_LAYER)
             if group_layer is None:
                 return
             survivor = None

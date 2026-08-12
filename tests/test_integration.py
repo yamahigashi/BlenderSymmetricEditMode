@@ -18,7 +18,7 @@ PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
 import ydd_symmetric_edit as addon  # noqa: E402
-from ydd_symmetric_edit import core, operators  # noqa: E402
+from ydd_symmetric_edit import layer_names, operators, stitch  # noqa: E402
 
 
 def viewport_context():
@@ -172,8 +172,8 @@ def run_test():
     assert len(bm.edges) == 14, len(bm.edges)
     assert len(bm.faces) == 4, len(bm.faces)
     assert has_exact_edge(bm, (1.5, -1.0, 0.0), (1.5, 1.0, 0.0))
-    assert bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER) is None
-    assert bm.faces.layers.int.get(core.FACE_ID_LAYER) is None
+    assert bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER) is None
+    assert bm.faces.layers.int.get(layer_names.FACE_ID_LAYER) is None
     assert all(face.hide for face in bm.faces if face.calc_center_median().x > 0.0)
     assert all(edge.hide for edge in bm.edges if all(vertex.co.x > 0.0 for vertex in edge.verts))
     assert all(vertex.hide for vertex in bm.verts if vertex.co.x > 0.0)
@@ -211,14 +211,14 @@ def run_test():
         simulate_source_bent_knife(bent_obj)
         bent_bm = bmesh.from_edit_mesh(bent_obj.data)
         bent_session = next(iter(operators._SESSIONS.values()))
-        bent_source, _side, _total, _crossing = core.collect_source_path_edges(
+        bent_source, _side, _total, _crossing = stitch.collect_source_path_edges(
             bent_bm,
             bent_session.axis_index,
             bent_session.tolerance,
             bent_session.source_side,
         )
         assert len(bent_source) == 2
-        assert not core.reflected_path_uses_only_target_boundaries(
+        assert not stitch.reflected_path_uses_only_target_boundaries(
             bent_bm,
             bent_source,
             bent_session.axis_index,
@@ -236,8 +236,8 @@ def run_test():
     )
     assert has_exact_edge(bent_bm, (1.5, -1.0, 0.0), (1.2, 0.0, 0.0))
     assert has_exact_edge(bent_bm, (1.2, 0.0, 0.0), (1.5, 1.0, 0.0))
-    assert bent_bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER) is None
-    assert bent_bm.faces.layers.int.get(core.FACE_ID_LAYER) is None
+    assert bent_bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER) is None
+    assert bent_bm.faces.layers.int.get(layer_names.FACE_ID_LAYER) is None
     assert not any(obj.name.startswith("YSE_TemporaryCutter") for obj in bpy.data.objects)
 
     print("YSE_INTEGRATION_TEST_OK", flush=True)

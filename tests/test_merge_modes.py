@@ -50,7 +50,7 @@ sys.path.insert(0, str(PACKAGE_PARENT))
 
 import ydd_symmetric_edit as addon  # noqa: E402
 from ydd_symmetric_edit import backup as yse_backup  # noqa: E402
-from ydd_symmetric_edit import core as yse_core  # noqa: E402
+from ydd_symmetric_edit import layer_names  # noqa: E402
 from ydd_symmetric_edit import replay as yse_replay  # noqa: E402
 
 MARKER_OK = "YSE_MERGE_MODES_TEST_OK"
@@ -716,7 +716,7 @@ def run_last_onplane_mixed_case(window, area, region) -> None:
 
 
 def assert_no_temp_layers(bm) -> None:
-    for name in yse_core.TEMP_LAYER_NAMES:
+    for name in layer_names.TEMP_LAYER_NAMES:
         assert bm.verts.layers.int.get(name) is None, f"vertex layer leaked: {name}"
         assert bm.edges.layers.int.get(name) is None, f"edge layer leaked: {name}"
         assert bm.faces.layers.int.get(name) is None, f"face layer leaked: {name}"
@@ -978,7 +978,7 @@ def run_d4_partial_and_untouched_case(window, area, region) -> None:
         assert obj_local is not None
         mesh_local = obj_local.data
         bm_local = bmesh.from_edit_mesh(mesh_local)
-        group_layer = bm_local.verts.layers.int.get(yse_core.VERT_MERGE_GROUP_LAYER)
+        group_layer = bm_local.verts.layers.int.get(layer_names.VERT_MERGE_GROUP_LAYER)
         assert group_layer is not None, "group markers must exist before native"
         marked = [vertex for vertex in bm_local.verts if int(vertex[group_layer]) > 0]
         assert len(marked) >= 3, [coordinate_key(v.co) for v in marked]

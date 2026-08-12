@@ -38,7 +38,7 @@ PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
 import ydd_symmetric_edit as addon  # noqa: E402
-from ydd_symmetric_edit import core, keymaps, operators  # noqa: E402
+from ydd_symmetric_edit import keymaps, layer_names, matching, operators  # noqa: E402
 
 OBJECT_NAME = "YSE_SelectMirroredGuiObject"
 MESH_NAME = "YSE_SelectMirroredGuiMesh"
@@ -98,7 +98,7 @@ def temporary_layer_names():
         bm.edges.layers.int,
         bm.faces.layers.int,
     )
-    return tuple(name for name in core.TEMP_LAYER_NAMES if any(layers.get(name) is not None for layers in layer_groups))
+    return tuple(name for name in layer_names.TEMP_LAYER_NAMES if any(layers.get(name) is not None for layers in layer_groups))
 
 
 def fail(message=""):
@@ -333,7 +333,7 @@ def setup_scene_and_edit():
         result = bpy.ops.wm.tool_set_by_id(name="builtin.select_box")
         assert result == {"FINISHED"}, result
         bpy.ops.ed.undo_push(message="YSE Select Mirrored GUI baseline")
-    assert core.enabled_mesh_symmetry_axes(obj) == (("X", 0),)
+    assert matching.enabled_mesh_symmetry_axes(obj) == (("X", 0),)
     return assert_baseline_topology()
 
 

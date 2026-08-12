@@ -35,7 +35,7 @@ PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
 import ydd_symmetric_edit as addon  # noqa: E402
-from ydd_symmetric_edit import core, keymaps, operators  # noqa: E402
+from ydd_symmetric_edit import keymaps, layer_names, matching, operators, snapshot  # noqa: E402
 
 OBJECT_NAME = "YSE_LoopCutRouteHistoryObject"
 MESH_NAME = "YSE_LoopCutRouteHistoryMesh"
@@ -94,7 +94,7 @@ def temporary_layer_names():
         bm.edges.layers.int,
         bm.faces.layers.int,
     )
-    return tuple(name for name in core.TEMP_LAYER_NAMES if any(layers.get(name) is not None for layers in layer_groups))
+    return tuple(name for name in layer_names.TEMP_LAYER_NAMES if any(layers.get(name) is not None for layers in layer_groups))
 
 
 def fail(message=""):
@@ -281,7 +281,7 @@ def assert_plain_undo_snapshot_is_not_treated_as_f9(committed):
     assert snapshot_token != latest_record.session.history_token
 
     bm = bmesh.from_edit_mesh(obj.data)
-    token_layer = bm.faces.layers.int.new(core.HISTORY_TOKEN_LAYER)
+    token_layer = bm.faces.layers.int.new(layer_names.HISTORY_TOKEN_LAYER)
     for face in bm.faces:
         face[token_layer] = snapshot_token
     bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
@@ -294,7 +294,7 @@ def assert_plain_undo_snapshot_is_not_treated_as_f9(committed):
     finally:
         operators.cleanup_session(STATE["window"].as_pointer())
         bm = bmesh.from_edit_mesh(obj.data)
-        core.remove_temporary_layers(bm)
+        snapshot.remove_temporary_layers(bm)
         bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
 
 
@@ -623,7 +623,7 @@ def start_test():
             assert result == {"FINISHED"}, result
             bpy.ops.ed.undo_push(message="YSE Loop Cut Route History baseline")
 
-        assert core.enabled_mesh_symmetry_axes(obj) == (("X", 0),)
+        assert matching.enabled_mesh_symmetry_axes(obj) == (("X", 0),)
         STATE["deadline"] = time.monotonic() + 5.0
         bpy.app.timers.register(wait_for_route, first_interval=0.05)
     except BaseException:

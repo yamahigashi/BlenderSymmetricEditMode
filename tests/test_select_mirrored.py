@@ -29,24 +29,22 @@ from __future__ import annotations
 
 import sys
 import traceback
-from collections import Counter
 from pathlib import Path
 
 import bmesh
 import bpy
-from mathutils import Vector
 
 PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
 import ydd_symmetric_edit as addon  # noqa: E402
-from ydd_symmetric_edit import core  # noqa: E402
+from ydd_symmetric_edit import layer_names, matching, selection, snapshot, stitch  # noqa: E402
 
 MARKER_OK = "YSE_SELECT_MIRRORED_OK"
 MARKER_FAILED = "YSE_SELECT_MIRRORED_FAILED"
 COORD_PRECISION = 5
 TOLERANCE = 1.0e-5
-AXIS = core.AXIS_INDEX["X"]
+AXIS = matching.AXIS_INDEX["X"]
 
 
 def fail(message: str = "") -> None:
@@ -179,7 +177,7 @@ def check_extend_selection_verts_edges_faces_and_history() -> None:
         bm.select_history.add(v_pos_b)
         history_before = history_vert_keys(bm)
 
-        added = core.extend_selection_to_mirror(bm, AXIS, TOLERANCE)
+        added = selection.extend_selection_to_mirror(bm, AXIS, TOLERANCE)
         assert added >= 3, f"expected verts+edge(+face) adds, got {added}"
         assert v_neg_a.select and v_neg_b.select
         assert e_neg.select
@@ -197,7 +195,7 @@ def check_extend_selection_verts_edges_faces_and_history() -> None:
         bm.select_history.clear()
         bm.select_history.add(v_plane)
         history_plane = history_vert_keys(bm)
-        added_plane = core.extend_selection_to_mirror(bm, AXIS, TOLERANCE)
+        added_plane = selection.extend_selection_to_mirror(bm, AXIS, TOLERANCE)
         assert added_plane == 0, added_plane
         assert history_vert_keys(bm) == history_plane
         # Re-run the full selection for idempotence of the primary case.
@@ -206,8 +204,8 @@ def check_extend_selection_verts_edges_faces_and_history() -> None:
         v_pos_b.select = True
         e_pos.select = True
         f_right.select = True
-        core.extend_selection_to_mirror(bm, AXIS, TOLERANCE)
-        added_again = core.extend_selection_to_mirror(bm, AXIS, TOLERANCE)
+        selection.extend_selection_to_mirror(bm, AXIS, TOLERANCE)
+        added_again = selection.extend_selection_to_mirror(bm, AXIS, TOLERANCE)
         assert added_again == 0, added_again
     finally:
         bm.free()
@@ -220,10 +218,10 @@ def check_loop_cut_on_off_selection() -> None:
     bm_on = build_two_symmetric_quads_bm()
     try:
         for bm, do_extend in ((bm_off, False), (bm_on, True)):
-            topology = core.prepare_topology(bm, AXIS, TOLERANCE)
+            topology = snapshot.prepare_topology(bm, AXIS, TOLERANCE)
             path_edge = split_left_mid_loop(bm)
             assert path_edge is not None
-            created, already, reason = core.apply_reflected_path_topology(
+            created, already, reason = stitch.apply_reflected_path_topology(
                 bm,
                 [path_edge],
                 AXIS,
@@ -236,7 +234,7 @@ def check_loop_cut_on_off_selection() -> None:
             for vertex in path_edge.verts:
                 vertex.select = True
             if do_extend:
-                core.extend_selection_to_mirror(bm, AXIS, TOLERANCE)
+                selection.extend_selection_to_mirror(bm, AXIS, TOLERANCE)
 
         off_edges = selected_edge_keys(bm_off)
         on_edges = selected_edge_keys(bm_on)
@@ -268,7 +266,7 @@ def check_asymmetric_skip() -> None:
         bm.select_history.add(v_lone)
         history_before = history_vert_keys(bm)
 
-        added = core.extend_selection_to_mirror(bm, AXIS, TOLERANCE)
+        added = selection.extend_selection_to_mirror(bm, AXIS, TOLERANCE)
         assert added == 1, added
         assert v_neg.select
         assert v_pos.select and v_lone.select
@@ -501,7 +499,7 @@ def check_undo_same_operator_step() -> None:
     assert "undo_push" not in connect_src
     assert "undo_push" not in merge_src
 
-    extend_src = inspect.getsource(core.extend_selection_to_mirror)
+    extend_src = inspect.getsource(selection.extend_selection_to_mirror)
     assert "undo_push" not in extend_src
 
     finish_src = inspect.getsource(yse_ops.MESH_OT_ydd_symmetric_edit_finish.execute)
@@ -570,7 +568,6 @@ def check_disjoint_merge_cluster_decline_no_extend() -> None:
     Geometry / mock pattern matches tests/test_merge_modes.py D4 (c2).
     """
 
-    from ydd_symmetric_edit import core as yse_core
     from ydd_symmetric_edit import replay as yse_replay
 
     partial_warning = "native merged this cluster only partially; its mirror was skipped"
@@ -637,7 +634,7 @@ def check_disjoint_merge_cluster_decline_no_extend() -> None:
         assert obj_local is not None
         mesh_local = obj_local.data
         bm_local = bmesh.from_edit_mesh(mesh_local)
-        group_layer = bm_local.verts.layers.int.get(yse_core.VERT_MERGE_GROUP_LAYER)
+        group_layer = bm_local.verts.layers.int.get(layer_names.VERT_MERGE_GROUP_LAYER)
         assert group_layer is not None, "group markers must exist before native"
         marked = [vertex for vertex in bm_local.verts if int(vertex[group_layer]) > 0]
         assert len(marked) >= 3, [coordinate_key(v.co) for v in marked]

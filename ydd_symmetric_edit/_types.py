@@ -18,7 +18,8 @@ if TYPE_CHECKING:
     from bpy.stub_internal.rna_enums import OperatorReturnItems
     from mathutils import Quaternion, Vector
 
-    from .core import LazyTopologyResolution, VertexMirrorLookup
+    from .matching import VertexMirrorLookup
+    from .snapshot import LazyTopologyResolution
 
 
 FaceId = NewType("FaceId", int)

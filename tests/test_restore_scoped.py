@@ -16,7 +16,7 @@ import bmesh
 PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
-from ydd_symmetric_edit import core  # noqa: E402
+from ydd_symmetric_edit import layer_names, selection, stitch  # noqa: E402
 from ydd_symmetric_edit._types import (  # noqa: E402
     FaceId,
     FaceSelectionHistory,
@@ -32,14 +32,14 @@ def _make_fixture(*, selected: bool, hidden_mode: str, with_history: bool):
     """Create every CustomData layer before creating any geometry."""
 
     bm = bmesh.new()
-    vertex_selection = bm.verts.layers.int.new(core.VERT_SELECTION_LAYER)
-    edge_selection = bm.edges.layers.int.new(core.EDGE_SELECTION_LAYER)
-    face_selection = bm.faces.layers.int.new(core.FACE_SELECTION_LAYER)
-    vertex_hidden = bm.verts.layers.int.new(core.VERT_HIDDEN_LAYER)
-    edge_hidden = bm.edges.layers.int.new(core.EDGE_HIDDEN_LAYER)
-    face_hidden = bm.faces.layers.int.new(core.FACE_HIDDEN_LAYER)
-    marker = bm.edges.layers.int.new(core.EDGE_ORIGINAL_LAYER)
-    face_id = bm.faces.layers.int.new(core.FACE_ID_LAYER)
+    vertex_selection = bm.verts.layers.int.new(layer_names.VERT_SELECTION_LAYER)
+    edge_selection = bm.edges.layers.int.new(layer_names.EDGE_SELECTION_LAYER)
+    face_selection = bm.faces.layers.int.new(layer_names.FACE_SELECTION_LAYER)
+    vertex_hidden = bm.verts.layers.int.new(layer_names.VERT_HIDDEN_LAYER)
+    edge_hidden = bm.edges.layers.int.new(layer_names.EDGE_HIDDEN_LAYER)
+    face_hidden = bm.faces.layers.int.new(layer_names.FACE_HIDDEN_LAYER)
+    marker = bm.edges.layers.int.new(layer_names.EDGE_ORIGINAL_LAYER)
+    face_id = bm.faces.layers.int.new(layer_names.FACE_ID_LAYER)
 
     vertices = [
         bm.verts.new((-1.0, -1.0, 0.0)),
@@ -111,7 +111,7 @@ def _mutate_selection(bm, *, mutation_case="p_stitch"):
 
 
 def _summary_for_all(bm):
-    return core.SelectionMutationSummary(
+    return stitch.SelectionMutationSummary(
         vertices=tuple(bm.verts),
         edges=tuple(bm.edges),
         faces=tuple(bm.faces),
@@ -128,9 +128,9 @@ def _state(bm):
 
     result = []
     for element_type, elements, selection_name, hidden_name in (
-        ("v", bm.verts, core.VERT_SELECTION_LAYER, core.VERT_HIDDEN_LAYER),
-        ("e", bm.edges, core.EDGE_SELECTION_LAYER, core.EDGE_HIDDEN_LAYER),
-        ("f", bm.faces, core.FACE_SELECTION_LAYER, core.FACE_HIDDEN_LAYER),
+        ("v", bm.verts, layer_names.VERT_SELECTION_LAYER, layer_names.VERT_HIDDEN_LAYER),
+        ("e", bm.edges, layer_names.EDGE_SELECTION_LAYER, layer_names.EDGE_HIDDEN_LAYER),
+        ("f", bm.faces, layer_names.FACE_SELECTION_LAYER, layer_names.FACE_HIDDEN_LAYER),
     ):
         selection_layer = elements.layers.int.get(selection_name)
         hidden_layer = elements.layers.int.get(hidden_name)
@@ -184,8 +184,8 @@ def check_scoped_matches_full_restore_matrix():
                             assert not next(iter(old_bm.faces)).select
                         _mutate_selection(old_bm, mutation_case=mutation_case)
                         _mutate_selection(new_bm, mutation_case=mutation_case)
-                        core.restore_visibility_and_selection(old_bm, old_hidden, old_snapshot)
-                        used_scoped = core.restore_selection_for_route(
+                        selection.restore_visibility_and_selection(old_bm, old_hidden, old_snapshot)
+                        used_scoped = selection.restore_selection_for_route(
                             new_bm,
                             new_hidden,
                             new_snapshot,
@@ -208,7 +208,7 @@ def check_scoped_matches_full_restore_matrix():
 
 
 def _route_restore(bm, snapshot, hidden_by_face_id, summary, *, direct, complete):
-    return core.restore_selection_for_route(
+    return selection.restore_selection_for_route(
         bm,
         hidden_by_face_id,
         snapshot,
@@ -219,14 +219,14 @@ def _route_restore(bm, snapshot, hidden_by_face_id, summary, *, direct, complete
 
 
 def check_fallback_conditions_increment_counter():
-    original = core.restore_visibility_and_selection
+    original = selection.restore_visibility_and_selection
     calls = []
 
     def counted(*args, **kwargs):
         calls.append(True)
         return original(*args, **kwargs)
 
-    core.restore_visibility_and_selection = counted
+    selection.restore_visibility_and_selection = counted
     import ydd_symmetric_edit.selection as selection_module
     selection_original = selection_module.restore_visibility_and_selection
     selection_module.restore_visibility_and_selection = counted
@@ -255,7 +255,7 @@ def check_fallback_conditions_increment_counter():
                 bm.free()
         assert len(calls) == 5
     finally:
-        core.restore_visibility_and_selection = original
+        selection.restore_visibility_and_selection = original
         selection_module.restore_visibility_and_selection = selection_original
 
 
@@ -267,21 +267,21 @@ def check_summary_omission_is_detected():
         selected=True, hidden_mode="none", with_history=False
     )
     try:
-        old_face_layer = old_bm.faces.layers.int.get(core.FACE_SELECTION_LAYER)
-        new_face_layer = new_bm.faces.layers.int.get(core.FACE_SELECTION_LAYER)
+        old_face_layer = old_bm.faces.layers.int.get(layer_names.FACE_SELECTION_LAYER)
+        new_face_layer = new_bm.faces.layers.int.get(layer_names.FACE_SELECTION_LAYER)
         next(iter(old_bm.faces))[old_face_layer] = 1
         next(iter(new_bm.faces))[new_face_layer] = 1
         old_snapshot.path_faces_selected = True
         new_snapshot.path_faces_selected = True
         _mutate_selection(old_bm)
         _mutate_selection(new_bm)
-        core.restore_visibility_and_selection(old_bm, old_hidden, old_snapshot)
-        complete = core.SelectionMutationSummary(
+        selection.restore_visibility_and_selection(old_bm, old_hidden, old_snapshot)
+        complete = stitch.SelectionMutationSummary(
             vertices=tuple(list(new_bm.verts)[1:]),
             edges=tuple(new_bm.edges),
             faces=(),
         )
-        core.restore_selection_scoped(new_bm, new_snapshot, complete)
+        selection.restore_selection_scoped(new_bm, new_snapshot, complete)
         assert _state(new_bm) != _state(old_bm)
     finally:
         old_bm.free()
@@ -294,9 +294,9 @@ def check_add_selection_layers_hidden_bit():
     for domain in ("verts", "edges", "faces"):
         for truth in (False, True):
             bm = bmesh.new()
-            vertex_hidden = bm.verts.layers.int.new(core.VERT_HIDDEN_LAYER)
-            edge_hidden = bm.edges.layers.int.new(core.EDGE_HIDDEN_LAYER)
-            face_hidden = bm.faces.layers.int.new(core.FACE_HIDDEN_LAYER)
+            vertex_hidden = bm.verts.layers.int.new(layer_names.VERT_HIDDEN_LAYER)
+            edge_hidden = bm.edges.layers.int.new(layer_names.EDGE_HIDDEN_LAYER)
+            face_hidden = bm.faces.layers.int.new(layer_names.FACE_HIDDEN_LAYER)
             vertices = [
                 bm.verts.new((0.0, 0.0, 0.0)),
                 bm.verts.new((1.0, 0.0, 0.0)),
@@ -310,7 +310,7 @@ def check_add_selection_layers_hidden_bit():
             for item in bm.faces:
                 item[face_hidden] = int(truth and domain == "faces")
             try:
-                snapshot = core.add_selection_layers(bm)
+                snapshot = selection.add_selection_layers(bm)
                 assert snapshot.saved_hidden_state_present is truth
             finally:
                 bm.free()
@@ -324,9 +324,9 @@ def check_tracker_closure_preserves_untracked_selection():
     from ydd_symmetric_edit import stitch
 
     bm = bmesh.new()
-    vertex_selection = bm.verts.layers.int.new(core.VERT_SELECTION_LAYER)
-    edge_selection = bm.edges.layers.int.new(core.EDGE_SELECTION_LAYER)
-    face_selection = bm.faces.layers.int.new(core.FACE_SELECTION_LAYER)
+    vertex_selection = bm.verts.layers.int.new(layer_names.VERT_SELECTION_LAYER)
+    edge_selection = bm.edges.layers.int.new(layer_names.EDGE_SELECTION_LAYER)
+    face_selection = bm.faces.layers.int.new(layer_names.FACE_SELECTION_LAYER)
     try:
         v = [
             bm.verts.new((0.0, 0.0, 0.0)),
@@ -367,7 +367,7 @@ def check_tracker_closure_preserves_untracked_selection():
             path_faces_selected=False,
             history=[],
         )
-        core.restore_selection_scoped(bm, snapshot, summary)
+        selection.restore_selection_scoped(bm, snapshot, summary)
         assert shared.select, "untracked-selection wiped by face clear cascade"
         assert bool(shared[edge_selection]) == shared.select
         print("PASS check_tracker_closure_preserves_untracked_selection", flush=True)

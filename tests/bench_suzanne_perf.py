@@ -24,8 +24,7 @@ import bpy
 
 PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
-
-from ydd_symmetric_edit import core  # noqa: E402
+from ydd_symmetric_edit import snapshot  # noqa: E402
 
 TOLERANCE = 1.0e-5
 SUBDIVIDE_CUTS = 10
@@ -82,7 +81,7 @@ def destroy_suzanne(obj) -> None:
 
 
 def _prepare_topology(obj, bm) -> None:
-    core.prepare_topology(bm, 0, TOLERANCE, mark_vertex_ids=True, mesh_object=obj)
+    snapshot.prepare_topology(bm, 0, TOLERANCE, mark_vertex_ids=True, mesh_object=obj)
 
 
 def _mesh_counts(bm) -> str:

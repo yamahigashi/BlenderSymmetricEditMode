@@ -36,8 +36,8 @@ PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
 import ydd_symmetric_edit as addon  # noqa: E402
-from ydd_symmetric_edit import core  # noqa: E402
 from ydd_symmetric_edit import delete_dissolve as yse_delete  # noqa: E402
+from ydd_symmetric_edit import layer_names  # noqa: E402
 from ydd_symmetric_edit import ui as yse_ui  # noqa: E402
 
 MARKER_OK = "YSE_COLLAPSE_OK"
@@ -274,7 +274,7 @@ def case_h_layer_cleanup(window, area, region) -> None:
     obj = active_mesh_object()
     assert obj is not None
     bm = ensure_edit(window, area, region, obj)
-    layer = bm.verts.layers.int.get(core.VERT_COLLAPSE_GROUP_LAYER)
+    layer = bm.verts.layers.int.get(layer_names.VERT_COLLAPSE_GROUP_LAYER)
     assert layer is None, f"temporary collapse layer remains: {layer}"
     print("YSE_COLLAPSE_H_OK", flush=True)
 
@@ -370,7 +370,7 @@ def case_e_fault_rollback(window, area, region) -> None:
         edit_obj = bpy.context.edit_object
         assert edit_obj is not None
         live = bmesh.from_edit_mesh(edit_obj.data)
-        layer = live.verts.layers.int.get(core.VERT_COLLAPSE_GROUP_LAYER)
+        layer = live.verts.layers.int.get(layer_names.VERT_COLLAPSE_GROUP_LAYER)
         assert layer is not None
         survivor = next(vertex for vertex in live.verts if int(vertex[layer]) > 0 and float(vertex.co.x) > 0.0)
         survivor.co.y += 0.375
@@ -408,7 +408,7 @@ def case_j_cascade_decline(window, area, region) -> None:
         edit_obj = bpy.context.edit_object
         assert edit_obj is not None
         live = bmesh.from_edit_mesh(edit_obj.data)
-        layer = live.verts.layers.int.get(core.VERT_COLLAPSE_GROUP_LAYER)
+        layer = live.verts.layers.int.get(layer_names.VERT_COLLAPSE_GROUP_LAYER)
         assert layer is not None
         survivor = next(vertex for vertex in live.verts if int(vertex[layer]) > 0)
         extra = live.verts.new((survivor.co.x + 0.25, survivor.co.y, survivor.co.z))

@@ -38,7 +38,7 @@ from dataclasses import dataclass
 import bmesh
 from mathutils import Vector
 
-from . import core
+from . import layer_names, matching
 from ._types import (
     Coordinate3D,
     FaceId,
@@ -90,7 +90,7 @@ def build_snapshot(
     axis_index: int,
     tolerance: float,
     *,
-    lookup: core.VertexMirrorLookup | None = None,
+    lookup: matching.VertexMirrorLookup | None = None,
 ) -> RipSnapshot | None:
     """Capture the selection and its one-ring before the native Rip runs.
 
@@ -106,10 +106,10 @@ def build_snapshot(
     bm.verts.ensure_lookup_table()
 
     if lookup is not None and not _lookup_matches_mesh(lookup, bm, axis_index, tolerance):
-        lookup = core.build_vertex_mirror_lookup([vertex.co for vertex in bm.verts], axis_index, tolerance)
+        lookup = matching.build_vertex_mirror_lookup([vertex.co for vertex in bm.verts], axis_index, tolerance)
 
-    vertex_id_layer = bm.verts.layers.int.get(core.VERT_RIP_ID_LAYER)
-    face_id_layer = bm.faces.layers.int.get(core.FACE_ID_LAYER)
+    vertex_id_layer = bm.verts.layers.int.get(layer_names.VERT_RIP_ID_LAYER)
+    face_id_layer = bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
     if vertex_id_layer is None or face_id_layer is None:
         return None
 
@@ -117,7 +117,7 @@ def build_snapshot(
         region_vertices = _snapshot_region_vertices(bm, None)
         if not region_vertices:
             return None
-        lookup = core.build_vertex_mirror_lookup([vertex.co for vertex in bm.verts], axis_index, tolerance)
+        lookup = matching.build_vertex_mirror_lookup([vertex.co for vertex in bm.verts], axis_index, tolerance)
         mirror_indices = lookup.find_all_mirrored([vertex.co for vertex in region_vertices])
     else:
         region_vertices, mirror_indices = _resolve_snapshot_region(bm, lookup)
@@ -152,7 +152,7 @@ def _mark_snapshot_vertex_ids(
 
 def _snapshot_region_vertices(
     bm: bmesh.types.BMesh,
-    lookup: core.VertexMirrorLookup | None,
+    lookup: matching.VertexMirrorLookup | None,
 ) -> tuple[bmesh.types.BMVert, ...]:
     """Return selected vertices plus their edge one-ring in legacy order."""
 
@@ -172,7 +172,7 @@ def _snapshot_region_vertices(
 
 def _resolve_snapshot_region(
     bm: bmesh.types.BMesh,
-    lookup: core.VertexMirrorLookup,
+    lookup: matching.VertexMirrorLookup,
 ) -> tuple[tuple[bmesh.types.BMVert, ...], tuple[int | None, ...]]:
     """Resolve only the selected RIP region and its edge one-ring."""
 
@@ -215,12 +215,12 @@ def _build_snapshot_records(
 
 
 def _lookup_matches_mesh(
-    lookup: core.VertexMirrorLookup,
+    lookup: matching.VertexMirrorLookup,
     bm: bmesh.types.BMesh,
     axis_index: int,
     tolerance: float,
 ) -> bool:
-    if not isinstance(lookup, core.VertexMirrorLookup):
+    if not isinstance(lookup, matching.VertexMirrorLookup):
         return False
     try:
         bm.verts.ensure_lookup_table()
@@ -233,8 +233,8 @@ def _lookup_matches_mesh(
         first = bm.verts[0].co
         last = bm.verts[len(bm.verts) - 1].co
         return (
-            tuple(float(value) for value in lookup._coords[0]) == core._coordinate_3d(first).as_tuple()
-            and tuple(float(value) for value in lookup._coords[-1]) == core._coordinate_3d(last).as_tuple()
+            tuple(float(value) for value in lookup._coords[0]) == matching._coordinate_3d(first).as_tuple()
+            and tuple(float(value) for value in lookup._coords[-1]) == matching._coordinate_3d(last).as_tuple()
         )
     except (ReferenceError, RuntimeError, IndexError):
         return False
@@ -247,7 +247,7 @@ def _lookup_matches_mesh(
 def has_rip_result(bm: bmesh.types.BMesh) -> bool:
     """True as soon as one duplicated vertex ID exists."""
 
-    vertex_id_layer = bm.verts.layers.int.get(core.VERT_RIP_ID_LAYER)
+    vertex_id_layer = bm.verts.layers.int.get(layer_names.VERT_RIP_ID_LAYER)
     if vertex_id_layer is None:
         return False
     seen: set[int] = set()
@@ -264,7 +264,7 @@ def has_rip_result(bm: bmesh.types.BMesh) -> bool:
 def rip_result_signature(bm: bmesh.types.BMesh) -> RipSignature | None:
     """Stable signature of the native result: duplicated IDs and coordinates."""
 
-    vertex_id_layer = bm.verts.layers.int.get(core.VERT_RIP_ID_LAYER)
+    vertex_id_layer = bm.verts.layers.int.get(layer_names.VERT_RIP_ID_LAYER)
     if vertex_id_layer is None:
         return None
     groups: dict[int, list[Coordinate3D]] = {}
@@ -311,9 +311,9 @@ class _DerivedRip:
 def _derive(
     bm: bmesh.types.BMesh, snapshot: RipSnapshot, mirror_face_ids: MirrorFaceMap
 ) -> tuple[_DerivedRip | None, str | None]:
-    vertex_id_layer = bm.verts.layers.int.get(core.VERT_RIP_ID_LAYER)
-    edge_layer = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
-    face_id_layer = bm.faces.layers.int.get(core.FACE_ID_LAYER)
+    vertex_id_layer = bm.verts.layers.int.get(layer_names.VERT_RIP_ID_LAYER)
+    edge_layer = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
+    face_id_layer = bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
     if vertex_id_layer is None or edge_layer is None or face_id_layer is None:
         return None, "temporary topology markers are missing"
 
@@ -560,15 +560,15 @@ def apply_mirrored_rip(
         copy_plan = []
         for copy, face_ids in zip(dup.copies, dup.copy_face_ids, strict=True):
             expected = frozenset(int(mirror_face_ids[FaceId(face_id)]) for face_id in face_ids)
-            copy_plan.append((expected, core.mirror_coordinate(copy.co, axis_index)))
+            copy_plan.append((expected, matching.mirror_coordinate(copy.co, axis_index)))
         split_plan.append((mirror_vertex_id, copy_plan))
 
     mirror_edges = [derived.mirror_seam_edges[edge_id] for edge_id in sorted(derived.mirror_seam_edges)]
     bmesh.ops.split_edges(bm, edges=mirror_edges, verts=mirror_split_verts, use_verts=True)
 
     # split_edges invalidates wrappers; rebuild the ID table before matching.
-    vertex_id_layer = bm.verts.layers.int.get(core.VERT_RIP_ID_LAYER)
-    face_id_layer = bm.faces.layers.int.get(core.FACE_ID_LAYER)
+    vertex_id_layer = bm.verts.layers.int.get(layer_names.VERT_RIP_ID_LAYER)
+    face_id_layer = bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
     if vertex_id_layer is None or face_id_layer is None:
         return 0, "temporary topology markers were lost while splitting"
     verts_by_id: dict[int, list[bmesh.types.BMVert]] = {}
@@ -687,7 +687,7 @@ def apply_self_mirrored_rip(
         source_mirror = source_by_vid.get(mirror_vertex_id)
         if source_mirror is None:
             return 0, "a self-mirrored seam vertex has no source counterpart"
-        nonsource.co = core.mirror_coordinate(source_mirror.co, axis_index)
+        nonsource.co = matching.mirror_coordinate(source_mirror.co, axis_index)
         nonsource.select = False
 
     # Native already selects the source bank; re-assert so selection state is

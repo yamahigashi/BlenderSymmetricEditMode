@@ -23,7 +23,7 @@ PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
 import ydd_symmetric_edit as addon  # noqa: E402
-from ydd_symmetric_edit import core, operators  # noqa: E402
+from ydd_symmetric_edit import layer_names, operators  # noqa: E402
 
 STATE = {"started": 0.0}
 
@@ -51,8 +51,8 @@ def verify_cancelled():
 
         bm = bmesh.from_edit_mesh(STATE["object"].data)
         assert len(bm.verts) == 8 and len(bm.edges) == 8 and len(bm.faces) == 2
-        assert bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER) is None
-        assert bm.faces.layers.int.get(core.FACE_ID_LAYER) is None
+        assert bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER) is None
+        assert bm.faces.layers.int.get(layer_names.FACE_ID_LAYER) is None
         print("YSE_NATIVE_CANCEL_TEST_OK", flush=True)
         addon.unregister()
         bpy.ops.wm.quit_blender()

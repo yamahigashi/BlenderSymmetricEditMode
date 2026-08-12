@@ -22,6 +22,7 @@ import bmesh
 import bpy
 import numpy
 from mathutils import Vector
+from mathutils.kdtree import KDTree
 
 PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
@@ -29,10 +30,19 @@ sys.path.insert(0, str(PACKAGE_PARENT / "tests"))
 
 from perf_fixtures import DENSE_CANDIDATE_COORDS  # noqa: E402
 
-from ydd_symmetric_edit import core, face_mapping, matching, operators, selection, snapshot  # noqa: E402
+from ydd_symmetric_edit import (  # noqa: E402
+    _types,
+    face_mapping,
+    layer_names,
+    matching,
+    operators,
+    selection,
+    stitch,
+)
 from ydd_symmetric_edit import replay as replay_module  # noqa: E402
 from ydd_symmetric_edit import rip as rip_module  # noqa: E402
 from ydd_symmetric_edit import session as session_module  # noqa: E402
+from ydd_symmetric_edit import snapshot as snapshot_module  # noqa: E402
 from ydd_symmetric_edit import watcher as watcher_module  # noqa: E402
 from ydd_symmetric_edit._types import (  # noqa: E402
     Coordinate3D,
@@ -118,7 +128,7 @@ class _ReferenceBinLookup:
         self._coords = tuple((float(co[0]), float(co[1]), float(co[2])) for co in coords)
         self._bins = defaultdict(list)
         for index, coordinate in enumerate(self._coords):
-            self._bins[core._quantized_coordinate(Vector(coordinate), tolerance)].append((index, coordinate))
+            self._bins[matching._quantized_coordinate(Vector(coordinate), tolerance)].append((index, coordinate))
         self._on_plane_indices = None
 
     def is_on_plane(self, co) -> bool:
@@ -137,21 +147,21 @@ class _ReferenceBinLookup:
     def _candidates_for(self, position):
         position = (float(position[0]), float(position[1]), float(position[2]))
         candidates = []
-        for bin_key in core._iter_quantized_neighborhood(Vector(position), self._tolerance):
+        for bin_key in matching._iter_quantized_neighborhood(Vector(position), self._tolerance):
             for index, stored in self._bins.get(bin_key, ()):
-                distance = core._chebyshev_distance_3d(position, stored)
+                distance = matching._chebyshev_distance_3d(position, stored)
                 if distance <= self._tolerance:
                     candidates.append((distance, index))
         candidates.sort()
         return candidates
 
     def find(self, co):
-        expected = core.mirror_coordinate(co, self._axis_index)
+        expected = matching.mirror_coordinate(co, self._axis_index)
         expected = (float(expected[0]), float(expected[1]), float(expected[2]))
         best = None
-        for bin_key in core._iter_quantized_neighborhood(Vector(expected), self._tolerance):
+        for bin_key in matching._iter_quantized_neighborhood(Vector(expected), self._tolerance):
             for index, stored in self._bins.get(bin_key, ()):
-                distance = core._chebyshev_distance_3d(expected, stored)
+                distance = matching._chebyshev_distance_3d(expected, stored)
                 if distance <= self._tolerance and (best is None or distance < best[0]):
                     best = (distance, index)
         return None if best is None else best[1]
@@ -209,7 +219,7 @@ class _ReferenceBinLookup:
             for (index, _co), target in zip(on_plane, resolved, strict=True):
                 result[index] = target
         off_plane = [
-            (index, core.mirror_coordinate(co, self._axis_index))
+            (index, matching.mirror_coordinate(co, self._axis_index))
             for index, co in enumerate(coords)
             if not self.is_on_plane(co)
         ]
@@ -305,15 +315,15 @@ def _make_lookup_case(
 
 def _assert_lookup_case(coords, axis_index: int, tolerance: float = TOLERANCE):
     reference = _ReferenceBinLookup(coords, axis_index, tolerance)
-    lookup = core.build_vertex_mirror_lookup(coords, axis_index, tolerance)
+    lookup = matching.build_vertex_mirror_lookup(coords, axis_index, tolerance)
     assert not hasattr(lookup, "_bins")
     assert tuple(lookup._coords) == reference._coords
-    assert core.build_vertex_pair_table(coords, axis_index, tolerance) == _pair_table(reference, coords)
+    assert matching.build_vertex_pair_table(coords, axis_index, tolerance) == _pair_table(reference, coords)
     assert lookup.find_all_mirrored(coords) == tuple(reference.find_all_mirrored(coords))
     assert lookup.find_all_direct(coords) == tuple(reference.find_all_direct(coords))
     assert lookup._batch_path_count >= 2
     for query in coords:
-        candidates = reference._candidates_for(core.mirror_coordinate(query, axis_index))
+        candidates = reference._candidates_for(matching.mirror_coordinate(query, axis_index))
         if not candidates or len([distance for distance, _index in candidates if distance == candidates[0][0]]) > 1:
             continue
         assert lookup.find(query) == reference.find(query)
@@ -321,7 +331,7 @@ def _assert_lookup_case(coords, axis_index: int, tolerance: float = TOLERANCE):
 
 def _assert_bin_and_sphere_fixture(axis_index: int):
     source = _make_point(axis_index, -1.0, (0.25, -0.5), False)
-    expected = core.mirror_coordinate(source, axis_index)
+    expected = matching.mirror_coordinate(source, axis_index)
     inside = expected.copy()
     outside = expected.copy()
     # expected (=1.0) sits at the very top of its floor bin, so the straddling
@@ -329,30 +339,30 @@ def _assert_bin_and_sphere_fixture(axis_index: int):
     # inside tol. Factors leave room for float32 rounding (~1.2% of tol here).
     inside[axis_index] += 0.99 * TOLERANCE
     outside[axis_index] += 1.03 * TOLERANCE
-    expected_key = core._quantized_coordinate(expected, TOLERANCE)
-    inside_key = core._quantized_coordinate(inside, TOLERANCE)
-    outside_key = core._quantized_coordinate(outside, TOLERANCE)
+    expected_key = matching._quantized_coordinate(expected, TOLERANCE)
+    inside_key = matching._quantized_coordinate(inside, TOLERANCE)
+    outside_key = matching._quantized_coordinate(outside, TOLERANCE)
     assert expected_key != inside_key and expected_key != outside_key
-    assert 0.98 * TOLERANCE <= core._chebyshev_distance_3d(_vector_tuple(expected), _vector_tuple(inside)) <= TOLERANCE
-    assert core._chebyshev_distance_3d(_vector_tuple(expected), _vector_tuple(outside)) > TOLERANCE
+    assert 0.98 * TOLERANCE <= matching._chebyshev_distance_3d(_vector_tuple(expected), _vector_tuple(inside)) <= TOLERANCE
+    assert matching._chebyshev_distance_3d(_vector_tuple(expected), _vector_tuple(outside)) > TOLERANCE
     reference = _ReferenceBinLookup((inside, outside), axis_index, TOLERANCE)
-    lookup = core.build_vertex_mirror_lookup((inside, outside), axis_index, TOLERANCE)
+    lookup = matching.build_vertex_mirror_lookup((inside, outside), axis_index, TOLERANCE)
     assert reference.find(source) == lookup.find(source) == 0
     assert reference.find_all_mirrored((source,)) == lookup.find_all_mirrored((source,)) == (0,)
 
     sphere_source = _make_point(axis_index, -4.0, (1.3, -1.1), False)
-    sphere_expected = core.mirror_coordinate(sphere_source, axis_index)
+    sphere_expected = matching.mirror_coordinate(sphere_source, axis_index)
     sphere_inside = sphere_expected.copy()
     sphere_outside = sphere_expected.copy()
     for coordinate in range(3):
         sphere_inside[coordinate] -= 0.95 * TOLERANCE
         sphere_outside[coordinate] -= 1.05 * TOLERANCE
-    inside_distance = core._chebyshev_distance_3d(_vector_tuple(sphere_expected), _vector_tuple(sphere_inside))
-    outside_distance = core._chebyshev_distance_3d(_vector_tuple(sphere_expected), _vector_tuple(sphere_outside))
+    inside_distance = matching._chebyshev_distance_3d(_vector_tuple(sphere_expected), _vector_tuple(sphere_inside))
+    outside_distance = matching._chebyshev_distance_3d(_vector_tuple(sphere_expected), _vector_tuple(sphere_outside))
     assert 0.9 * TOLERANCE <= inside_distance <= TOLERANCE
     assert TOLERANCE < outside_distance <= 1.1 * TOLERANCE
     reference = _ReferenceBinLookup((sphere_inside, sphere_outside), axis_index, TOLERANCE)
-    lookup = core.build_vertex_mirror_lookup((sphere_inside, sphere_outside), axis_index, TOLERANCE)
+    lookup = matching.build_vertex_mirror_lookup((sphere_inside, sphere_outside), axis_index, TOLERANCE)
     assert reference.find(sphere_source) == lookup.find(sphere_source) == 0
     assert reference.find_all_mirrored((sphere_source,)) == lookup.find_all_mirrored((sphere_source,)) == (0,)
 
@@ -370,7 +380,7 @@ def _reference_coordinates_match(first, second, tolerance):
     if len(first) != len(second):
         return False
     adjacency = [
-        [index for index, right in enumerate(second) if core.coordinates_match(left, right, tolerance)]
+        [index for index, right in enumerate(second) if matching.coordinates_match(left, right, tolerance)]
         for left in first
     ]
     match_left = [-1] * len(first)
@@ -405,7 +415,7 @@ def _reference_coordinates_match(first, second, tolerance):
 
 
 def _check_vertex_lookup_equivalence():
-    for axis_index in (core.AXIS_INDEX["X"], core.AXIS_INDEX["Y"], core.AXIS_INDEX["Z"]):
+    for axis_index in (matching.AXIS_INDEX["X"], matching.AXIS_INDEX["Y"], matching.AXIS_INDEX["Z"]):
         _assert_bin_and_sphere_fixture(axis_index)
         for seed in SEEDS:
             _assert_lookup_case(_make_lookup_case(axis_index, seed), axis_index)
@@ -420,7 +430,7 @@ def _check_vertex_lookup_equivalence():
         _assert_lookup_case(offset_coords, axis_index, tolerance=1.0e-2)
 
     _assert_a_reference_case([], 0, TOLERANCE)
-    empty_lookup = core.build_vertex_mirror_lookup([], 0, TOLERANCE)
+    empty_lookup = matching.build_vertex_mirror_lookup([], 0, TOLERANCE)
     empty_query = Vector((1.0, 2.0, 3.0))
     assert empty_lookup.find(empty_query) is None
     assert empty_lookup.find_all_direct((empty_query,)) == (None,)
@@ -428,17 +438,17 @@ def _check_vertex_lookup_equivalence():
 
     plane_coords = [Vector((0.0, float(index), -float(index))) for index in range(5)]
     _assert_a_reference_case(plane_coords, 0, TOLERANCE)
-    lookup = core.build_vertex_mirror_lookup(plane_coords, 0, TOLERANCE)
+    lookup = matching.build_vertex_mirror_lookup(plane_coords, 0, TOLERANCE)
     assert lookup.find_all_mirrored(plane_coords) == tuple(range(5))
 
     batch_positions = tuple(plane_coords)
-    batch_lookup = core.build_vertex_mirror_lookup(batch_positions, 0, TOLERANCE)
+    batch_lookup = matching.build_vertex_mirror_lookup(batch_positions, 0, TOLERANCE)
     batch_lists = batch_lookup._batch_candidates(batch_positions)
     assert batch_lists is not None
     assert batch_lists == [batch_lookup._candidates_for(position) for position in batch_positions]
     assert batch_lookup._batch_path_count == 1
 
-    tie_lookup = core.build_vertex_mirror_lookup(
+    tie_lookup = matching.build_vertex_mirror_lookup(
         [Vector((0.5 * TOLERANCE, 0.0, 0.0)), Vector((-0.5 * TOLERANCE, 0.0, 0.0))],
         0,
         TOLERANCE,
@@ -479,7 +489,7 @@ def _check_batch_candidate_contract_edges():
             (-1.0 - 0.4 * tolerance, -0.25, 0.5),
         )
     )
-    boundary_lookup = core.build_vertex_mirror_lookup(boundary_coords, 0, tolerance)
+    boundary_lookup = matching.build_vertex_mirror_lookup(boundary_coords, 0, tolerance)
     assert_candidates(boundary_lookup, boundary_coords)
     boundary_candidates = boundary_lookup._batch_candidates((Vector((1.0, 0.0, 0.0)),))
     assert boundary_candidates is not None
@@ -497,7 +507,7 @@ def _check_batch_candidate_contract_edges():
             (-0.25, -0.75, 0.0),
         )
     )
-    planar_lookup = core.build_vertex_mirror_lookup(planar_coords, 0, tolerance)
+    planar_lookup = matching.build_vertex_mirror_lookup(planar_coords, 0, tolerance)
     planar_index = planar_lookup._registered_batch_index()
     assert planar_index is not False and int(planar_index["spans"][2]) == 1
     planar_queries = tuple(
@@ -513,7 +523,7 @@ def _check_batch_candidate_contract_edges():
     # Box-corner clamps: registered box spans 2x2x1 bins at tolerance=1;
     # queries sit diagonally outside every axis at once.
     corner_coords = (Vector((0.0, 0.0, 0.0)), Vector((1.0, 1.0, 0.0)))
-    corner_lookup = core.build_vertex_mirror_lookup(corner_coords, 0, 1.0)
+    corner_lookup = matching.build_vertex_mirror_lookup(corner_coords, 0, 1.0)
     corner_queries = (Vector((-1.0, -1.0, -1.0)), Vector((2.0, 2.0, 1.0)))
     actual_corner = corner_lookup._batch_candidates(corner_queries)
     assert actual_corner is not None
@@ -524,7 +534,7 @@ def _check_batch_candidate_contract_edges():
     # packed span product overflows int64 and must fall back to the KDTree
     # path with identical public results.
     huge_span_coords = (Vector((0.0, 0.0, 0.0)), Vector((float(2**21), float(2**21), float(2**21))))
-    huge_span_lookup = core.build_vertex_mirror_lookup(huge_span_coords, 0, 1.0)
+    huge_span_lookup = matching.build_vertex_mirror_lookup(huge_span_coords, 0, 1.0)
     assert huge_span_lookup._registered_batch_index() is False
     assert huge_span_lookup._batch_candidates(huge_span_coords) is None
     reference_huge = _ReferenceBinLookup(huge_span_coords, 0, 1.0)
@@ -535,7 +545,7 @@ def _check_batch_candidate_contract_edges():
 
     # Non-finite queries abandon the batch path; the public API answers via
     # the per-query KDTree route without raising.
-    finite_lookup = core.build_vertex_mirror_lookup((Vector((1.0, 0.0, 0.0)),), 0, tolerance)
+    finite_lookup = matching.build_vertex_mirror_lookup((Vector((1.0, 0.0, 0.0)),), 0, tolerance)
     nan_query = (Vector((float("nan"), 0.0, 0.0)),)
     assert finite_lookup._batch_candidates(nan_query) is None
     assert finite_lookup.find_all_direct(nan_query) == (None,)
@@ -544,29 +554,29 @@ def _check_batch_candidate_contract_edges():
     # negation operates on a fancy-indexed copy).
     owned = numpy.asarray([(0.5, 0.25, 0.0), (-0.5, 0.25, 0.0)], dtype=numpy.float64)
     owned_snapshot = owned.copy()
-    owned_lookup = core.build_vertex_mirror_lookup((Vector((0.5, 0.25, 0.0)), Vector((-0.5, 0.25, 0.0))), 0, tolerance)
+    owned_lookup = matching.build_vertex_mirror_lookup((Vector((0.5, 0.25, 0.0)), Vector((-0.5, 0.25, 0.0))), 0, tolerance)
     owned_lookup.find_all_mirrored(owned)
     owned_lookup.find_all_direct(owned)
     assert (owned == owned_snapshot).all()
 
     clamp_coords = (Vector((0.0, 0.0, 0.0)), Vector((1.0e-13, 0.0, 0.0)))
-    clamp_lookup = core.build_vertex_mirror_lookup(clamp_coords, 0, 0.0)
+    clamp_lookup = matching.build_vertex_mirror_lookup(clamp_coords, 0, 0.0)
     assert_candidates(clamp_lookup, clamp_coords)
 
-    empty_registered = core.build_vertex_mirror_lookup([], 0, tolerance)
+    empty_registered = matching.build_vertex_mirror_lookup([], 0, tolerance)
     assert empty_registered._batch_candidates((Vector((float("nan"), 0.0, 0.0)),)) is None
     assert empty_registered._batch_candidates((Vector((float("inf"), 0.0, 0.0)),)) is None
-    invalid_tree = core.KDTree(1)
+    invalid_tree = KDTree(1)
     invalid_tree.insert(Vector((0.0, 0.0, 0.0)), 0)
     invalid_tree.balance()
-    invalid_registered = core.VertexMirrorLookup(
+    invalid_registered = matching.VertexMirrorLookup(
         axis_index=0,
         tolerance=tolerance,
         coords=((float("nan"), 0.0, 0.0),),
         tree=invalid_tree,
     )
     assert invalid_registered._batch_candidates(()) is None
-    huge_registered = core.VertexMirrorLookup(
+    huge_registered = matching.VertexMirrorLookup(
         axis_index=0,
         tolerance=tolerance,
         coords=((2**63 * tolerance, 0.0, 0.0),),
@@ -575,16 +585,16 @@ def _check_batch_candidate_contract_edges():
     assert huge_registered._batch_candidates(()) is None
 
     rounding_coords = (Vector((0.09375, 0.0, 0.0)), Vector((-0.09375, 0.0, 0.0)))
-    rounding_lookup = core.build_vertex_mirror_lookup(rounding_coords, 0, 1.0e-5)
+    rounding_lookup = matching.build_vertex_mirror_lookup(rounding_coords, 0, 1.0e-5)
     assert_candidates(rounding_lookup, rounding_coords)
 
     plane_coords = (Vector((0.0, 0.0, 0.0)), Vector((2.0 * tolerance, 0.0, 0.0)))
-    plane_lookup = core.build_vertex_mirror_lookup(plane_coords, 0, tolerance)
+    plane_lookup = matching.build_vertex_mirror_lookup(plane_coords, 0, tolerance)
     plane_positions = (Vector((0.0, 0.0, 0.0)), Vector((2.0 * tolerance, 0.0, 0.0)))
     assert_candidates(plane_lookup, plane_positions, True)
     assert_candidates(plane_lookup, plane_positions, False)
     assert plane_lookup.find_all_mirrored((Vector((0.0, 0.0, 0.0)), Vector((-2.0 * tolerance, 0.0, 0.0)))) == (0, 1)
-    near_plane_target = core.build_vertex_mirror_lookup((Vector((0.5 * tolerance, 0.0, 0.0)),), 0, tolerance)
+    near_plane_target = matching.build_vertex_mirror_lookup((Vector((0.5 * tolerance, 0.0, 0.0)),), 0, tolerance)
     near_plane_queries = (Vector((0.5 * tolerance, 0.0, 0.0)), Vector((-1.25 * tolerance, 0.0, 0.0)))
     near_plane_candidate_positions = (near_plane_queries[0], Vector((1.25 * tolerance, 0.0, 0.0)))
     near_plane_candidates = near_plane_target._batch_candidates(near_plane_candidate_positions)
@@ -602,7 +612,7 @@ def _check_batch_candidate_contract_edges():
         near_plane_reference.find_all_mirrored(near_plane_queries)
     )
 
-    fallback_lookup = core.build_vertex_mirror_lookup((Vector((0.0, 0.0, 0.0)),), 0, tolerance)
+    fallback_lookup = matching.build_vertex_mirror_lookup((Vector((0.0, 0.0, 0.0)),), 0, tolerance)
     fallback_calls = 0
     original_candidates = fallback_lookup._candidates_for
 
@@ -621,14 +631,14 @@ def _check_batch_candidate_contract_edges():
     finally:
         setattr(fallback_lookup, method_name, original_candidates)
 
-    contested = core.build_vertex_mirror_lookup((Vector((1.0, 0.0, 0.0)),), 0, tolerance)
+    contested = matching.build_vertex_mirror_lookup((Vector((1.0, 0.0, 0.0)),), 0, tolerance)
     assert contested._resolve_injective((Vector((1.0, 0.0, 0.0)), Vector((1.0 + 0.4 * tolerance, 0.0, 0.0)))) == [
         None,
         None,
     ]
 
     two_target_coords = (Vector((1.0, 0.0, 0.0)), Vector((1.0 + 0.8 * tolerance, 0.0, 0.0)))
-    two_target_lookup = core.build_vertex_mirror_lookup(two_target_coords, 0, tolerance)
+    two_target_lookup = matching.build_vertex_mirror_lookup(two_target_coords, 0, tolerance)
     two_target_queries = (Vector((1.0 + 0.1 * tolerance, 0.0, 0.0)), Vector((1.0 + 0.2 * tolerance, 0.0, 0.0)))
     assert two_target_lookup._resolve_injective(two_target_queries) == [0, 1]
 
@@ -646,7 +656,7 @@ def _check_batch_candidate_contract_edges():
         target[2] += rng.uniform(-0.2, 0.2) * tolerance
         large_coords.extend((source, target))
     assert len(large_coords) >= 2000
-    large_lookup = core.build_vertex_mirror_lookup(large_coords, 0, tolerance)
+    large_lookup = matching.build_vertex_mirror_lookup(large_coords, 0, tolerance)
     large_batch = large_lookup._batch_candidates(large_coords)
     assert large_batch is not None
     large_oracle = [large_lookup._candidates_for(position) for position in large_coords]
@@ -678,7 +688,7 @@ def _check_extend_selection_matrix():
     try:
         reset()
         history_before = tuple(cast(Any, bm.select_history))
-        assert core.extend_selection_to_mirror(bm, 0, TOLERANCE) == 0
+        assert selection.extend_selection_to_mirror(bm, 0, TOLERANCE) == 0
         assert not any(vertex.select for vertex in bm.verts)
         assert tuple(cast(Any, bm.select_history)) == history_before
 
@@ -686,7 +696,7 @@ def _check_extend_selection_matrix():
         left[0].select = True
         bm.select_history.add(left[0])
         history_before = tuple(cast(Any, bm.select_history))
-        assert core.extend_selection_to_mirror(bm, 0, TOLERANCE) == 1
+        assert selection.extend_selection_to_mirror(bm, 0, TOLERANCE) == 1
         assert right[0].select
         assert tuple(cast(Any, bm.select_history)) == history_before
 
@@ -696,7 +706,7 @@ def _check_extend_selection_matrix():
         left_edge.select = True
         bm.select_history.add(left_edge)
         history_before = tuple(cast(Any, bm.select_history))
-        assert core.extend_selection_to_mirror(bm, 0, TOLERANCE) == 3
+        assert selection.extend_selection_to_mirror(bm, 0, TOLERANCE) == 3
         assert right_edge.select
         assert tuple(cast(Any, bm.select_history)) == history_before
 
@@ -704,7 +714,7 @@ def _check_extend_selection_matrix():
         left_face.select = True
         bm.select_history.add(left_face)
         history_before = tuple(cast(Any, bm.select_history))
-        assert core.extend_selection_to_mirror(bm, 0, TOLERANCE) == 7
+        assert selection.extend_selection_to_mirror(bm, 0, TOLERANCE) == 7
         assert right_face.select
         assert tuple(cast(Any, bm.select_history)) == history_before
     finally:
@@ -789,7 +799,7 @@ def _check_extend_selection_lazy_indices():
         for sequence in (vertex_sequence, edge_sequence, face_sequence):
             setattr(cast(Any, sequence), "ensure_lookup_table", lambda: None)
             setattr(cast(Any, sequence), "index_update", lambda: None)
-        cast(Any, core.extend_selection_to_mirror)(bm, 0, TOLERANCE)
+        cast(Any, selection.extend_selection_to_mirror)(bm, 0, TOLERANCE)
         assert edge_sequence.iterations == 1
         assert face_sequence.iterations == 1
 
@@ -800,7 +810,7 @@ def _check_extend_selection_wrapper_matrix():
         (replay_module, "replay"),
     )
     selection_modes = ("empty", "vertex", "edge", "face")
-    original_extend = core.extend_selection_to_mirror
+    original_extend = selection.extend_selection_to_mirror
     original_operator_bpy = operators.bpy
     original_operator_bmesh = operators.bmesh
     original_replay_bpy = replay_module.bpy
@@ -837,7 +847,7 @@ def _check_extend_selection_wrapper_matrix():
                 calls.append((mesh, axis_index, tolerance, mesh_object))
                 return original_extend(mesh, axis_index, tolerance, mesh_object=mesh_object)
 
-            setattr(core, "extend_selection_to_mirror", spy_extend)
+            setattr(selection, "extend_selection_to_mirror", spy_extend)
             settings = SimpleNamespace(select_mirrored=True)
             fake_context = SimpleNamespace(scene=SimpleNamespace(ydd_symmetric_edit=settings))
             fake_bpy = SimpleNamespace(context=fake_context)
@@ -870,7 +880,7 @@ def _check_extend_selection_wrapper_matrix():
             finally:
                 bm.free()
 
-    setattr(core, "extend_selection_to_mirror", original_extend)
+    setattr(selection, "extend_selection_to_mirror", original_extend)
     setattr(operators, "bpy", original_operator_bpy)
     setattr(operators, "bmesh", original_operator_bmesh)
     setattr(replay_module, "bpy", original_replay_bpy)
@@ -879,9 +889,9 @@ def _check_extend_selection_wrapper_matrix():
 
 def _assert_a_reference_case(coords, axis_index: int, tolerance: float):
     reference = _ReferenceBinLookup(coords, axis_index, tolerance)
-    lookup = core.build_vertex_mirror_lookup(coords, axis_index, tolerance)
+    lookup = matching.build_vertex_mirror_lookup(coords, axis_index, tolerance)
     expected_pairs = _pair_table(reference, coords)
-    assert core.build_vertex_pair_table(coords, axis_index, tolerance) == expected_pairs
+    assert matching.build_vertex_pair_table(coords, axis_index, tolerance) == expected_pairs
     batch_count_before = lookup._batch_path_count
     old_mirrored = tuple(reference.find_all_mirrored(coords))
     new_mirrored = lookup.find_all_mirrored(coords)
@@ -907,20 +917,20 @@ def _face_records(bm, axis_index: int, tolerance: float):
     for raw_id, face in enumerate(bm.faces, start=1):
         face_id = FaceId(raw_id)
         coords = tuple((float(vertex.co[0]), float(vertex.co[1]), float(vertex.co[2])) for vertex in face.verts)
-        key = core.FaceKey(
+        key = _types.FaceKey(
             vertex_count=len(coords),
             coordinates=tuple(
-                sorted(core._quantized_coordinate(Vector(coordinate), tolerance) for coordinate in coords)
+                sorted(matching._quantized_coordinate(Vector(coordinate), tolerance) for coordinate in coords)
             ),
         )
         mirrored_coords = tuple(
-            tuple(float(component) for component in core.mirror_coordinate(Vector(coordinate), axis_index))
+            tuple(float(component) for component in matching.mirror_coordinate(Vector(coordinate), axis_index))
             for coordinate in coords
         )
-        mirrored_key = core.FaceKey(
+        mirrored_key = _types.FaceKey(
             vertex_count=len(coords),
             coordinates=tuple(
-                sorted(core._quantized_coordinate(Vector(coordinate), tolerance) for coordinate in mirrored_coords)
+                sorted(matching._quantized_coordinate(Vector(coordinate), tolerance) for coordinate in mirrored_coords)
             ),
         )
         centroid = _vector_tuple(face.calc_center_median())
@@ -974,7 +984,7 @@ def _reference_eager_face_map(bm, axis_index: int, tolerance: float):
         for face_id, record in records.items():
             face_coords[face_id] = record.coords
             centroid = Vector(record.centroid)
-            faces_by_count_centroid[(len(record.coords), core._quantized_coordinate(centroid, tolerance))].append(
+            faces_by_count_centroid[(len(record.coords), matching._quantized_coordinate(centroid, tolerance))].append(
                 face_id
             )
         fallback_ready = True
@@ -988,16 +998,16 @@ def _reference_eager_face_map(bm, axis_index: int, tolerance: float):
             candidates = list(exact)
         else:
             ensure_fallback_index()
-            mirrored_centroid = core.mirror_coordinate(Vector(record.centroid), axis_index)
+            mirrored_centroid = matching.mirror_coordinate(Vector(record.centroid), axis_index)
             mirrored_coords = tuple(
-                tuple(float(component) for component in core.mirror_coordinate(Vector(coordinate), axis_index))
+                tuple(float(component) for component in matching.mirror_coordinate(Vector(coordinate), axis_index))
                 for coordinate in record.coords
             )
             candidates = []
             seen = set()
             found_self = False
             found_other = False
-            for centroid_key in core._iter_quantized_neighborhood(mirrored_centroid, tolerance):
+            for centroid_key in matching._iter_quantized_neighborhood(mirrored_centroid, tolerance):
                 for candidate_id in faces_by_count_centroid.get((len(record.coords), centroid_key), ()):
                     if candidate_id in seen:
                         continue
@@ -1088,9 +1098,11 @@ def _check_topology_equivalence():
     bm = _build_deformed_grid(7)
     original_face_key = face_mapping._face_key
     frame_name = (
-        "_carrier_frame_from_coords" if hasattr(snapshot, "_carrier_frame_from_coords") else "_carrier_frame_snapshot"
+        "_carrier_frame_from_coords"
+        if hasattr(snapshot_module, "_carrier_frame_from_coords")
+        else "_carrier_frame_snapshot"
     )
-    original_frame = getattr(snapshot, frame_name)
+    original_frame = getattr(snapshot_module, frame_name)
     counters = {"key": 0, "frame": 0}
 
     def count_key(*args, **kwargs):
@@ -1103,12 +1115,12 @@ def _check_topology_equivalence():
 
     face_key_name = "_face_key"
     setattr(face_mapping, face_key_name, count_key)
-    setattr(snapshot, frame_name, count_frame)
+    setattr(snapshot_module, frame_name, count_frame)
     try:
-        topology = core.prepare_topology(bm, 0, TOLERANCE)
+        topology = snapshot_module.prepare_topology(bm, 0, TOLERANCE)
     finally:
         setattr(face_mapping, face_key_name, original_face_key)
-        setattr(snapshot, frame_name, original_frame)
+        setattr(snapshot_module, frame_name, original_frame)
     assert topology.mirror_face_ids == _reference_eager_face_map(bm, 0, TOLERANCE)
     assert topology.matched_faces == topology.total_faces
     assert counters == {"key": 0, "frame": 0}, counters
@@ -1130,7 +1142,7 @@ def _check_topology_equivalence():
     try:
         face_key_name = "_face_key"
         setattr(face_mapping, face_key_name, count_fallback_key)
-        topology = core.prepare_topology(perturbed, 0, TOLERANCE)
+        topology = snapshot_module.prepare_topology(perturbed, 0, TOLERANCE)
         # The geometric fallback runs at lazy resolve time, so force it
         # while the counting patch is still installed.
         _ = topology.mirror_face_ids
@@ -1153,7 +1165,7 @@ def _check_topology_equivalence():
     try:
         asymmetric.faces.ensure_lookup_table()
         asymmetric.faces[0].hide = True
-        topology = core.prepare_topology(asymmetric, 0, TOLERANCE)
+        topology = snapshot_module.prepare_topology(asymmetric, 0, TOLERANCE)
         expected = _reference_eager_face_map(asymmetric, 0, TOLERANCE)
         assert expected == {FaceId(1): FaceId(2)}
         assert topology.mirror_face_ids == expected
@@ -1171,7 +1183,7 @@ def _check_topology_equivalence():
     fallback_order = _build_fallback_bin_order_fixture()
     try:
         expected = _reference_eager_face_map(fallback_order, 0, 1.0)
-        topology = core.prepare_topology(fallback_order, 0, 1.0)
+        topology = snapshot_module.prepare_topology(fallback_order, 0, 1.0)
         assert expected[FaceId(1)] == FaceId(3)
         assert topology.mirror_face_ids == expected
     finally:
@@ -1181,7 +1193,7 @@ def _check_topology_equivalence():
 def _reference_carrier_frame(vertices):
     if not vertices:
         zero = Coordinate3D(0.0, 0.0, 0.0)
-        return core.CarrierFrameSnapshot(vertices, zero, None, None, 0.0)
+        return _types.CarrierFrameSnapshot(vertices, zero, None, None, 0.0)
     count = float(len(vertices))
     origin_vector = Vector(
         (
@@ -1196,9 +1208,9 @@ def _reference_carrier_frame(vertices):
         newell.x += (current.y - following.y) * (current.z + following.z)
         newell.y += (current.z - following.z) * (current.x + following.x)
         newell.z += (current.x - following.x) * (current.y + following.y)
-    origin = core._coordinate_3d(origin_vector)
+    origin = matching._coordinate_3d(origin_vector)
     if newell.length <= 1.0e-12:
-        return core.CarrierFrameSnapshot(vertices, origin, None, None, 0.0)
+        return _types.CarrierFrameSnapshot(vertices, origin, None, None, 0.0)
     normal_vector = newell.normalized()
     basis_u = None
     for vertex in sorted(vertices):
@@ -1208,13 +1220,13 @@ def _reference_carrier_frame(vertices):
             basis_u = projected.normalized()
             break
     if basis_u is None:
-        return core.CarrierFrameSnapshot(vertices, origin, core._coordinate_3d(normal_vector), None, 0.0)
+        return _types.CarrierFrameSnapshot(vertices, origin, matching._coordinate_3d(normal_vector), None, 0.0)
     deviation = max(abs((Vector(vertex.as_tuple()) - origin_vector).dot(normal_vector)) for vertex in vertices)
-    return core.CarrierFrameSnapshot(
+    return _types.CarrierFrameSnapshot(
         vertices=vertices,
         origin=origin,
-        normal=core._coordinate_3d(normal_vector),
-        basis_u=core._coordinate_3d(basis_u),
+        normal=matching._coordinate_3d(normal_vector),
+        basis_u=matching._coordinate_3d(basis_u),
         deviation=float(deviation),
     )
 
@@ -1254,7 +1266,7 @@ def _check_carrier_frame_lifecycle():
         face_vertex_ids[face_id] = tuple(range(offset, offset + len(vertices)))
         offset += len(vertices)
     lazy_type_name = "LazyCarrierFrameMap"
-    lazy_type = cast(Any, getattr(core, lazy_type_name))
+    lazy_type = cast(Any, getattr(snapshot_module, lazy_type_name))
     lazy = lazy_type(vertex_coords, face_vertex_ids)
     assert lazy._cache == {}
     keys = tuple(lazy)
@@ -1283,7 +1295,7 @@ def _check_carrier_frame_lifecycle():
     assert cloned._cache == {}
     partial = lazy_type(vertex_coords, dict(face_vertex_ids))
     partial.get(FaceId(1))
-    original_factory = snapshot._carrier_frame_from_coords
+    original_factory = snapshot_module._carrier_frame_from_coords
     factory_calls = 0
 
     def count_factory(vertices):
@@ -1291,12 +1303,12 @@ def _check_carrier_frame_lifecycle():
         factory_calls += 1
         return original_factory(vertices)
 
-    setattr(snapshot, "_carrier_frame_from_coords", count_factory)
+    setattr(snapshot_module, "_carrier_frame_from_coords", count_factory)
     try:
         factory_calls = 0
         partial_clone = copy.deepcopy(partial)
     finally:
-        setattr(snapshot, "_carrier_frame_from_coords", original_factory)
+        setattr(snapshot_module, "_carrier_frame_from_coords", original_factory)
     assert factory_calls == 0
     assert tuple(partial._cache) == tuple(partial_clone._cache) == (FaceId(1),)
     assert len(partial_clone._cache) < len(face_vertex_ids)
@@ -1320,10 +1332,10 @@ def _check_history_and_single_object_guard():
     vertex_coords = ((0.0, 0.0, 0.0),)
     face_vertex_ids = {FaceId(1): (0,)}
     lazy_type_name = "LazyCarrierFrameMap"
-    lazy_type = cast(Any, getattr(core, lazy_type_name))
+    lazy_type = cast(Any, getattr(snapshot_module, lazy_type_name))
     carrier_frames = lazy_type(vertex_coords, face_vertex_ids)
     history_token = operators._new_history_token()
-    resolution = core.LazyTopologyResolution(
+    resolution = snapshot_module.LazyTopologyResolution(
         numpy.asarray(vertex_coords, dtype=numpy.float64),
         numpy.asarray((0,), dtype=numpy.int64),
         numpy.asarray((0,), dtype=numpy.int64),
@@ -1436,7 +1448,7 @@ def _check_rip_lookup_validation():
     bm = bmesh.new()
     bmesh.ops.create_grid(bm, x_segments=2, y_segments=1, size=2.0)
     try:
-        topology = core.prepare_topology(bm, 0, TOLERANCE, mark_vertex_ids=True)
+        topology = snapshot_module.prepare_topology(bm, 0, TOLERANCE, mark_vertex_ids=True)
         assert topology.topology_resolution.resolve_count == 0
         bm.verts.ensure_lookup_table()
         bm.verts[0].select = True
@@ -1444,21 +1456,21 @@ def _check_rip_lookup_validation():
         valid = topology.vertex_lookup
         assert topology.topology_resolution.resolve_count == 1
         variants = {
-            "axis": core.build_vertex_mirror_lookup(coords, 1, TOLERANCE),
-            "tolerance": core.build_vertex_mirror_lookup(coords, 0, TOLERANCE * 2.0),
-            "count": core.build_vertex_mirror_lookup(coords[:-1], 0, TOLERANCE),
+            "axis": matching.build_vertex_mirror_lookup(coords, 1, TOLERANCE),
+            "tolerance": matching.build_vertex_mirror_lookup(coords, 0, TOLERANCE * 2.0),
+            "count": matching.build_vertex_mirror_lookup(coords[:-1], 0, TOLERANCE),
         }
         first_bad_coords = list(coords)
         first_bad_coords[0] = Vector((first_bad_coords[0][0] + 1.0, *first_bad_coords[0][1:]))
-        first_bad = core.build_vertex_mirror_lookup(first_bad_coords, 0, TOLERANCE)
+        first_bad = matching.build_vertex_mirror_lookup(first_bad_coords, 0, TOLERANCE)
         variants["first"] = first_bad
         last_bad_coords = list(coords)
         last_bad_coords[-1] = Vector((last_bad_coords[-1][0] + 1.0, *last_bad_coords[-1][1:]))
-        last_bad = core.build_vertex_mirror_lookup(last_bad_coords, 0, TOLERANCE)
+        last_bad = matching.build_vertex_mirror_lookup(last_bad_coords, 0, TOLERANCE)
         variants["last"] = last_bad
 
         original_match = rip_module._lookup_matches_mesh
-        original_builder = core.build_vertex_mirror_lookup
+        original_builder = matching.build_vertex_mirror_lookup
         validation_calls = 0
         rebuild_calls = 0
 
@@ -1475,7 +1487,7 @@ def _check_rip_lookup_validation():
         validation_name = "_lookup_matches_mesh"
         builder_name = "build_vertex_mirror_lookup"
         setattr(rip_module, validation_name, count_validation)
-        setattr(core, builder_name, count_rebuild)
+        setattr(matching, builder_name, count_rebuild)
         try:
             assert rip_module.build_snapshot(bm, 0, TOLERANCE, lookup=valid) is not None
             assert validation_calls == 1 and rebuild_calls == 0
@@ -1487,13 +1499,13 @@ def _check_rip_lookup_validation():
 
             validation_calls = 0
             rebuild_calls = 0
-            vertex_layer = bm.verts.layers.int.get(core.VERT_RIP_ID_LAYER)
+            vertex_layer = bm.verts.layers.int.get(layer_names.VERT_RIP_ID_LAYER)
             assert vertex_layer is not None
             bm.verts.layers.int.remove(vertex_layer)
             assert rip_module.build_snapshot(bm, 0, TOLERANCE, lookup=valid) is None
             assert validation_calls == 1 and rebuild_calls == 0
 
-            topology = core.prepare_topology(bm, 0, TOLERANCE, mark_vertex_ids=True)
+            topology = snapshot_module.prepare_topology(bm, 0, TOLERANCE, mark_vertex_ids=True)
             for vertex in bm.verts:
                 vertex.select = False
             validation_calls = 0
@@ -1502,7 +1514,7 @@ def _check_rip_lookup_validation():
             assert validation_calls == 1 and rebuild_calls == 0
         finally:
             setattr(rip_module, validation_name, original_match)
-            setattr(core, builder_name, original_builder)
+            setattr(matching, builder_name, original_builder)
     finally:
         bm.free()
 
@@ -1518,8 +1530,8 @@ def _check_rip_scoped_vertex_ids():
             vertex.select = False
         bm.verts[1].select = True
 
-        topology = core.prepare_topology(bm, 0, TOLERANCE, mark_vertex_ids=True)
-        vertex_layer = bm.verts.layers.int.get(core.VERT_RIP_ID_LAYER)
+        topology = snapshot_module.prepare_topology(bm, 0, TOLERANCE, mark_vertex_ids=True)
+        vertex_layer = bm.verts.layers.int.get(layer_names.VERT_RIP_ID_LAYER)
         assert vertex_layer is not None
         assert all(int(vertex[vertex_layer]) == 0 for vertex in bm.verts)
 
@@ -1551,13 +1563,13 @@ def _check_rip_scoped_vertex_ids():
 
         # The lookup=None compatibility path resolves the same selected
         # region and must produce the same snapshot IDs.
-        topology = core.prepare_topology(bm, 0, TOLERANCE, mark_vertex_ids=True)
+        topology = snapshot_module.prepare_topology(bm, 0, TOLERANCE, mark_vertex_ids=True)
         snapshot_without_lookup = rip_module.build_snapshot(bm, 0, TOLERANCE)
         assert snapshot_without_lookup == snapshot
 
         # Re-preparing must not retain positive IDs from the prior scoped run.
-        topology = core.prepare_topology(bm, 0, TOLERANCE, mark_vertex_ids=True)
-        vertex_layer = bm.verts.layers.int.get(core.VERT_RIP_ID_LAYER)
+        topology = snapshot_module.prepare_topology(bm, 0, TOLERANCE, mark_vertex_ids=True)
+        vertex_layer = bm.verts.layers.int.get(layer_names.VERT_RIP_ID_LAYER)
         assert vertex_layer is not None
         assert all(int(vertex[vertex_layer]) == 0 for vertex in bm.verts)
         for vertex in bm.verts:
@@ -1581,7 +1593,7 @@ def _check_rip_resolution_free_lookup_equivalence():
         for index in (1, 2, 3):
             bm.verts[index].select = True
 
-        topology = core.prepare_topology(bm, 0, TOLERANCE, mark_vertex_ids=True)
+        topology = snapshot_module.prepare_topology(bm, 0, TOLERANCE, mark_vertex_ids=True)
         resolution = topology.topology_resolution
         lazy_lookup = resolution.vertex_lookup_unresolved
         assert resolution.resolve_count == 0
@@ -1914,7 +1926,7 @@ def _check_u6_scoped_selection_equivalence():
 
             setattr(selection, "build_vertex_pair_table", count_selection_full_build)
             try:
-                actual_added = core.extend_selection_to_mirror(actual_bm, 0, TOLERANCE)
+                actual_added = selection.extend_selection_to_mirror(actual_bm, 0, TOLERANCE)
             finally:
                 setattr(selection, "build_vertex_pair_table", original_selection_builder)
             assert full_build_calls == 0, (pattern, full_build_calls)
@@ -1924,7 +1936,7 @@ def _check_u6_scoped_selection_equivalence():
             coords = numpy.asarray([tuple(vertex.co) for vertex in source.verts], dtype=numpy.float64)
             selected = tuple(vertex.index for vertex in source.verts if vertex.select)
             expected = _reference_classify_selection_overlap(coords, selected)
-            registry = core.VertexRegistry(coords, 0, TOLERANCE)
+            registry = matching.VertexRegistry(coords, 0, TOLERANCE)
             resolved = registry.resolve_closure(selected)
             assert resolved is not None
             closure, expected_scoped_pairs = resolved
@@ -1942,7 +1954,7 @@ def _check_u6_scoped_selection_equivalence():
 
             setattr(matching, "build_vertex_pair_table", count_matching_full_build)
             try:
-                actual = core.classify_selection_overlap(
+                actual = matching.classify_selection_overlap(
                     coords,
                     selected,
                     axis_index=0,
@@ -2031,7 +2043,7 @@ def _check_u6_registry_fallback():
     setattr(matching, "VertexRegistry", UnavailableRegistry)
     setattr(matching, "build_vertex_pair_table", count_build)
     try:
-        actual = core.classify_selection_overlap(coords, (0,), axis_index=0, tolerance=TOLERANCE)
+        actual = matching.classify_selection_overlap(coords, (0,), axis_index=0, tolerance=TOLERANCE)
     finally:
         setattr(matching, "build_vertex_pair_table", original_builder)
         setattr(matching, "VertexRegistry", original_registry)
@@ -2050,7 +2062,7 @@ def _check_u6_registry_fallback():
         setattr(selection, "VertexRegistry", UnavailableRegistry)
         setattr(selection, "build_vertex_pair_table", count_build)
         try:
-            added = core.extend_selection_to_mirror(bm, 0, TOLERANCE)
+            added = selection.extend_selection_to_mirror(bm, 0, TOLERANCE)
         finally:
             setattr(selection, "build_vertex_pair_table", original_builder)
             setattr(selection, "VertexRegistry", original_registry)
@@ -2094,8 +2106,8 @@ def _check_selection_snapshot_bulk_equivalence():
         mesh_object = _BulkMeshObject(bulk_data)
         original_foreach = _install_bulk_polygon_loop_hooks(bulk_data)
         try:
-            compat = core.capture_selection_snapshot(bm, domains=("VERT", "EDGE", "FACE"), include_history=True)
-            captured = core.capture_selection_snapshot(
+            compat = snapshot_module.capture_selection_snapshot(bm, domains=("VERT", "EDGE", "FACE"), include_history=True)
+            captured = snapshot_module.capture_selection_snapshot(
                 bulk,
                 mesh_object=mesh_object,
                 domains=("VERT", "EDGE", "FACE"),
@@ -2132,8 +2144,8 @@ def _check_selection_snapshot_bulk_equivalence():
                 source.edges[left_edge.index].select = True
                 source.faces[left_face.index].select = True
             bulk_data.sync_selection_from(bulk)
-            added_compat = core.extend_selection_to_mirror(bm, 0, TOLERANCE, mesh_object=None)
-            added_bulk = core.extend_selection_to_mirror(bulk, 0, TOLERANCE, mesh_object=mesh_object)
+            added_compat = selection.extend_selection_to_mirror(bm, 0, TOLERANCE, mesh_object=None)
+            added_bulk = selection.extend_selection_to_mirror(bulk, 0, TOLERANCE, mesh_object=mesh_object)
             assert added_compat == added_bulk
             assert _selection_state(bm) == _selection_state(bulk)
             assert right[0].select and right_face.select
@@ -2180,8 +2192,8 @@ def _check_capture_resolve_contract():
         mesh_object = _BulkMeshObject(bulk_data)
         original_foreach = _install_bulk_polygon_loop_hooks(bulk_data)
         try:
-            compatibility = core.prepare_topology(compat, 0, TOLERANCE)
-            captured = core.prepare_topology(bulk, 0, TOLERANCE, mesh_object=mesh_object)
+            compatibility = snapshot_module.prepare_topology(compat, 0, TOLERANCE)
+            captured = snapshot_module.prepare_topology(bulk, 0, TOLERANCE, mesh_object=mesh_object)
             assert mesh_object.update_calls == 1
             assert compatibility.total_faces == captured.total_faces
             assert compatibility.mirror_face_ids == captured.mirror_face_ids
@@ -2192,17 +2204,17 @@ def _check_capture_resolve_contract():
             assert captured.topology_resolution.edge_count == len(bulk.edges)
             assert captured.topology_resolution.face_count == len(bulk.faces)
             coords_matrix = captured.topology_resolution.coords64
-            assert core._one_sided_pair_table(coords_matrix, 0, TOLERANCE) == core.build_vertex_pair_table(
+            assert matching._one_sided_pair_table(coords_matrix, 0, TOLERANCE) == matching.build_vertex_pair_table(
                 tuple(Vector(tuple(row)) for row in coords_matrix.tolist()), 0, TOLERANCE
             )
             bulk_data.shape_keys = object()
             shape_key_object = _BulkMeshObject(bulk_data)
-            shape_key_topology = core.prepare_topology(bulk, 0, TOLERANCE, mesh_object=shape_key_object)
+            shape_key_topology = snapshot_module.prepare_topology(bulk, 0, TOLERANCE, mesh_object=shape_key_object)
             assert shape_key_object.update_calls == 0
             assert shape_key_topology.total_faces == captured.total_faces
             bulk_data.shape_keys = None
             shared_object = _BulkMeshObject(bulk_data)
-            shared = core.prepare_topology(bulk, 0, TOLERANCE, mesh_object=shared_object)
+            shared = snapshot_module.prepare_topology(bulk, 0, TOLERANCE, mesh_object=shared_object)
             assert shared.mirror_face_ids == compatibility.mirror_face_ids
         finally:
             _BulkCollection.foreach_get = original_foreach
@@ -2212,8 +2224,8 @@ def _check_capture_resolve_contract():
     empty = bmesh.new()
     try:
         data = _BulkMeshData(empty)
-        compatibility = core.prepare_topology(empty, 0, TOLERANCE)
-        captured = core.prepare_topology(empty, 0, TOLERANCE, mesh_object=_BulkMeshObject(data))
+        compatibility = snapshot_module.prepare_topology(empty, 0, TOLERANCE)
+        captured = snapshot_module.prepare_topology(empty, 0, TOLERANCE, mesh_object=_BulkMeshObject(data))
         assert compatibility.topology_resolution.coords64.shape == (0, 3)
         assert captured.topology_resolution.coords64.shape == (0, 3)
         assert compatibility.mirror_face_ids == captured.mirror_face_ids == {}
@@ -2236,7 +2248,7 @@ def _check_rip_capture_omits_vertex_edge_hides():
         for index, face in enumerate(bm.faces):
             face.hide = index % 2 == 1
 
-        non_rip = core.prepare_topology(bm, 0, TOLERANCE)
+        non_rip = snapshot_module.prepare_topology(bm, 0, TOLERANCE)
         assert non_rip.topology_resolution.hide_vertices.any()
         assert non_rip.topology_resolution.hide_edges.any()
         assert non_rip.topology_resolution.hide_faces.any()
@@ -2252,7 +2264,7 @@ def _check_rip_capture_omits_vertex_edge_hides():
             bm.verts[index].select = True
 
         data = _BulkMeshData(bm)
-        rip_topology = core.prepare_topology(
+        rip_topology = snapshot_module.prepare_topology(
             bm,
             0,
             TOLERANCE,
@@ -2269,8 +2281,8 @@ def _check_rip_capture_omits_vertex_edge_hides():
             resolution.hide_faces,
             numpy.asarray([bool(face.hide) for face in bm.faces], dtype=bool),
         )
-        assert bm.verts.layers.int.get(core.VERT_HIDDEN_LAYER) is None
-        assert bm.edges.layers.int.get(core.EDGE_HIDDEN_LAYER) is None
+        assert bm.verts.layers.int.get(layer_names.VERT_HIDDEN_LAYER) is None
+        assert bm.edges.layers.int.get(layer_names.EDGE_HIDDEN_LAYER) is None
         rip_snapshot = rip_module.build_snapshot(
             bm,
             0,
@@ -2278,7 +2290,7 @@ def _check_rip_capture_omits_vertex_edge_hides():
             lookup=resolution.vertex_lookup_unresolved,
         )
         assert rip_snapshot is not None
-        core.remove_temporary_layers(bm)
+        snapshot_module.remove_temporary_layers(bm)
         hide_after_rip = (
             tuple(bool(vertex.hide) for vertex in bm.verts),
             tuple(bool(edge.hide) for edge in bm.edges),
@@ -2291,7 +2303,7 @@ def _check_rip_capture_omits_vertex_edge_hides():
             fallback_data = _BulkMeshData(fallback_bm)
             fallback_data.shape_keys = object()
             fallback_object = _BulkMeshObject(fallback_data)
-            fallback_topology = core.prepare_topology(
+            fallback_topology = snapshot_module.prepare_topology(
                 fallback_bm,
                 0,
                 TOLERANCE,
@@ -2315,19 +2327,19 @@ def _check_rip_capture_omits_vertex_edge_hides():
                 fallback_resolution.hide_faces,
                 numpy.asarray([bool(face.hide) for face in fallback_bm.faces], dtype=bool),
             )
-            assert fallback_bm.verts.layers.int.get(core.VERT_HIDDEN_LAYER) is None
-            assert fallback_bm.edges.layers.int.get(core.EDGE_HIDDEN_LAYER) is None
+            assert fallback_bm.verts.layers.int.get(layer_names.VERT_HIDDEN_LAYER) is None
+            assert fallback_bm.edges.layers.int.get(layer_names.EDGE_HIDDEN_LAYER) is None
         finally:
             fallback_bm.free()
 
-        fallback = core._capture_bmesh_snapshot(bm, skip_vertex_edge_hides=True)
+        fallback = snapshot_module._capture_bmesh_snapshot(bm, skip_vertex_edge_hides=True)
         assert numpy.array_equal(fallback[4], numpy.zeros(len(bm.verts), dtype=bool))
         assert numpy.array_equal(fallback[5], numpy.zeros(len(bm.edges), dtype=bool))
         assert numpy.array_equal(
             fallback[6],
             numpy.asarray([bool(face.hide) for face in bm.faces], dtype=bool),
         )
-        compatibility = core._capture_bmesh_snapshot(bm)
+        compatibility = snapshot_module._capture_bmesh_snapshot(bm)
         assert compatibility[4].any()
         assert compatibility[5].any()
     finally:
@@ -2341,8 +2353,8 @@ def _assert_bulk_snapshot_matches_edit_bmesh(obj, bm):
         edge.hide = index % 3 == 2
     for index, face in enumerate(bm.faces):
         face.hide = index % 2 == 1
-    bulk = core._capture_mesh_snapshot(obj, bm)
-    compatibility = core._capture_bmesh_snapshot(bm)
+    bulk = snapshot_module._capture_mesh_snapshot(obj, bm)
+    compatibility = snapshot_module._capture_bmesh_snapshot(bm)
     assert bulk is not None
     assert len(bulk) == len(compatibility)
     for actual, expected in zip(bulk, compatibility, strict=True):
@@ -2406,10 +2418,10 @@ def _finish_scope_fixture(face_coordinates, path_face_index):
     bpy.ops.object.mode_set(mode="EDIT")
     bm = bmesh.from_edit_mesh(mesh)
     token = operators._new_history_token()
-    topology = core.prepare_topology(bm, 0, TOLERANCE, token, mesh_object=obj)
+    topology = snapshot_module.prepare_topology(bm, 0, TOLERANCE, token, mesh_object=obj)
     bm.faces.ensure_lookup_table()
     path_face = bm.faces[path_face_index]
-    edge_layer = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+    edge_layer = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
     assert edge_layer is not None
     path_face.edges[0][edge_layer] = 0
     bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
@@ -2444,9 +2456,9 @@ def _check_finish_scope_warning_matrix():
     )
     for label, faces, path_face_index, expect_warning, expect_apply in cases:
         obj, mesh, window_pointer, session, resolution = _finish_scope_fixture(faces, path_face_index)
-        original_crossing_plan = core.plan_mirrored_path_crossings
-        original_boundary_check = core.reflected_path_uses_only_target_boundaries
-        original_apply = core.apply_reflected_path_topology
+        original_crossing_plan = stitch.plan_mirrored_path_crossings
+        original_boundary_check = stitch.reflected_path_uses_only_target_boundaries
+        original_apply = stitch.apply_reflected_path_topology
         original_backup_create = operators.backup.create_topology_backup
         original_backup_remove = operators.backup.remove_backup
         apply_calls = 0
@@ -2455,12 +2467,12 @@ def _check_finish_scope_warning_matrix():
             nonlocal apply_calls
             apply_calls += 1
             if _kwargs.get("return_summary"):
-                return len(source_edges), 0, "", core.SelectionMutationSummary()
+                return len(source_edges), 0, "", stitch.SelectionMutationSummary()
             return len(source_edges), 0, ""
 
-        setattr(core, "plan_mirrored_path_crossings", lambda *_args, **_kwargs: ([], ""))
-        setattr(core, "reflected_path_uses_only_target_boundaries", lambda *_args, **_kwargs: True)
-        setattr(core, "apply_reflected_path_topology", count_apply)
+        setattr(stitch, "plan_mirrored_path_crossings", lambda *_args, **_kwargs: ([], ""))
+        setattr(stitch, "reflected_path_uses_only_target_boundaries", lambda *_args, **_kwargs: True)
+        setattr(stitch, "apply_reflected_path_topology", count_apply)
         setattr(operators.backup, "create_topology_backup", lambda _bm: object())
         setattr(operators.backup, "remove_backup", lambda _value: None)
         operators._SESSIONS[window_pointer] = session
@@ -2482,9 +2494,9 @@ def _check_finish_scope_warning_matrix():
                 assert resolution.resolve_count == 0
                 assert resolution.partial_face_resolve_count >= 1
         finally:
-            setattr(core, "plan_mirrored_path_crossings", original_crossing_plan)
-            setattr(core, "reflected_path_uses_only_target_boundaries", original_boundary_check)
-            setattr(core, "apply_reflected_path_topology", original_apply)
+            setattr(stitch, "plan_mirrored_path_crossings", original_crossing_plan)
+            setattr(stitch, "reflected_path_uses_only_target_boundaries", original_boundary_check)
+            setattr(stitch, "apply_reflected_path_topology", original_apply)
             setattr(operators.backup, "create_topology_backup", original_backup_create)
             setattr(operators.backup, "remove_backup", original_backup_remove)
             operators._SESSIONS.pop(window_pointer, None)
@@ -2498,10 +2510,10 @@ def _check_finish_scope_warning_matrix():
 def _check_scoped_face_overlay_and_materialize():
     bm = _build_deformed_grid(3)
     try:
-        topology = core.prepare_topology(bm, 0, TOLERANCE, 808)
+        topology = snapshot_module.prepare_topology(bm, 0, TOLERANCE, 808)
         resolution = topology.topology_resolution
-        face_id_layer = bm.faces.layers.int.get(core.FACE_ID_LAYER)
-        edge_layer = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+        face_id_layer = bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
+        edge_layer = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
         assert face_id_layer is not None and edge_layer is not None
         bm.faces.ensure_lookup_table()
         path_edge = bm.faces[0].edges[0]
@@ -2519,7 +2531,7 @@ def _check_scoped_face_overlay_and_materialize():
             def __len__(self):
                 raise AssertionError("scope overlay must not resolve the lazy face map")
 
-        overlay = core.resolve_live_mirror_face_map(
+        overlay = face_mapping.resolve_live_mirror_face_map(
             bm,
             GetOnlyFaceMap(),
             0,
@@ -2530,7 +2542,7 @@ def _check_scoped_face_overlay_and_materialize():
         assert resolution.resolve_count == 0
 
         resolution.materialize_faces(bm, scope)
-        mirror_layer = bm.faces.layers.int.get(core.FACE_MIRROR_ID_LAYER)
+        mirror_layer = bm.faces.layers.int.get(layer_names.FACE_MIRROR_ID_LAYER)
         assert mirror_layer is not None
         for face in bm.faces:
             face_id = FaceId(int(face[face_id_layer]))
@@ -2560,11 +2572,11 @@ def _check_finish_zero_match_decline():
         bpy.ops.object.mode_set(mode="EDIT")
         bm = bmesh.from_edit_mesh(mesh)
         token = operators._new_history_token()
-        topology = core.prepare_topology(bm, 0, TOLERANCE, token, mesh_object=obj)
+        topology = snapshot_module.prepare_topology(bm, 0, TOLERANCE, token, mesh_object=obj)
         bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
         bm.edges.ensure_lookup_table()
         split = bmesh.ops.subdivide_edges(bm, edges=(bm.edges[0],), cuts=1, use_grid_fill=False)
-        marker_layer = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+        marker_layer = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
         assert marker_layer is not None
         # subdivide interpolates int layers from the parent edge; a real knife
         # cut leaves the marker at 0, so zero the split edges explicitly.
@@ -2607,7 +2619,7 @@ def _check_finish_zero_match_decline():
         ]
         restored = bmesh.from_edit_mesh(mesh)
         assert len(restored.verts) == native_vertex_count
-        assert restored.faces.layers.int.get(core.FACE_ID_LAYER) is None
+        assert restored.faces.layers.int.get(layer_names.FACE_ID_LAYER) is None
     finally:
         operators._SESSIONS.pop(window_pointer, None)
         if obj.mode != "OBJECT":
@@ -2620,13 +2632,13 @@ def _check_finish_zero_match_decline():
 def _check_hide_layer_omission_and_consumers():
     bm = _build_deformed_grid(3)
     try:
-        topology = core.prepare_topology(bm, 0, TOLERANCE)
-        assert bm.verts.layers.int.get(core.VERT_HIDDEN_LAYER) is None
-        assert bm.edges.layers.int.get(core.EDGE_HIDDEN_LAYER) is None
-        assert bm.faces.layers.int.get(core.FACE_HIDDEN_LAYER) is None
-        assert not core.path_ring_includes_pre_hidden_edges(bm)
-        snapshot = core.SelectionSnapshot(False, False, False, [])
-        core.restore_visibility_and_selection(bm, topology.hidden_by_face_id, snapshot)
+        topology = snapshot_module.prepare_topology(bm, 0, TOLERANCE)
+        assert bm.verts.layers.int.get(layer_names.VERT_HIDDEN_LAYER) is None
+        assert bm.edges.layers.int.get(layer_names.EDGE_HIDDEN_LAYER) is None
+        assert bm.faces.layers.int.get(layer_names.FACE_HIDDEN_LAYER) is None
+        assert not stitch.path_ring_includes_pre_hidden_edges(bm)
+        snapshot = _types.SelectionSnapshot(False, False, False, [])
+        selection.restore_visibility_and_selection(bm, topology.hidden_by_face_id, snapshot)
     finally:
         bm.free()
 
@@ -2636,7 +2648,7 @@ def _check_bulk_guard_fallbacks():
         bm = _build_deformed_grid(2)
         try:
             data = _BulkMeshData(bm)
-            expected = core.prepare_topology(bm, 0, TOLERANCE)
+            expected = snapshot_module.prepare_topology(bm, 0, TOLERANCE)
             expected_map = expected.mirror_face_ids
             if kind == "counts":
                 data.vertices._values.append((9.0, 9.0, 9.0))
@@ -2654,7 +2666,7 @@ def _check_bulk_guard_fallbacks():
                     data.loops._values[start],
                 )
             obj = _BulkMeshObject(data)
-            topology = core.prepare_topology(bm, 0, TOLERANCE, mesh_object=obj)
+            topology = snapshot_module.prepare_topology(bm, 0, TOLERANCE, mesh_object=obj)
             assert obj.update_calls == 1
             assert topology.total_faces == len(bm.faces)
             assert topology.topology_resolution.vertex_count == len(bm.verts)
@@ -2703,7 +2715,7 @@ def _check_selection_bulk_guard_fallbacks():
                 bm.select_history.clear()
                 bm.select_history.add(bm.verts[0])
 
-            expected = core.capture_selection_snapshot(bm, domains=domains, include_history=True)
+            expected = snapshot_module.capture_selection_snapshot(bm, domains=domains, include_history=True)
             data = _BulkMeshData(bm)
             if kind == "shape_keys":
                 data.shape_keys = object()
@@ -2721,7 +2733,7 @@ def _check_selection_bulk_guard_fallbacks():
                     data.loops._values[start],
                 )
             obj = _BulkMeshObject(data)
-            captured = core.capture_selection_snapshot(
+            captured = snapshot_module.capture_selection_snapshot(
                 bm,
                 mesh_object=obj,
                 domains=domains,
@@ -2738,9 +2750,9 @@ def _check_selection_bulk_guard_fallbacks():
 
 def _check_nonfinite_one_sided_fallback():
     coords = numpy.asarray(((numpy.nan, 0.0, 0.0), (1.0, 0.0, 0.0)), dtype=numpy.float64)
-    assert core._one_sided_pair_table(coords, 0, TOLERANCE) is None
+    assert matching._one_sided_pair_table(coords, 0, TOLERANCE) is None
     empty = numpy.empty(0, dtype=numpy.int64)
-    handle = core.LazyTopologyResolution(
+    handle = snapshot_module.LazyTopologyResolution(
         coords,
         empty,
         empty,
@@ -2760,7 +2772,7 @@ def _check_nonfinite_one_sided_fallback():
             return "error", type(exc)
 
     expected = outcome(
-        lambda: core.build_vertex_pair_table(tuple(Vector(tuple(row)) for row in coords.tolist()), 0, TOLERANCE)
+        lambda: matching.build_vertex_pair_table(tuple(Vector(tuple(row)) for row in coords.tolist()), 0, TOLERANCE)
     )
     actual = outcome(handle.resolve)
     assert actual[0] == expected[0]
@@ -2769,7 +2781,7 @@ def _check_nonfinite_one_sided_fallback():
 
 
 def _expected_mirror_candidate_arrays(coords, axis_index: int):
-    lookup = core.build_vertex_mirror_lookup(coords, axis_index, TOLERANCE)
+    lookup = matching.build_vertex_mirror_lookup(coords, axis_index, TOLERANCE)
     matrix = numpy.asarray([_vector_tuple(coordinate) for coordinate in coords], dtype=numpy.float64)
     on_plane = numpy.abs(matrix[:, axis_index]) <= TOLERANCE
     parts = []
@@ -2798,11 +2810,11 @@ def _expected_mirror_candidate_arrays(coords, axis_index: int):
 
 
 def _check_one_sided_candidate_arrays_contract():
-    for axis_index in (core.AXIS_INDEX["X"], core.AXIS_INDEX["Y"], core.AXIS_INDEX["Z"]):
+    for axis_index in (matching.AXIS_INDEX["X"], matching.AXIS_INDEX["Y"], matching.AXIS_INDEX["Z"]):
         for seed in SEEDS:
             coords = _make_lookup_case(axis_index, seed)
             expected = _expected_mirror_candidate_arrays(coords, axis_index)
-            actual = core._one_sided_candidate_arrays(
+            actual = matching._one_sided_candidate_arrays(
                 numpy.asarray([_vector_tuple(coordinate) for coordinate in coords], dtype=numpy.float64),
                 axis_index,
                 TOLERANCE,
@@ -2874,7 +2886,7 @@ def _check_vertex_registry_plane_split_oracle():
         ),
         dtype=numpy.float64,
     )
-    registry = core.VertexRegistry(coords, 0, tolerance)
+    registry = matching.VertexRegistry(coords, 0, tolerance)
 
     assert registry.on_plane_indices.tolist() == [2, 3, 4]
     assert _candidate_multiset(registry.candidates_on_plane(numpy.asarray((2,), dtype=numpy.int64))) == [
@@ -2900,7 +2912,7 @@ def _check_vertex_registry_dense_candidates():
     tolerance = TOLERANCE
     positive = [(1.0 + 0.3 * tolerance * index, 0.0, 0.0) for index in range(4)]
     negative = [(-coordinate[0], coordinate[1], coordinate[2]) for coordinate in positive]
-    registry = core.VertexRegistry(numpy.asarray(positive + negative, dtype=numpy.float64), 0, tolerance)
+    registry = matching.VertexRegistry(numpy.asarray(positive + negative, dtype=numpy.float64), 0, tolerance)
 
     forward = _candidate_multiset(registry.candidates_off_plane(registry.positive_indices))
     assert len(forward) == 16
@@ -2928,7 +2940,7 @@ def _check_vertex_registry_matches_one_sided_candidate_multiset():
     )
     for axis_index in range(3):
         axis_coords = numpy.roll(coords, axis_index, axis=1)
-        registry = core.VertexRegistry(axis_coords, axis_index, tolerance)
+        registry = matching.VertexRegistry(axis_coords, axis_index, tolerance)
         parts = (
             registry.candidates_off_plane(registry.positive_indices),
             registry.claimants_off_plane(registry.positive_indices),
@@ -2936,14 +2948,14 @@ def _check_vertex_registry_matches_one_sided_candidate_multiset():
         )
         candidate_rows = [row for arrays in parts for row in _candidate_multiset(arrays)]
 
-        expected = core._one_sided_candidate_arrays(axis_coords, axis_index, tolerance)
+        expected = matching._one_sided_candidate_arrays(axis_coords, axis_index, tolerance)
         assert sorted(candidate_rows) == _candidate_multiset(expected)
 
 
 def _partial_resolution_handle(coords, tolerance=TOLERANCE):
     coords64 = numpy.asarray(coords, dtype=numpy.float64).reshape((-1, 3))
     empty = numpy.empty(0, dtype=numpy.int64)
-    return core.LazyTopologyResolution(
+    return snapshot_module.LazyTopologyResolution(
         coords64,
         empty,
         empty,
@@ -3082,13 +3094,13 @@ def _check_partial_vertex_resolution_non_power_tolerance_boundary():
 
 
 def _check_partial_vertex_resolution_registry_fallback_and_empty_guard():
-    empty_registry = core.VertexRegistry(numpy.empty((0, 3), dtype=numpy.float64), 0, TOLERANCE)
+    empty_registry = matching.VertexRegistry(numpy.empty((0, 3), dtype=numpy.float64), 0, TOLERANCE)
     empty_closure = empty_registry.resolve_closure(())
     assert empty_closure is not None
     assert len(empty_closure[0]) == 0 and empty_closure[1] == {}
 
     coords = numpy.asarray(((numpy.nan, 0.0, 0.0),), dtype=numpy.float64)
-    invalid_registry = core.VertexRegistry(coords, 0, TOLERANCE)
+    invalid_registry = matching.VertexRegistry(coords, 0, TOLERANCE)
     assert invalid_registry.resolve_closure(()) is None
     full = _partial_resolution_handle(coords)
     partial = _partial_resolution_handle(coords)
@@ -3108,7 +3120,7 @@ def _check_partial_vertex_resolution_registry_fallback_and_empty_guard():
 def _check_lazy_restore_state_matrix():
     bm = _build_deformed_grid(3)
     try:
-        topology = core.prepare_topology(bm, 0, TOLERANCE, 19)
+        topology = snapshot_module.prepare_topology(bm, 0, TOLERANCE, 19)
         session = KnifeSession(
             window_pointer=1,
             area_pointer=2,
@@ -3130,7 +3142,7 @@ def _check_lazy_restore_state_matrix():
         original_from_edit = operators.bmesh.from_edit_mesh
         setattr(operators.bmesh, "from_edit_mesh", lambda _data: bm)
         try:
-            unresolved_materialize = core.LazyTopologyResolution(
+            unresolved_materialize = snapshot_module.LazyTopologyResolution(
                 topology.topology_resolution.coords64,
                 topology.topology_resolution.loop_verts,
                 topology.topology_resolution.loop_starts,
@@ -3154,12 +3166,12 @@ def _check_lazy_restore_state_matrix():
             assert session.mirror_face_ids == topology.mirror_face_ids
             assert copy.deepcopy(topology.topology_resolution) == topology.topology_resolution
             assert not any(
-                isinstance(value, core.VertexMirrorLookup) for value in topology.topology_resolution.__dict__.values()
+                isinstance(value, matching.VertexMirrorLookup) for value in topology.topology_resolution.__dict__.values()
             )
             assert not any(name in {"bm", "mesh_object", "callback"} for name in topology.topology_resolution.__dict__)
-            mirror_layer = bm.faces.layers.int.get(core.FACE_MIRROR_ID_LAYER)
-            face_id_layer = bm.faces.layers.int.get(core.FACE_ID_LAYER)
-            token_layer = bm.faces.layers.int.get(core.HISTORY_TOKEN_LAYER)
+            mirror_layer = bm.faces.layers.int.get(layer_names.FACE_MIRROR_ID_LAYER)
+            face_id_layer = bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
+            token_layer = bm.faces.layers.int.get(layer_names.HISTORY_TOKEN_LAYER)
             assert mirror_layer is not None and face_id_layer is not None and token_layer is not None
             first_face = next(iter(bm.faces))
             for face in bm.faces:
@@ -3193,7 +3205,7 @@ def _check_lazy_restore_state_matrix():
                 face[token_layer] = 77
                 face[mirror_layer] = 0
             foreign_handle = copy.copy(session)
-            foreign_handle.topology_resolution = core.LazyTopologyResolution(
+            foreign_handle.topology_resolution = snapshot_module.LazyTopologyResolution(
                 topology.topology_resolution.coords64,
                 topology.topology_resolution.loop_verts,
                 topology.topology_resolution.loop_starts,
@@ -3214,7 +3226,7 @@ def _check_lazy_restore_state_matrix():
             original_face_id = int(first_face[face_id_layer])
             first_face[face_id_layer] = 999
             invalid_domain = copy.copy(session)
-            invalid_domain.topology_resolution = core.LazyTopologyResolution(
+            invalid_domain.topology_resolution = snapshot_module.LazyTopologyResolution(
                 topology.topology_resolution.coords64,
                 topology.topology_resolution.loop_verts,
                 topology.topology_resolution.loop_starts,
@@ -3252,7 +3264,7 @@ def _check_lazy_restore_state_matrix():
         finally:
             setattr(operators.bmesh, "from_edit_mesh", original_from_edit)
 
-        unresolved = core.LazyTopologyResolution(
+        unresolved = snapshot_module.LazyTopologyResolution(
             topology.topology_resolution.coords64,
             topology.topology_resolution.loop_verts,
             topology.topology_resolution.loop_starts,
@@ -3275,7 +3287,7 @@ def _check_lazy_restore_state_matrix():
 def _check_prepare_session_invoke_does_not_resolve():
     bm = _build_deformed_grid(2)
     try:
-        prepared = core.prepare_topology(bm, 0, TOLERANCE, 23)
+        prepared = snapshot_module.prepare_topology(bm, 0, TOLERANCE, 23)
         obj = SimpleNamespace(
             name="object",
             type="MESH",
@@ -3293,9 +3305,9 @@ def _check_prepare_session_invoke_does_not_resolve():
             tool_settings=SimpleNamespace(mesh_select_mode=(True, False, False)),
             preferences=SimpleNamespace(edit=SimpleNamespace(undo_steps=8)),
         )
-        original_prepare = core.prepare_topology
+        original_prepare = snapshot_module.prepare_topology
         original_from_edit = operators.bmesh.from_edit_mesh
-        original_remove = core.remove_temporary_layers
+        original_remove = snapshot_module.remove_temporary_layers
         original_update = operators.bmesh.update_edit_mesh
         original_cleanup = session_module.cleanup_session
         original_suspend = session_module._suspend_mesh_symmetry
@@ -3306,9 +3318,9 @@ def _check_prepare_session_invoke_does_not_resolve():
             calls.append(kwargs.get("mesh_object"))
             return prepared
 
-        setattr(core, "prepare_topology", spy_prepare)
+        setattr(snapshot_module, "prepare_topology", spy_prepare)
         setattr(operators.bmesh, "from_edit_mesh", lambda _data: bm)
-        setattr(core, "remove_temporary_layers", lambda _bm: None)
+        setattr(snapshot_module, "remove_temporary_layers", lambda _bm: None)
         setattr(operators.bmesh, "update_edit_mesh", lambda *_args, **_kwargs: None)
         setattr(session_module, "cleanup_session", lambda *_args, **_kwargs: None)
         setattr(session_module, "_suspend_mesh_symmetry", lambda *_args, **_kwargs: None)
@@ -3322,9 +3334,9 @@ def _check_prepare_session_invoke_does_not_resolve():
         finally:
             operators._SESSIONS.pop(11, None)
             operators.clear_history_records()
-            setattr(core, "prepare_topology", original_prepare)
+            setattr(snapshot_module, "prepare_topology", original_prepare)
             setattr(operators.bmesh, "from_edit_mesh", original_from_edit)
-            setattr(core, "remove_temporary_layers", original_remove)
+            setattr(snapshot_module, "remove_temporary_layers", original_remove)
             setattr(operators.bmesh, "update_edit_mesh", original_update)
             setattr(session_module, "cleanup_session", original_cleanup)
             setattr(session_module, "_suspend_mesh_symmetry", original_suspend)
@@ -3365,7 +3377,7 @@ def _check_rip_invoke_does_not_resolve():
             ),
             preferences=SimpleNamespace(edit=SimpleNamespace(undo_steps=8)),
         )
-        original_prepare = core.prepare_topology
+        original_prepare = snapshot_module.prepare_topology
         original_from_edit = session_module.bmesh.from_edit_mesh
         original_update = session_module.bmesh.update_edit_mesh
         original_cleanup = session_module.cleanup_session
@@ -3379,7 +3391,7 @@ def _check_rip_invoke_does_not_resolve():
             prepared.append(result)
             return result
 
-        setattr(core, "prepare_topology", spy_prepare)
+        setattr(snapshot_module, "prepare_topology", spy_prepare)
         setattr(session_module.bmesh, "from_edit_mesh", lambda _data: bm)
         setattr(session_module.bmesh, "update_edit_mesh", lambda *_args, **_kwargs: None)
         setattr(session_module, "cleanup_session", lambda *_args, **_kwargs: None)
@@ -3396,7 +3408,7 @@ def _check_rip_invoke_does_not_resolve():
         finally:
             session_module.session_state._SESSIONS.pop(21, None)
             operators.clear_history_records()
-            setattr(core, "prepare_topology", original_prepare)
+            setattr(snapshot_module, "prepare_topology", original_prepare)
             setattr(session_module.bmesh, "from_edit_mesh", original_from_edit)
             setattr(session_module.bmesh, "update_edit_mesh", original_update)
             setattr(session_module, "cleanup_session", original_cleanup)
@@ -3416,7 +3428,7 @@ def _face_resolution_handle(coords, faces, tolerance=TOLERANCE):
     )
     loop_verts = numpy.asarray([vertex_id for face in faces for vertex_id in face], dtype=numpy.int64)
     empty = numpy.empty(0, dtype=numpy.int64)
-    return core.LazyTopologyResolution(
+    return snapshot_module.LazyTopologyResolution(
         coords64,
         loop_verts,
         loop_starts,
@@ -3477,7 +3489,7 @@ def _restricted_face_results(expected, face_ids):
 def _check_face_registry_preserves_global_rows_and_lazy_geometry():
     coords, faces = _phase4_u4_grid(duplicate=True)
     handle = _face_resolution_handle(coords, faces)
-    registry = core.FaceRegistry(
+    registry = face_mapping.FaceRegistry(
         handle.coords64,
         handle.loop_verts,
         handle.loop_starts,
@@ -3495,7 +3507,7 @@ def _check_face_registry_preserves_global_rows_and_lazy_geometry():
     assert registry.centroid_geometry_ready
     assert registry.geometry_ready
 
-    lazy_centroid_registry = core.FaceRegistry(
+    lazy_centroid_registry = face_mapping.FaceRegistry(
         handle.coords64,
         handle.loop_verts,
         handle.loop_starts,
@@ -3508,7 +3520,7 @@ def _check_face_registry_preserves_global_rows_and_lazy_geometry():
     assert lazy_centroid_registry.centroid_geometry_ready
     assert not lazy_centroid_registry.geometry_ready
 
-    direct_registry = core.FaceRegistry(
+    direct_registry = face_mapping.FaceRegistry(
         handle.coords64,
         handle.loop_verts,
         handle.loop_starts,
@@ -3534,7 +3546,7 @@ def _check_face_registry_preserves_global_rows_and_lazy_geometry():
     assert direct_batch.targets.tolist() == expected_batch_targets
     assert direct_registry._coordinates is None
     assert direct_registry._face_key_buckets is None
-    core._snapshot_face_map(
+    face_mapping._snapshot_face_map(
         handle.coords64,
         handle.loop_verts,
         handle.loop_starts,
@@ -3581,14 +3593,14 @@ def _check_face_geometry_array_index_global_oracle():
         (numpy.asarray((0,), dtype=numpy.int64), numpy.cumsum(loop_totals[:-1], dtype=numpy.int64))
     )
     loop_verts = numpy.asarray([vertex_id for face in faces for vertex_id in face], dtype=numpy.int64)
-    registry = core.FaceRegistry(coords64, loop_verts, loop_starts, loop_totals, 0, TOLERANCE)
+    registry = face_mapping.FaceRegistry(coords64, loop_verts, loop_starts, loop_totals, 0, TOLERANCE)
     actual = registry.exact_geometry_candidates(tuple(FaceId(index) for index in range(1, len(faces) + 1)))
 
     buckets = defaultdict(list)
     for face_index, face in enumerate(faces, start=1):
         key = (
             len(face),
-            tuple(sorted(core._quantized_coordinate(Vector(coords64[vertex_id]), TOLERANCE) for vertex_id in face)),
+            tuple(sorted(matching._quantized_coordinate(Vector(coords64[vertex_id]), TOLERANCE) for vertex_id in face)),
         )
         buckets[key].append(FaceId(face_index))
     expected = {}
@@ -3598,7 +3610,7 @@ def _check_face_geometry_array_index_global_oracle():
             coordinate[0] *= -1.0
         key = (
             len(face),
-            tuple(sorted(core._quantized_coordinate(Vector(coordinate), TOLERANCE) for coordinate in mirrored)),
+            tuple(sorted(matching._quantized_coordinate(Vector(coordinate), TOLERANCE) for coordinate in mirrored)),
         )
         expected[FaceId(face_index)] = tuple(buckets[key])
     assert actual == expected
@@ -3606,7 +3618,7 @@ def _check_face_geometry_array_index_global_oracle():
     invalid_coords = numpy.asarray(
         ((numpy.nan, 0.0, 0.0), (numpy.inf, 0.0, 0.0), (-numpy.inf, 1.0, 0.0)), dtype=numpy.float64
     )
-    invalid_registry = core.FaceRegistry(
+    invalid_registry = face_mapping.FaceRegistry(
         invalid_coords,
         numpy.asarray((0, 1, 2), dtype=numpy.int64),
         numpy.asarray((0,), dtype=numpy.int64),
@@ -3624,7 +3636,7 @@ def _check_face_geometry_array_index_global_oracle():
         ),
         dtype=numpy.float64,
     )
-    overflow_registry = core.FaceRegistry(
+    overflow_registry = face_mapping.FaceRegistry(
         overflow_coords,
         numpy.asarray((0, 1, 2), dtype=numpy.int64),
         numpy.asarray((0,), dtype=numpy.int64),
@@ -3658,7 +3670,7 @@ def _check_face_geometry_snapshot_oracle_edges():
     )
     raw_loop_starts = numpy.asarray((0, 3, 6), dtype=numpy.int64)
     raw_loop_totals = numpy.asarray((3, 3, 3), dtype=numpy.int64)
-    raw_actual = core._snapshot_face_map(
+    raw_actual = face_mapping._snapshot_face_map(
         raw_coords,
         raw_loop_verts,
         raw_loop_starts,
@@ -3672,7 +3684,7 @@ def _check_face_geometry_snapshot_oracle_edges():
     for axis_index in range(3):
         self_coords = numpy.asarray(((0.0, 0.0, 0.0), (0.3, 0.5, 0.7), (0.8, -0.2, 0.4)), dtype=numpy.float64)
         self_coords[:, axis_index] = 0.0
-        self_registry = core.FaceRegistry(
+        self_registry = face_mapping.FaceRegistry(
             self_coords,
             numpy.asarray((0, 1, 2), dtype=numpy.int64),
             numpy.asarray((0,), dtype=numpy.int64),
@@ -3680,7 +3692,7 @@ def _check_face_geometry_snapshot_oracle_edges():
             axis_index,
             TOLERANCE,
         )
-        self_map = core._snapshot_face_map(
+        self_map = face_mapping._snapshot_face_map(
             self_coords,
             numpy.asarray((0, 1, 2), dtype=numpy.int64),
             numpy.asarray((0,), dtype=numpy.int64),
@@ -3712,7 +3724,7 @@ def _check_face_geometry_snapshot_oracle_edges():
     centroid_order_loops = numpy.tile(numpy.arange(len(centroid_order_x), dtype=numpy.int64), 2)
     centroid_order_starts = numpy.asarray((0, len(centroid_order_x)), dtype=numpy.int64)
     centroid_order_totals = numpy.asarray((len(centroid_order_x), len(centroid_order_x)), dtype=numpy.int64)
-    centroid_order_registry = core.FaceRegistry(
+    centroid_order_registry = face_mapping.FaceRegistry(
         centroid_order_coords,
         centroid_order_loops,
         centroid_order_starts,
@@ -3723,7 +3735,7 @@ def _check_face_geometry_snapshot_oracle_edges():
     centroid_order_batch = centroid_order_registry.exact_geometry_batch((FaceId(1), FaceId(2)))
     assert centroid_order_batch is not None
     assert centroid_order_batch.targets.tolist() == [2, 1]
-    assert core._snapshot_face_map(
+    assert face_mapping._snapshot_face_map(
         centroid_order_coords,
         centroid_order_loops,
         centroid_order_starts,
@@ -3736,7 +3748,7 @@ def _check_face_geometry_snapshot_oracle_edges():
 
     empty = numpy.empty((0, 3), dtype=numpy.float64)
     empty_faces = numpy.empty(0, dtype=numpy.int64)
-    assert core._snapshot_face_map(empty, empty_faces, empty_faces, empty_faces, 0, TOLERANCE) == {}
+    assert face_mapping._snapshot_face_map(empty, empty_faces, empty_faces, empty_faces, 0, TOLERANCE) == {}
 
 
 def _check_partial_face_resolution_duplicate_row_orderings():
@@ -3794,7 +3806,7 @@ def _check_face_primary_conflict_downgrades_every_claimant():
     )
     faces = ((0, 1, 2), (3, 4, 5), (6, 7, 8))
     handle = _face_resolution_handle(coords, faces)
-    registry = core.FaceRegistry(
+    registry = face_mapping.FaceRegistry(
         handle.coords64,
         handle.loop_verts,
         handle.loop_starts,
@@ -3877,12 +3889,12 @@ def _check_u7_unselected_topology_bulk_capture():
                 element.select = False
         bulk_data = _BulkMeshData(bulk)
         mesh_object = _BulkMeshObject(bulk_data)
-        compatibility = core.capture_selection_snapshot(
+        compatibility = snapshot_module.capture_selection_snapshot(
             bm,
             domains=("EDGE", "FACE"),
             include_loops=True,
         )
-        captured = core.capture_selection_snapshot(
+        captured = snapshot_module.capture_selection_snapshot(
             bulk,
             mesh_object=mesh_object,
             domains=("EDGE", "FACE"),

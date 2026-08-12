@@ -14,7 +14,7 @@ import bmesh
 # Prefer production constant; fall back to the layer name if the package is
 # unavailable (standalone fixture self-check under a minimal path).
 try:
-    from ydd_symmetric_edit.core import EDGE_ORIGINAL_LAYER
+    from ydd_symmetric_edit.layer_names import EDGE_ORIGINAL_LAYER
 except Exception:  # pragma: no cover - Blender headless always has the package
     EDGE_ORIGINAL_LAYER = ".yse_original_edge"
 

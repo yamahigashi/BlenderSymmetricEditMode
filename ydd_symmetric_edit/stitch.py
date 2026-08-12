@@ -21,6 +21,13 @@ from ._types import (
     QuantizedCoordinate,
 )
 from .face_mapping import _canonical_carrier_frames
+from .layer_names import (
+    EDGE_HIDDEN_LAYER,
+    EDGE_ORIGINAL_LAYER,
+    EDGE_SELECTION_LAYER,
+    FACE_ID_LAYER,
+    VERT_SELECTION_LAYER,
+)
 from .matching import (
     _chebyshev_distance_3d,
     _iter_quantized_neighborhood,
@@ -28,7 +35,6 @@ from .matching import (
     coordinates_match,
     mirror_coordinate,
 )
-from .snapshot import EDGE_HIDDEN_LAYER, EDGE_ORIGINAL_LAYER, EDGE_SELECTION_LAYER, FACE_ID_LAYER, VERT_SELECTION_LAYER
 
 _MIN_SIDE_LENGTH = 1.0e-9
 _LOGGER = logging.getLogger(__name__)

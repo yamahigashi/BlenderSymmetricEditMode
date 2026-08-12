@@ -37,7 +37,7 @@ PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
 import ydd_symmetric_edit as addon  # noqa: E402
-from ydd_symmetric_edit import backup, core, replay  # noqa: E402
+from ydd_symmetric_edit import backup, layer_names, matching, replay  # noqa: E402
 
 MARKER_OK = "YSE_CONNECT_LIFT_OK"
 MARKER_FAILED = "YSE_CONNECT_LIFT_FAILED"
@@ -196,9 +196,9 @@ def leave_edit(window, area, region) -> None:
 
 
 def assert_no_temp_layers(bm) -> None:
-    assert bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER) is None
-    assert bm.faces.layers.int.get(core.FACE_ID_LAYER) is None
-    assert bm.verts.layers.int.get(core.VERT_BACKUP_ID_LAYER) is None
+    assert bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER) is None
+    assert bm.faces.layers.int.get(layer_names.FACE_ID_LAYER) is None
+    assert bm.verts.layers.int.get(layer_names.VERT_BACKUP_ID_LAYER) is None
 
 
 def mirror_coord(coordinate):
@@ -497,7 +497,7 @@ def case_f_zigzag(window, area, region) -> None:
     bm.verts.index_update()
     coords_now = tuple(Vector(v.co) for v in bm.verts)
     selected = [v.index for v in bm.verts if v.select]
-    classification = core.classify_selection_overlap(
+    classification = matching.classify_selection_overlap(
         coords_now,
         selected,
         axis_index=0,

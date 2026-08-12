@@ -25,7 +25,7 @@ PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
 import ydd_symmetric_edit as addon  # noqa: E402
-from ydd_symmetric_edit import core, operators  # noqa: E402
+from ydd_symmetric_edit import layer_names, operators  # noqa: E402
 
 STATE = {
     "events": [],
@@ -126,8 +126,8 @@ def verify_finished():
         cut_x = symmetric_cut_x_coordinates(bm)
         assert len(cut_x) == 2 and cut_x[0] < 0.0 < cut_x[1], cut_x
         assert abs(cut_x[0] + cut_x[1]) <= 1.0e-7, cut_x
-        assert bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER) is None
-        assert bm.faces.layers.int.get(core.FACE_ID_LAYER) is None
+        assert bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER) is None
+        assert bm.faces.layers.int.get(layer_names.FACE_ID_LAYER) is None
 
         with bpy.context.temp_override(window=STATE["window"], area=STATE["area"], region=STATE["region"]):
             undo_result = bpy.ops.ed.undo()
@@ -136,8 +136,8 @@ def verify_finished():
         assert undone_object is not None and undone_object.mode == "EDIT"
         bm = bmesh.from_edit_mesh(undone_object.data)
         assert len(bm.verts) == 8 and len(bm.edges) == 8 and len(bm.faces) == 2
-        assert bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER) is None
-        assert bm.faces.layers.int.get(core.FACE_ID_LAYER) is None
+        assert bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER) is None
+        assert bm.faces.layers.int.get(layer_names.FACE_ID_LAYER) is None
         print("YSE_NATIVE_MODAL_TEST_OK", flush=True)
         addon.unregister()
         bpy.ops.wm.quit_blender()

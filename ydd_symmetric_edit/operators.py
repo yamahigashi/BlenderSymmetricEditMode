@@ -9,7 +9,7 @@ import bpy
 from bpy.app.handlers import persistent
 from bpy.props import BoolProperty, StringProperty
 
-from . import backup, core, rip, session_state, stitch
+from . import backup, face_mapping, layer_names, rip, selection, session_state, snapshot, stitch
 from ._types import (
     Coordinate3D,
     FaceId,
@@ -111,7 +111,7 @@ def cleanup_stale_attributes(_dummy=None) -> None:
     cleanup_all_sessions()
     for mesh in bpy.data.meshes:
         try:
-            core.remove_temporary_mesh_attributes(mesh)
+            snapshot.remove_temporary_mesh_attributes(mesh)
         except RuntimeError:
             pass
 
@@ -256,7 +256,7 @@ def _finish_rip_session(
         if obj is not None and obj.mode == "EDIT":
             try:
                 bm = bmesh.from_edit_mesh(obj.data)
-                core.remove_temporary_layers(bm)
+                snapshot.remove_temporary_layers(bm)
                 bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=True)
             except (ReferenceError, RuntimeError):
                 pass
@@ -295,7 +295,7 @@ def _maybe_extend_selection_to_mirror(obj, axis_index: int, tolerance: float) ->
         if obj is None or obj.mode != "EDIT":
             return
         bm = bmesh.from_edit_mesh(obj.data)
-        core.extend_selection_to_mirror(bm, axis_index, tolerance, mesh_object=obj)
+        selection.extend_selection_to_mirror(bm, axis_index, tolerance, mesh_object=obj)
         bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
     except Exception:
         traceback.print_exc()
@@ -385,7 +385,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
 
         try:
             bm = bmesh.from_edit_mesh(obj.data)
-            edge_layer, face_layer = core.get_required_layers(bm)
+            edge_layer, face_layer = snapshot.get_required_layers(bm)
             if edge_layer is None or face_layer is None:
                 raise SymmetricKnifeError("Temporary topology markers are missing")
 
@@ -393,7 +393,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
             knife_path_edge_cache = None
 
             def _resolve_scope_overlay_and_materialize(edit_bm, path_edges):
-                current_face_layer = edit_bm.faces.layers.int.get(core.FACE_ID_LAYER)
+                current_face_layer = edit_bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
                 if current_face_layer is None:
                     raise SymmetricKnifeError("Temporary face markers are missing")
                 scope = {
@@ -410,7 +410,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     resolution.resolve_faces(scope)
                     lazy_face_map = resolution.scoped_mirror_face_ids
                     session.carrier_frames = resolution.scoped_carrier_frames
-                overlay = core.resolve_live_mirror_face_map(
+                overlay = face_mapping.resolve_live_mirror_face_map(
                     edit_bm,
                     lazy_face_map,
                     session.axis_index,
@@ -449,7 +449,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                 def _collect_knife_path_edges(edit_bm, *, topology_changed: bool = False):
                     nonlocal knife_path_edge_cache
                     if not topology_changed:
-                        cached = core.reclassify_knife_path_edge_cache(
+                        cached = stitch.reclassify_knife_path_edge_cache(
                             edit_bm,
                             session.axis_index,
                             session.tolerance,
@@ -457,12 +457,12 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                         )
                         if cached is not None:
                             return cached
-                    result = core.collect_knife_path_edges_by_side(
+                    result = stitch.collect_knife_path_edges_by_side(
                         edit_bm,
                         session.axis_index,
                         session.tolerance,
                     )
-                    knife_path_edge_cache = core.capture_knife_path_edge_cache(
+                    knife_path_edge_cache = stitch.capture_knife_path_edge_cache(
                         edit_bm,
                         _all_path_edges(result[0]),
                     )
@@ -477,18 +477,18 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                 crossing_count = len(by_side["CROSSES"])
                 side = "BOTH"
                 live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, _all_path_edges(by_side))
-                _edge_layer, face_layer = core.get_required_layers(bm)
+                _edge_layer, face_layer = snapshot.get_required_layers(bm)
                 by_side, total_path_edges = _collect_knife_path_edges(bm)
                 live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, _all_path_edges(by_side))
 
                 if crossing_count:
                     # Single backup covers p-stitch + mirror.
-                    selection_state = core.add_selection_layers(bm)
+                    selection_state = selection.add_selection_layers(bm)
                     backup_mesh = _create_backup(bm)
                     bm = bmesh.from_edit_mesh(obj.data)
                     by_side, total_path_edges = _collect_knife_path_edges(bm)
                     live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, _all_path_edges(by_side))
-                    stitched, stitch_reason, stitch_summary = core.apply_crosses_p_stitch(
+                    stitched, stitch_reason, stitch_summary = stitch.apply_crosses_p_stitch(
                         bm,
                         by_side["CROSSES"],
                         session.axis_index,
@@ -512,11 +512,11 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                         bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=True)
 
                         bm = bmesh.from_edit_mesh(obj.data)
-                        _edge_layer, face_layer = core.get_required_layers(bm)
+                        _edge_layer, face_layer = snapshot.get_required_layers(bm)
                         by_side, total_path_edges = _collect_knife_path_edges(bm, topology_changed=True)
                         live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, _all_path_edges(by_side))
 
-                crossing_plan, crossing_reason = core.plan_mirrored_path_crossings(
+                crossing_plan, crossing_reason = stitch.plan_mirrored_path_crossings(
                     bm,
                     by_side,
                     session.axis_index,
@@ -528,13 +528,13 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     raise SymmetricKnifeError(crossing_reason)
                 if crossing_plan:
                     if backup_mesh is None:
-                        selection_state = core.add_selection_layers(bm)
+                        selection_state = selection.add_selection_layers(bm)
                         backup_mesh = _create_backup(bm)
                         bm = bmesh.from_edit_mesh(obj.data)
-                        _edge_layer, face_layer = core.get_required_layers(bm)
+                        _edge_layer, face_layer = snapshot.get_required_layers(bm)
                         by_side, total_path_edges = _collect_knife_path_edges(bm)
                         live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, _all_path_edges(by_side))
-                        crossing_plan, crossing_reason = core.plan_mirrored_path_crossings(
+                        crossing_plan, crossing_reason = stitch.plan_mirrored_path_crossings(
                             bm,
                             by_side,
                             session.axis_index,
@@ -566,7 +566,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                         crossing_cache_positions = {
                             hash(edge): position for position, edge in enumerate(previous_crossing_edges)
                         }
-                    _crossings_stitched, crossing_reason, crossing_summary = core.apply_mirrored_path_crossings(
+                    _crossings_stitched, crossing_reason, crossing_summary = stitch.apply_mirrored_path_crossings(
                         bm,
                         crossing_plan,
                         cache_positions=crossing_cache_positions,
@@ -589,7 +589,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     else:
                         by_side, total_path_edges = patched
                     live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, _all_path_edges(by_side))
-                    _edge_layer, face_layer = core.get_required_layers(bm)
+                    _edge_layer, face_layer = snapshot.get_required_layers(bm)
 
                 source_edges = by_side["POSITIVE"] + by_side["NEGATIVE"]
                 if not source_edges:
@@ -604,7 +604,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     )
                     return result
 
-                target_face_ids, unmatched = core.target_face_ids_for_edges(
+                target_face_ids, unmatched = stitch.target_face_ids_for_edges(
                     source_edges,
                     face_layer,
                     live_mirror_face_ids,
@@ -614,7 +614,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                 if not target_face_ids:
                     raise SymmetricKnifeError("The native cut path has no carrier faces")
 
-                use_direct_topology = core.reflected_path_uses_only_target_boundaries(
+                use_direct_topology = stitch.reflected_path_uses_only_target_boundaries(
                     bm,
                     source_edges,
                     session.axis_index,
@@ -623,7 +623,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                 )
                 if use_direct_topology:
                     if backup_mesh is None:
-                        selection_state = core.add_selection_layers(bm)
+                        selection_state = selection.add_selection_layers(bm)
                         backup_mesh = _create_backup(bm)
                         # Layer creation invalidates the held BMesh proxies, so
                         # reclassify the unchanged path against a fresh view.
@@ -634,7 +634,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                         source_edges = by_side["POSITIVE"] + by_side["NEGATIVE"]
                     if not source_edges:
                         raise SymmetricKnifeError("The native cut path was lost before mirroring")
-                    created, already_present, direct_reason, reflected_summary = core.apply_reflected_path_topology(
+                    created, already_present, direct_reason, reflected_summary = stitch.apply_reflected_path_topology(
                         bm,
                         source_edges,
                         session.axis_index,
@@ -670,7 +670,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     )
                     return result
 
-                coordinates, cutter_edges, already_present = core.build_reflected_cutter(
+                coordinates, cutter_edges, already_present = stitch.build_reflected_cutter(
                     bm,
                     source_edges,
                     session.axis_index,
@@ -686,9 +686,9 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     self.report({"INFO"}, "The opposite side already contains this cut")
                     return result
 
-                core.reserve_source_path_marker(bm)
+                stitch.reserve_source_path_marker(bm)
                 if backup_mesh is None:
-                    selection_state = core.add_selection_layers(bm)
+                    selection_state = selection.add_selection_layers(bm)
                     backup_mesh = _create_backup(bm)
                     preexisting_vertex_keys = {hash(vertex) for vertex in bm.verts}
                 else:
@@ -696,7 +696,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     # vertex key set after the stitch so snap only moves new
                     # projection geometry.
                     preexisting_vertex_keys = {hash(vertex) for vertex in bm.verts}
-                _edge_layer, face_layer = core.get_required_layers(bm)
+                _edge_layer, face_layer = snapshot.get_required_layers(bm)
                 for face in bm.faces:
                     face.hide = FaceId(int(face[face_layer])) not in target_face_ids
                 bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
@@ -732,7 +732,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
 
                 mirrored_segment_count = len(cutter_edges)
                 bm = bmesh.from_edit_mesh(obj.data)
-                snapped, _projection_error, snap_reason = core.snap_projected_graph(
+                snapped, _projection_error, snap_reason = stitch.snap_projected_graph(
                     bm,
                     coordinates,
                     cutter_edges,
@@ -750,7 +750,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                 # Straddling rings symmetrize through the ordinary reflection
                 # only because their carrier faces map to themselves or their
                 # pairs; when pairing fails the counterpart check declines.
-                source_edges, side, total_path_edges, crossing_count = core.collect_source_path_edges(
+                source_edges, side, total_path_edges, crossing_count = stitch.collect_source_path_edges(
                     bm,
                     session.axis_index,
                     session.tolerance,
@@ -772,12 +772,12 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
 
                 # Native loopcut skips hidden ring edges, leaving an open
                 # partial ring whose mirror is not well-defined.
-                if core.path_ring_includes_pre_hidden_edges(bm):
+                if stitch.path_ring_includes_pre_hidden_edges(bm):
                     raise SymmetricKnifeError("the cut ring includes hidden edges; partial ring cuts are not mirrored")
 
                 live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, source_edges)
-                _edge_layer, face_layer = core.get_required_layers(bm)
-                source_edges, side, total_path_edges, crossing_count = core.collect_source_path_edges(
+                _edge_layer, face_layer = snapshot.get_required_layers(bm)
+                source_edges, side, total_path_edges, crossing_count = stitch.collect_source_path_edges(
                     bm,
                     session.axis_index,
                     session.tolerance,
@@ -791,7 +791,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                 if side is None or not source_edges:
                     raise SymmetricKnifeError("The native cut path was lost before mirroring")
                 live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, source_edges)
-                target_face_ids, unmatched = core.target_face_ids_for_edges(
+                target_face_ids, unmatched = stitch.target_face_ids_for_edges(
                     source_edges,
                     face_layer,
                     live_mirror_face_ids,
@@ -804,7 +804,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                 collapsed_target_markers = set()
                 profile = TOOL_PROFILES.get(session.tool_kind)
                 if profile is not None and profile.supports_nested_offset:
-                    collapsed_target_markers, _collapsed_reason = core.collapsed_offset_target_edge_markers(
+                    collapsed_target_markers, _collapsed_reason = stitch.collapsed_offset_target_edge_markers(
                         bm,
                         source_edges,
                         session.axis_index,
@@ -814,10 +814,10 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     # Esc cancels only Offset's Edge Slide child; Blender keeps the
                     # two new loops at factor zero. A coincident Knife Project is
                     # impossible, so reproduce the same topology with BMesh.
-                    core.reserve_source_path_marker(bm)
-                    selection_state = core.add_selection_layers(bm)
+                    stitch.reserve_source_path_marker(bm)
+                    selection_state = selection.add_selection_layers(bm)
                     backup_mesh = _create_backup(bm)
-                    mirrored_segment_count, collapsed_reason = core.apply_collapsed_offset_topology(
+                    mirrored_segment_count, collapsed_reason = stitch.apply_collapsed_offset_topology(
                         bm,
                         collapsed_target_markers,
                         use_cap_endpoint=session.offset_use_cap_endpoint,
@@ -843,10 +843,10 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     # A viewport projection is not one-to-one on curved or
                     # self-occluding surfaces. Rebuild the native cut topology on
                     # paired target faces instead, using exact reflected points.
-                    selection_state = core.add_selection_layers(bm)
+                    selection_state = selection.add_selection_layers(bm)
                     backup_mesh = _create_backup(bm)
                     bm = bmesh.from_edit_mesh(obj.data)
-                    source_edges, side, total_path_edges, crossing_count = core.collect_source_path_edges(
+                    source_edges, side, total_path_edges, crossing_count = stitch.collect_source_path_edges(
                         bm,
                         session.axis_index,
                         session.tolerance,
@@ -859,7 +859,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     )
                     if side is None or not source_edges:
                         raise SymmetricKnifeError("The native cut path was lost before mirroring")
-                    created, already_present, direct_reason = core.apply_reflected_path_topology(
+                    created, already_present, direct_reason = stitch.apply_reflected_path_topology(
                         bm,
                         source_edges,
                         session.axis_index,
@@ -894,7 +894,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     )
                     return result
 
-                coordinates, cutter_edges, already_present = core.build_reflected_cutter(
+                coordinates, cutter_edges, already_present = stitch.build_reflected_cutter(
                     bm,
                     source_edges,
                     session.axis_index,
@@ -905,13 +905,13 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     self.report({"INFO"}, "The opposite side already contains this cut")
                     return result
 
-                core.reserve_source_path_marker(bm)
-                selection_state = core.add_selection_layers(bm)
+                stitch.reserve_source_path_marker(bm)
+                selection_state = selection.add_selection_layers(bm)
                 backup_mesh = _create_backup(bm)
                 preexisting_vertex_keys = {hash(vertex) for vertex in bm.verts}
                 # Layer creation invalidates held element wrappers; retrieve layers
                 # and iterate faces again before changing visibility.
-                _edge_layer, face_layer = core.get_required_layers(bm)
+                _edge_layer, face_layer = snapshot.get_required_layers(bm)
                 for face in bm.faces:
                     face.hide = FaceId(int(face[face_layer])) not in target_face_ids
                 bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
@@ -947,7 +947,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
 
                 mirrored_segment_count = len(cutter_edges)
                 bm = bmesh.from_edit_mesh(obj.data)
-                snapped, _projection_error, snap_reason = core.snap_projected_graph(
+                snapped, _projection_error, snap_reason = stitch.snap_projected_graph(
                     bm,
                     coordinates,
                     cutter_edges,
@@ -989,14 +989,14 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     bm = bmesh.from_edit_mesh(obj.data)
                     context.tool_settings.mesh_select_mode = mesh_select_mode.as_tuple()
                     if selection_state is not None:
-                        summary = core.combine_selection_mutation_summaries(restore_mutation_summaries)
+                        summary = stitch.combine_selection_mutation_summaries(restore_mutation_summaries)
                         if session.tool_kind == "KNIFE" and restore_mutation_summaries:
                             scoped_direct_success = (
                                 direct_topology_success
                                 and projection_committed
                                 and mirror_failure is None
                             )
-                            core.restore_selection_for_route(
+                            selection.restore_selection_for_route(
                                 bm,
                                 session.hidden_by_face_id,
                                 selection_state,
@@ -1005,19 +1005,19 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                                 summary_complete=restore_summary_complete and summary.complete,
                             )
                         else:
-                            core.restore_visibility_and_selection(
+                            selection.restore_visibility_and_selection(
                                 bm,
                                 session.hidden_by_face_id,
                                 selection_state,
                             )
                     else:
-                        face_layer = bm.faces.layers.int.get(core.FACE_ID_LAYER)
+                        face_layer = bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
                         if face_layer is not None:
                             for face in bm.faces:
                                 face_id = FaceId(int(face[face_layer]))
                                 face.hide = bool(session.hidden_by_face_id.get(face_id, False))
                     if not self.preserve_history_layers:
-                        core.remove_temporary_layers(bm)
+                        snapshot.remove_temporary_layers(bm)
                     # Select Mirrored normally runs after layer cleanup so it sees
                     # permanent topology. History's first F9 repair stage retains
                     # the layers for its immediately following adjusted stage.
@@ -1026,7 +1026,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                         try:
                             settings = getattr(context.scene, "ydd_symmetric_edit", None)
                             if settings is not None and bool(getattr(settings, "select_mirrored", False)):
-                                core.extend_selection_to_mirror(
+                                selection.extend_selection_to_mirror(
                                     bm,
                                     session.axis_index,
                                     session.tolerance,

@@ -17,11 +17,10 @@ from mathutils import Vector
 
 PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
-
-from ydd_symmetric_edit import core  # noqa: E402
+from ydd_symmetric_edit import layer_names, matching, snapshot, stitch  # noqa: E402
 
 TOLERANCE = 1.0e-5
-AXIS = core.AXIS_INDEX["X"]
+AXIS = matching.AXIS_INDEX["X"]
 
 
 def build_two_symmetric_quads():
@@ -100,7 +99,7 @@ def find_vertex(bm, expected, tolerance=1.0e-7):
 
 
 def collect_source_path_edges(bm):
-    source, side, total, crossing = core.collect_source_path_edges(bm, AXIS, TOLERANCE, "AUTO")
+    source, side, total, crossing = stitch.collect_source_path_edges(bm, AXIS, TOLERANCE, "AUTO")
     assert side == "NEGATIVE", (side, total, crossing)
     assert crossing == 0
     return source
@@ -111,7 +110,7 @@ def check_interior_chain_n1():
 
     bm = build_two_symmetric_quads()
     try:
-        topology = core.prepare_topology(bm, AXIS, TOLERANCE)
+        topology = snapshot.prepare_topology(bm, AXIS, TOLERANCE)
         bottom = _split_at_x(_bottom_edge(bm, negative=True), -1.5)
         top = _split_at_x(_top_edge(bm, negative=True), -1.5)
         host = next(face for face in bm.faces if bottom in face.verts and top in face.verts)
@@ -120,7 +119,7 @@ def check_interior_chain_n1():
         source = collect_source_path_edges(bm)
         assert len(source) == 2, len(source)
 
-        assert core.reflected_path_uses_only_target_boundaries(
+        assert stitch.reflected_path_uses_only_target_boundaries(
             bm,
             source,
             AXIS,
@@ -128,7 +127,7 @@ def check_interior_chain_n1():
             topology.mirror_face_ids,
         )
 
-        created, already, reason = core.apply_reflected_path_topology(
+        created, already, reason = stitch.apply_reflected_path_topology(
             bm,
             source,
             AXIS,
@@ -162,7 +161,7 @@ def check_interior_chain_n2():
 
     bm = build_two_symmetric_quads()
     try:
-        topology = core.prepare_topology(bm, AXIS, TOLERANCE)
+        topology = snapshot.prepare_topology(bm, AXIS, TOLERANCE)
         bottom = _split_at_x(_bottom_edge(bm, negative=True), -1.5)
         top = _split_at_x(_top_edge(bm, negative=True), -1.5)
         host = next(face for face in bm.faces if bottom in face.verts and top in face.verts)
@@ -176,7 +175,7 @@ def check_interior_chain_n2():
         source = collect_source_path_edges(bm)
         assert len(source) == 3, len(source)
 
-        assert core.reflected_path_uses_only_target_boundaries(
+        assert stitch.reflected_path_uses_only_target_boundaries(
             bm,
             source,
             AXIS,
@@ -184,7 +183,7 @@ def check_interior_chain_n2():
             topology.mirror_face_ids,
         )
 
-        created, already, reason = core.apply_reflected_path_topology(
+        created, already, reason = stitch.apply_reflected_path_topology(
             bm,
             source,
             AXIS,
@@ -218,7 +217,7 @@ def check_decline_degree3_interior():
 
     bm = build_two_symmetric_quads()
     try:
-        topology = core.prepare_topology(bm, AXIS, TOLERANCE)
+        topology = snapshot.prepare_topology(bm, AXIS, TOLERANCE)
         # Place three boundary anchors on the left face.
         bottom = _split_at_x(_bottom_edge(bm, negative=True), -1.5)
         top = _split_at_x(_top_edge(bm, negative=True), -1.5)
@@ -246,7 +245,7 @@ def check_decline_degree3_interior():
         source = collect_source_path_edges(bm)
         assert len(source) == 3, len(source)
 
-        assert not core.reflected_path_uses_only_target_boundaries(
+        assert not stitch.reflected_path_uses_only_target_boundaries(
             bm,
             source,
             AXIS,
@@ -254,7 +253,7 @@ def check_decline_degree3_interior():
             topology.mirror_face_ids,
         )
 
-        created, already, reason = core.apply_reflected_path_topology(
+        created, already, reason = stitch.apply_reflected_path_topology(
             bm,
             source,
             AXIS,
@@ -317,8 +316,8 @@ def check_decline_no_common_face():
         bm.faces.new(upper_right)
         bm.normal_update()
 
-        topology = core.prepare_topology(bm, AXIS, TOLERANCE)
-        marker = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+        topology = snapshot.prepare_topology(bm, AXIS, TOLERANCE)
+        marker = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
         assert marker is not None
 
         bottom_edge = next(
@@ -379,7 +378,7 @@ def check_decline_no_common_face():
         source = collect_source_path_edges(bm)
         assert len(source) == 3, len(source)
 
-        assert not core.reflected_path_uses_only_target_boundaries(
+        assert not stitch.reflected_path_uses_only_target_boundaries(
             bm,
             source,
             AXIS,
@@ -387,7 +386,7 @@ def check_decline_no_common_face():
             topology.mirror_face_ids,
         )
 
-        created, already, reason = core.apply_reflected_path_topology(
+        created, already, reason = stitch.apply_reflected_path_topology(
             bm,
             source,
             AXIS,
@@ -431,7 +430,7 @@ def check_curved_quad_single_candidate():
         bm.faces.new(right)
         bm.normal_update()
 
-        topology = core.prepare_topology(bm, AXIS, TOLERANCE)
+        topology = snapshot.prepare_topology(bm, AXIS, TOLERANCE)
         host = next(face for face in bm.faces if all(v.co.x < 0.0 for v in face.verts))
         verts = list(host.verts)
         edge = next(e for e in host.edges if verts[0] in e.verts and verts[1] in e.verts)
@@ -478,14 +477,14 @@ def check_curved_quad_single_candidate():
         source = collect_source_path_edges(bm)
         assert len(source) == 2, len(source)
 
-        assert core.reflected_path_uses_only_target_boundaries(
+        assert stitch.reflected_path_uses_only_target_boundaries(
             bm,
             source,
             AXIS,
             TOLERANCE,
             topology.mirror_face_ids,
         )
-        created, already, reason = core.apply_reflected_path_topology(
+        created, already, reason = stitch.apply_reflected_path_topology(
             bm,
             source,
             AXIS,
@@ -517,7 +516,7 @@ def check_two_chains_same_face():
 
     bm = build_two_symmetric_quads()
     try:
-        topology = core.prepare_topology(bm, AXIS, TOLERANCE)
+        topology = snapshot.prepare_topology(bm, AXIS, TOLERANCE)
         vb1 = _split_at_x(_bottom_edge(bm, negative=True), -1.8)
         bottom_rest = next(
             edge
@@ -541,14 +540,14 @@ def check_two_chains_same_face():
         source = collect_source_path_edges(bm)
         assert len(source) == 4, len(source)
 
-        assert core.reflected_path_uses_only_target_boundaries(
+        assert stitch.reflected_path_uses_only_target_boundaries(
             bm,
             source,
             AXIS,
             TOLERANCE,
             topology.mirror_face_ids,
         )
-        created, already, reason = core.apply_reflected_path_topology(
+        created, already, reason = stitch.apply_reflected_path_topology(
             bm,
             source,
             AXIS,

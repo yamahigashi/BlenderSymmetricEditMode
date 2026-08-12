@@ -43,7 +43,7 @@ PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
 import ydd_symmetric_edit as addon  # noqa: E402
-from ydd_symmetric_edit import core, operators  # noqa: E402
+from ydd_symmetric_edit import matching, operators, snapshot  # noqa: E402
 
 MARKER_OK = "YSE_LOOPCUT_STRADDLING_OK"
 MARKER_FAILED = "YSE_LOOPCUT_STRADDLING_TEST_FAILED"
@@ -499,12 +499,12 @@ def case_e_non_self_mirror_faces(window, area, region) -> None:
     bm = enter_edit(obj, window, area, region)
 
     # Preflight: mesh must be X-symmetric and faces must not all be self-mirrored.
-    topology = core.prepare_topology(bm, core.AXIS_INDEX["X"], 1.0e-5)
+    topology = snapshot.prepare_topology(bm, matching.AXIS_INDEX["X"], 1.0e-5)
     self_mirrored = sum(1 for source, target in topology.mirror_face_ids.items() if source == target)
     paired = sum(1 for source, target in topology.mirror_face_ids.items() if source != target)
     total = topology.total_faces
     matched = topology.matched_faces
-    core.remove_temporary_layers(bm)
+    snapshot.remove_temporary_layers(bm)
     bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
 
     print(

@@ -16,7 +16,7 @@ PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
 import ydd_symmetric_edit as addon  # noqa: E402
-from ydd_symmetric_edit import core, operators  # noqa: E402
+from ydd_symmetric_edit import layer_names, matching, operators  # noqa: E402
 
 
 def set_axes(obj, x=False, y=False, z=False):
@@ -27,8 +27,8 @@ def set_axes(obj, x=False, y=False, z=False):
 
 def assert_clean(obj):
     bm = bmesh.from_edit_mesh(obj.data)
-    assert bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER) is None
-    assert bm.faces.layers.int.get(core.FACE_ID_LAYER) is None
+    assert bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER) is None
+    assert bm.faces.layers.int.get(layer_names.FACE_ID_LAYER) is None
     assert not operators._SESSIONS
 
 
@@ -60,12 +60,12 @@ def run():
         bpy.ops.object.mode_set(mode="EDIT")
 
         set_axes(obj)
-        assert core.enabled_mesh_symmetry_axes(obj) == ()
+        assert matching.enabled_mesh_symmetry_axes(obj) == ()
         expect_prepare_failure()
         assert_clean(obj)
 
         set_axes(obj, x=True, y=True)
-        assert core.enabled_mesh_symmetry_axes(obj) == (("X", 0), ("Y", 1))
+        assert matching.enabled_mesh_symmetry_axes(obj) == (("X", 0), ("Y", 1))
         expect_prepare_failure()
         assert_clean(obj)
 
@@ -75,7 +75,7 @@ def run():
             ("Z", 2, (False, False, True)),
         ):
             set_axes(obj, *values)
-            assert core.enabled_mesh_symmetry_axes(obj) == ((axis, index),)
+            assert matching.enabled_mesh_symmetry_axes(obj) == ((axis, index),)
             assert operators._prepare_session(
                 bpy.context,
                 ignore_report,

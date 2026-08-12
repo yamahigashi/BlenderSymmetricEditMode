@@ -22,10 +22,10 @@ from mathutils import Vector
 PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
-from ydd_symmetric_edit import core, stitch  # noqa: E402
+from ydd_symmetric_edit import layer_names, matching, snapshot, stitch  # noqa: E402
 from ydd_symmetric_edit._types import FaceId  # noqa: E402
 
-AXIS = core.AXIS_INDEX["X"]
+AXIS = matching.AXIS_INDEX["X"]
 TOLERANCE = 1.0e-5
 MISSING_FACE_ID = FaceId(9001)
 
@@ -46,8 +46,8 @@ def _frozen_eager_apply_reflected_path_topology(
     if not source_edges:
         return 0, 0, "no source cut edges were supplied"
 
-    marker_layer = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
-    face_layer = bm.faces.layers.int.get(core.FACE_ID_LAYER)
+    marker_layer = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
+    face_layer = bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
     if marker_layer is None or face_layer is None:
         return 0, 0, "temporary topology markers are missing"
 
@@ -105,7 +105,7 @@ def _frozen_eager_apply_reflected_path_topology(
     for source_key, source_vertex in source_vertex_by_key.items():
         if classification[source_key][0] == "interior":
             continue
-        expected = core.mirror_coordinate(source_vertex.co, axis_index)
+        expected = matching.mirror_coordinate(source_vertex.co, axis_index)
         candidate_faces = {
             face
             for target_id in target_ids_by_vertex[source_key]
@@ -442,7 +442,7 @@ def _build_two_symmetric_quads():
     bm.faces.new(right)
     _update_indices(bm)
     assert tuple(vertex.index for vertex in left + right) == tuple(range(8))
-    topology = core.prepare_topology(bm, AXIS, TOLERANCE)
+    topology = snapshot.prepare_topology(bm, AXIS, TOLERANCE)
     mirror_face_ids = dict(topology.mirror_face_ids)
     return bm, mirror_face_ids
 
@@ -460,7 +460,7 @@ def _add_source_diagonal(bm):
     bmesh.utils.face_split(host, a, b)
     edge = bm.edges.get((a, b))
     assert edge is not None
-    marker_layer = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+    marker_layer = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
     edge[marker_layer] = 0
     _update_indices(bm)
     return edge
@@ -475,7 +475,7 @@ def _add_loose_edge(bm, a, b):
 
 
 def _target_id_for_source(edge, bm, mirror_face_ids):
-    face_layer = bm.faces.layers.int.get(core.FACE_ID_LAYER)
+    face_layer = bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
     source_id = FaceId(int(edge.link_faces[0][face_layer]))
     target_id = mirror_face_ids[source_id]
     assert target_id is not None
@@ -699,7 +699,7 @@ def _build_two_chain_fixture():
     bmesh.utils.face_split(host_a, vb1, corner_tl, coords=[(-1.85, 0.0, 0.0)])
     host_b = next(face for face in bm.faces if face.is_valid and vb2 in face.verts and corner_tr in face.verts)
     bmesh.utils.face_split(host_b, vb2, corner_tr, coords=[(-1.15, 0.0, 0.0)])
-    chain_edges, side, total, crossing = core.collect_source_path_edges(
+    chain_edges, side, total, crossing = stitch.collect_source_path_edges(
         bm,
         AXIS,
         TOLERANCE,
@@ -931,7 +931,7 @@ def _build_two_rows_per_side():
         )
     _update_indices(bm)
     assert (len(bm.verts), len(bm.edges), len(bm.faces)) == (12, 14, 4)
-    topology = core.prepare_topology(bm, AXIS, TOLERANCE)
+    topology = snapshot.prepare_topology(bm, AXIS, TOLERANCE)
     mirror_face_ids = dict(topology.mirror_face_ids)
     return bm, mirror_face_ids
 
@@ -947,7 +947,7 @@ def check_vii_shared_edge_registered_once():
         bmesh.utils.face_split(host, a, b)
         source = bm.edges.get((a, b))
         assert source is not None
-        source[bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)] = 0
+        source[bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)] = 0
         upper_boundary = bm.edges.get(
             (
                 _find_vertex(bm, (-2.0, 1.0, 0.0)),
@@ -993,7 +993,7 @@ def check_vii_coordinate_duplicate_edges_are_ambiguous():
     bm, mirror_face_ids = _build_two_symmetric_quads()
     try:
         source = _add_source_diagonal(bm)
-        face_layer = bm.faces.layers.int.get(core.FACE_ID_LAYER)
+        face_layer = bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
         for z in (1.0, 2.0):
             vertices = [
                 bm.verts.new((1.0, -1.0, 0.0)),
@@ -1058,8 +1058,8 @@ def _frozen_build_reflected_cutter(bm, source_edges, axis_index, tolerance):
     already_present = 0
     for edge in source_edges:
         reflected = (
-            core.mirror_coordinate(edge.verts[0].co, axis_index),
-            core.mirror_coordinate(edge.verts[1].co, axis_index),
+            matching.mirror_coordinate(edge.verts[0].co, axis_index),
+            matching.mirror_coordinate(edge.verts[1].co, axis_index),
         )
         if _frozen_endpoint_match(reflected[0], reflected[1], existing, tolerance) is not None:
             already_present += 1
@@ -1080,7 +1080,7 @@ def _frozen_build_reflected_cutter(bm, source_edges, axis_index, tolerance):
 def _frozen_collapsed_offset_markers(bm, source_edges, axis_index, tolerance):
     """Independent eager list oracle for the untouched collapsed-offset boundary."""
 
-    marker_layer = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+    marker_layer = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
     if marker_layer is None:
         return set(), "edge marker layer is missing"
     originals = []
@@ -1096,8 +1096,8 @@ def _frozen_collapsed_offset_markers(bm, source_edges, axis_index, tolerance):
     target_markers = set()
     matched_nonzero_segments = 0
     for edge in source_edges:
-        reflected_a = core.mirror_coordinate(edge.verts[0].co, axis_index)
-        reflected_b = core.mirror_coordinate(edge.verts[1].co, axis_index)
+        reflected_a = matching.mirror_coordinate(edge.verts[0].co, axis_index)
+        reflected_b = matching.mirror_coordinate(edge.verts[1].co, axis_index)
         if (reflected_a - reflected_b).length <= tolerance:
             continue
         if _frozen_endpoint_match(reflected_a, reflected_b, new_edges, tolerance) is not None:
@@ -1135,7 +1135,7 @@ def check_viii_unscoped_helper_boundaries():
         _add_loose_edge(cutter, (1.0, 0.0, 0.0), (1.0, 1.0, 0.0))
         cutter_oracle = _clone_bmesh(cutter)
         cutter_source_indices = (matched_source.index, unmatched_source.index)
-        candidate_cutter = core.build_reflected_cutter(
+        candidate_cutter = stitch.build_reflected_cutter(
             cutter,
             [matched_source, unmatched_source],
             AXIS,
@@ -1149,7 +1149,7 @@ def check_viii_unscoped_helper_boundaries():
         )
         assert _normalize_cutter(candidate_cutter) == _normalize_cutter(eager_cutter)
 
-        marker_layer = collapsed.edges.layers.int.new(core.EDGE_ORIGINAL_LAYER)
+        marker_layer = collapsed.edges.layers.int.new(layer_names.EDGE_ORIGINAL_LAYER)
         source = _add_loose_edge(collapsed, (-1.0, 0.0, 0.0), (-1.0, 1.0, 0.0))
         source[marker_layer] = 0
         for shift, marker in ((1.5 * TOLERANCE, 20), (0.25 * TOLERANCE, 10), (0.8 * TOLERANCE, 30)):
@@ -1160,7 +1160,7 @@ def check_viii_unscoped_helper_boundaries():
             )
             target[marker_layer] = marker
         collapsed_oracle = _clone_bmesh(collapsed)
-        candidate_markers = core.collapsed_offset_target_edge_markers(
+        candidate_markers = stitch.collapsed_offset_target_edge_markers(
             collapsed,
             [source],
             AXIS,

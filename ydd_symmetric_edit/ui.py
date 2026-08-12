@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-
 import sys
 from typing import TYPE_CHECKING
 
 import bpy
 from bpy.props import BoolProperty, EnumProperty, FloatProperty
 
-from . import core, keymaps
+from . import keymaps, matching
 
 
 def _update_persistent_mode(self, _context):
@@ -120,7 +119,7 @@ class VIEW3D_PT_ydd_symmetric_edit(bpy.types.Panel):
         settings = context.scene.ydd_symmetric_edit
         preferences = get_addon_preferences(context)
         obj = context.edit_object
-        axes = tuple(axis for axis, _index in core.enabled_mesh_symmetry_axes(obj))
+        axes = tuple(axis for axis, _index in matching.enabled_mesh_symmetry_axes(obj))
 
         enabled = preferences is not None and preferences.enabled
         if preferences is None:
@@ -133,7 +132,7 @@ class VIEW3D_PT_ydd_symmetric_edit(bpy.types.Panel):
 
         body.label(text="Symmetry:")
         row = body.row(align=True)
-        for axis, _index, property_name in core.MESH_SYMMETRY_PROPERTIES:
+        for axis, _index, property_name in matching.MESH_SYMMETRY_PROPERTIES:
             row.prop(obj, property_name, text=axis, toggle=True)
         if len(axes) != 1:
             body.label(text="Enable exactly one axis", icon="ERROR")

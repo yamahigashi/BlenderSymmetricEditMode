@@ -15,7 +15,7 @@ import bpy
 PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
-from ydd_symmetric_edit import delete_dissolve  # noqa: E402
+from ydd_symmetric_edit import delete_dissolve, matching  # noqa: E402
 
 _AXIS = 0
 _TOL = 1.0e-5
@@ -373,7 +373,7 @@ def _legacy_build_element_pair_maps(
     bm.edges.index_update()
     bm.faces.index_update()
     coords = tuple(vertex.co.copy() for vertex in bm.verts)
-    vert_pairs = delete_dissolve.core.build_vertex_pair_table(coords, _AXIS, _TOL)
+    vert_pairs = matching.build_vertex_pair_table(coords, _AXIS, _TOL)
 
     endpoint_to_edges = defaultdict(list)
     for edge in bm.edges:

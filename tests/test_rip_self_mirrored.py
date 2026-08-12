@@ -53,7 +53,7 @@ PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
 import ydd_symmetric_edit as addon  # noqa: E402
-from ydd_symmetric_edit import backup, core, operators, rip  # noqa: E402
+from ydd_symmetric_edit import backup, layer_names, operators, rip  # noqa: E402
 
 MARKER_OK = "YSE_RIP_SELF_MIRRORED_OK"
 MARKER_FAILED = "YSE_RIP_SELF_MIRRORED_TEST_FAILED"
@@ -241,9 +241,9 @@ def assert_x_symmetric_full(bm, label=""):
 
 
 def assert_layers_removed(bm):
-    assert bm.verts.layers.int.get(core.VERT_RIP_ID_LAYER) is None, "rip vertex layer leaked"
-    assert bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER) is None, "edge layer leaked"
-    assert bm.faces.layers.int.get(core.FACE_ID_LAYER) is None, "face layer leaked"
+    assert bm.verts.layers.int.get(layer_names.VERT_RIP_ID_LAYER) is None, "rip vertex layer leaked"
+    assert bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER) is None, "edge layer leaked"
+    assert bm.faces.layers.int.get(layer_names.FACE_ID_LAYER) is None, "face layer leaked"
 
 
 def topology_counts(bm):

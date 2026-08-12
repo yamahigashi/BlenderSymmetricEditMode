@@ -17,7 +17,7 @@ PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
 import ydd_symmetric_edit as addon  # noqa: E402
-from ydd_symmetric_edit import core, operators  # noqa: E402
+from ydd_symmetric_edit import layer_names, operators, stitch  # noqa: E402
 
 
 def make_object():
@@ -85,7 +85,7 @@ def run():
     region_3d.update()
     obj = make_object()
 
-    original_apply = core.apply_reflected_path_topology
+    original_apply = stitch.apply_reflected_path_topology
     with bpy.context.temp_override(window=window, area=area, region=region):
         bpy.ops.object.mode_set(mode="EDIT")
         assert operators._prepare_session(
@@ -99,11 +99,11 @@ def run():
             result = original_apply(*args, **kwargs)
             return (*result[:2], "forced rollback test", *result[3:])
 
-        core.apply_reflected_path_topology = forced_apply
+        stitch.apply_reflected_path_topology = forced_apply
         try:
             result = bpy.ops.mesh.ydd_symmetric_edit_finish("EXEC_DEFAULT")
         finally:
-            core.apply_reflected_path_topology = original_apply
+            stitch.apply_reflected_path_topology = original_apply
         # Contract §2.2: successful rollback after mirror failure is a
         # legitimate decline → WARNING + FINISHED (native result kept).
         assert result == {"FINISHED"}, result
@@ -127,7 +127,7 @@ def run():
         and {round(vertex.co.y, 6) for vertex in edge.verts} == {-1.0, 1.0}
         for edge in bm.edges
     )
-    assert bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER) is None
+    assert bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER) is None
     assert list(bm.verts.layers.shape.keys()) == ["Basis", "Key1"]
     assert not any(mesh.name.startswith("YSE_TemporaryBackup") for mesh in bpy.data.meshes)
     assert not any(obj.name.startswith("YSE_TemporaryCutter") for obj in bpy.data.objects)

@@ -16,7 +16,7 @@ import bpy
 import numpy  # type: ignore
 from bpy.props import BoolProperty, EnumProperty, FloatProperty
 
-from . import backup, core
+from . import backup, layer_names, matching, snapshot
 from .gc_gate import gc_disabled_during_execute
 from .matching import _one_sided_pair_table
 from .replay import _symmetry_parameters
@@ -116,7 +116,7 @@ def _vertex_pair_arrays(
     count = len(coords)
     pairs = _one_sided_pair_table(coords, axis_index, tolerance)
     if pairs is None:
-        pairs = core.build_vertex_pair_table(coords, axis_index, tolerance)
+        pairs = matching.build_vertex_pair_table(coords, axis_index, tolerance)
 
     dense = numpy.full(count, -1, dtype=numpy.int64)
     if pairs:
@@ -673,10 +673,10 @@ def _mark_collapse_components(
             self_mirrored_groups.add(group_id)
         mirror_group_by_group[group_id] = next(iter(mirrored_groups)) if len(mirrored_groups) == 1 else None
 
-    old_layer = bm.verts.layers.int.get(core.VERT_COLLAPSE_GROUP_LAYER)
+    old_layer = bm.verts.layers.int.get(layer_names.VERT_COLLAPSE_GROUP_LAYER)
     if old_layer is not None:
         bm.verts.layers.int.remove(old_layer)
-    group_layer = bm.verts.layers.int.new(core.VERT_COLLAPSE_GROUP_LAYER)
+    group_layer = bm.verts.layers.int.new(layer_names.VERT_COLLAPSE_GROUP_LAYER)
     # CustomData layer creation invalidates element wrappers. Rebuild the
     # lookup and only then retain references for post-native validity checks.
     bm.verts.ensure_lookup_table()
@@ -701,7 +701,7 @@ def _collapse_survivors(
 ) -> tuple[dict[int, bmesh.types.BMVert], bool]:
     """Recover one survivor per component, allowing marker loss on fusion."""
 
-    group_layer = bm.verts.layers.int.get(core.VERT_COLLAPSE_GROUP_LAYER)
+    group_layer = bm.verts.layers.int.get(layer_names.VERT_COLLAPSE_GROUP_LAYER)
     if group_layer is None:
         return {}, False
 
@@ -1143,7 +1143,7 @@ class MESH_OT_ydd_symmetric_edit_dissolve(bpy.types.Operator):
             try:
                 if obj.mode == "EDIT":
                     bm = bmesh.from_edit_mesh(mesh)
-                    if core.remove_temporary_layers(bm):
+                    if snapshot.remove_temporary_layers(bm):
                         bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
             except (ReferenceError, RuntimeError):
                 pass
@@ -1261,7 +1261,7 @@ class MESH_OT_ydd_symmetric_edit_edge_collapse(bpy.types.Operator):
             try:
                 if obj.mode == "EDIT":
                     bm = bmesh.from_edit_mesh(mesh)
-                    if core.remove_temporary_layers(bm):
+                    if snapshot.remove_temporary_layers(bm):
                         bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
             except (ReferenceError, RuntimeError):
                 pass
@@ -1379,7 +1379,7 @@ class MESH_OT_ydd_symmetric_edit_delete_edgeloop(bpy.types.Operator):
             try:
                 if obj.mode == "EDIT":
                     bm = bmesh.from_edit_mesh(mesh)
-                    if core.remove_temporary_layers(bm):
+                    if snapshot.remove_temporary_layers(bm):
                         bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
             except (ReferenceError, RuntimeError):
                 pass

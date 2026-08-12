@@ -24,9 +24,9 @@ from mathutils import Vector
 PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
-from ydd_symmetric_edit import core, stitch  # noqa: E402
+from ydd_symmetric_edit import layer_names, matching, stitch  # noqa: E402
 
-AXIS = core.AXIS_INDEX["X"]
+AXIS = matching.AXIS_INDEX["X"]
 TOLERANCE = 1.0e-5
 MARKER = "YSE_CROSSINGS_INDEX_TEST_OK"
 
@@ -45,9 +45,9 @@ def _frozen_apply_mirrored_path_crossings(bm, plan):
 
     if not plan:
         return 0, ""
-    marker_layer = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
-    vertex_selection_layer = bm.verts.layers.int.get(core.VERT_SELECTION_LAYER)
-    edge_selection_layer = bm.edges.layers.int.get(core.EDGE_SELECTION_LAYER)
+    marker_layer = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
+    vertex_selection_layer = bm.verts.layers.int.get(layer_names.VERT_SELECTION_LAYER)
+    edge_selection_layer = bm.edges.layers.int.get(layer_names.EDGE_SELECTION_LAYER)
     if marker_layer is None or vertex_selection_layer is None or edge_selection_layer is None:
         return 0, "temporary topology or selection markers are missing"
 
@@ -86,7 +86,7 @@ def _frozen_apply_mirrored_path_crossings(bm, plan):
             for vertex in bm.verts
             if vertex.is_valid
             and vertex not in participant_endpoints[application_index]
-            and core.coordinates_match(vertex.co, coordinate, _frozen_plan_tolerance(plan))
+            and matching.coordinates_match(vertex.co, coordinate, _frozen_plan_tolerance(plan))
         ]
         if len(extras) > 1:
             return 0, "multiple existing vertices are ambiguous at a mirrored cut intersection"
@@ -198,7 +198,7 @@ def _frozen_apply_mirrored_path_crossings(bm, plan):
             for vertex in bm.verts
             if vertex.is_valid
             and vertex != survivor
-            and core.coordinates_match(vertex.co, coordinate, _frozen_plan_tolerance(plan))
+            and matching.coordinates_match(vertex.co, coordinate, _frozen_plan_tolerance(plan))
         ]
         if ambiguous:
             return 0, "a separate existing vertex remains within tolerance of a mirrored cut intersection"
@@ -331,12 +331,12 @@ def _mesh_state(bm):
 
 
 def _ensure_layers(bm):
-    if bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER) is None:
-        bm.edges.layers.int.new(core.EDGE_ORIGINAL_LAYER)
-    if bm.edges.layers.int.get(core.EDGE_SELECTION_LAYER) is None:
-        bm.edges.layers.int.new(core.EDGE_SELECTION_LAYER)
-    if bm.verts.layers.int.get(core.VERT_SELECTION_LAYER) is None:
-        bm.verts.layers.int.new(core.VERT_SELECTION_LAYER)
+    if bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER) is None:
+        bm.edges.layers.int.new(layer_names.EDGE_ORIGINAL_LAYER)
+    if bm.edges.layers.int.get(layer_names.EDGE_SELECTION_LAYER) is None:
+        bm.edges.layers.int.new(layer_names.EDGE_SELECTION_LAYER)
+    if bm.verts.layers.int.get(layer_names.VERT_SELECTION_LAYER) is None:
+        bm.verts.layers.int.new(layer_names.VERT_SELECTION_LAYER)
     _update_indices(bm)
 
 
@@ -434,7 +434,7 @@ def _build_grid(segments: int, size: float = 2.0):
     bm = bmesh.new()
     bmesh.ops.create_grid(bm, x_segments=segments, y_segments=segments, size=size)
     _ensure_layers(bm)
-    marker = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+    marker = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
     for index, edge in enumerate(bm.edges, start=1):
         edge[marker] = index
     _update_indices(bm)
@@ -574,7 +574,7 @@ def check_dense_ambiguous_matches_oracle():
         # Two non-participant verts inside tolerance of the positive cut coordinate.
         bm.verts.new((1.0 + 0.3 * TOLERANCE, 0.5, 0.0))
         bm.verts.new((1.0 - 0.3 * TOLERANCE, 0.5 + 0.3 * TOLERANCE, 0.0))
-        marker = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+        marker = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
         pos_edge[marker] = 1
         neg_edge[marker] = 2
         _update_indices(bm)
@@ -617,7 +617,7 @@ def check_survivor_rebin_across_applications():
         e1 = bm.edges.new((b0, b1))
         e2 = bm.edges.new((c0, c1))
         e3 = bm.edges.new((d0, d1))
-        marker = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+        marker = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
         for index, edge in enumerate((e0, e1, e2, e3), start=1):
             edge[marker] = index
         _update_indices(bm)
@@ -667,7 +667,7 @@ def check_rebin_keeps_nearby_query_complete():
         bm.verts.new((merge_co.x + stray_offset, merge_co.y, 0.0))
         e0 = bm.edges.new((a0, a1))
         e1 = bm.edges.new((b0, b1))
-        marker = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+        marker = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
         e0[marker] = 1
         e1[marker] = 2
         _update_indices(bm)
@@ -711,7 +711,7 @@ def check_nonfinite_fallback_matches_oracle():
             bm.verts.new((nonfinite, 5.0, 0.0))
             e0 = bm.edges.new((a0, a1))
             e1 = bm.edges.new((b0, b1))
-            marker = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+            marker = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
             e0[marker] = 1
             e1[marker] = 2
             _update_indices(bm)
@@ -740,7 +740,7 @@ def check_nonfinite_fallback_matches_oracle():
         b1 = bm.verts.new((-1.0, 1.0, 0.0))
         e0 = bm.edges.new((a0, a1))
         e1 = bm.edges.new((b0, b1))
-        marker = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+        marker = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
         e0[marker] = 1
         e1[marker] = 2
         _update_indices(bm)
@@ -767,7 +767,7 @@ def check_nonfinite_fallback_matches_oracle():
         b1 = bm.verts.new((-1.0, 1.0, 0.0))
         e0 = bm.edges.new((a0, a1))
         e1 = bm.edges.new((b0, b1))
-        marker = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+        marker = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
         e0[marker] = 1
         e1[marker] = 2
         _update_indices(bm)
@@ -798,12 +798,12 @@ def check_bin_boundary_neighborhood():
         delta = 1.0e-6
         query = Vector((boundary + delta, 0.5, 0.0))
         existing = Vector((boundary - delta, 0.5, 0.0))
-        assert core._quantized_coordinate(query, TOLERANCE) != core._quantized_coordinate(existing, TOLERANCE), (
-            core._quantized_coordinate(query, TOLERANCE),
-            core._quantized_coordinate(existing, TOLERANCE),
+        assert matching._quantized_coordinate(query, TOLERANCE) != matching._quantized_coordinate(existing, TOLERANCE), (
+            matching._quantized_coordinate(query, TOLERANCE),
+            matching._quantized_coordinate(existing, TOLERANCE),
         )
-        assert core._quantized_coordinate(existing, TOLERANCE) in set(
-            core._iter_quantized_neighborhood(query, TOLERANCE)
+        assert matching._quantized_coordinate(existing, TOLERANCE) in set(
+            matching._iter_quantized_neighborhood(query, TOLERANCE)
         )
         a0 = bm.verts.new((1.0, 0.0, 0.0))
         a1 = bm.verts.new((1.0, 1.0, 0.0))
@@ -812,7 +812,7 @@ def check_bin_boundary_neighborhood():
         bm.verts.new(tuple(existing))
         e0 = bm.edges.new((a0, a1))
         e1 = bm.edges.new((b0, b1))
-        marker = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+        marker = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
         e0[marker] = 1
         e1[marker] = 2
         _update_indices(bm)
@@ -893,14 +893,14 @@ def _build_prior_split_observed_by_later_ambiguous():
     b1 = bm.verts.new((5.0, 1.0, 0.0))
     e0 = bm.edges.new((a0, a1))
     e1 = bm.edges.new((b0, b1))
-    marker = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+    marker = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
     e0[marker] = 1
     e1[marker] = 2
     _update_indices(bm)
     split_factor = 0.5
     generated = a0.co + split_factor * (a1.co - a0.co)
     later_merge = generated + Vector((0.5 * TOLERANCE, 0.0, 0.0))
-    assert core.coordinates_match(generated, later_merge, TOLERANCE)
+    assert matching.coordinates_match(generated, later_merge, TOLERANCE)
     plan = [
         _make_cluster(
             generated,
@@ -953,7 +953,7 @@ def _build_rebinned_survivor_observed_by_later_ambiguous():
     e0 = bm.edges.new((a0, a1))
     e_mid = bm.edges.new((c0, c1))
     e1 = bm.edges.new((b0, b1))
-    marker = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+    marker = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
     e0[marker] = 1
     e_mid[marker] = 2
     e1[marker] = 3
@@ -968,10 +968,10 @@ def _build_rebinned_survivor_observed_by_later_ambiguous():
     assert survivor_key == min(_edge_key_for_occurrence(e0), _edge_key_for_occurrence(e_mid))
     far = geometric + Vector((10.0, 0.0, 0.0))
     later_merge = far + Vector((0.5 * TOLERANCE, 0.0, 0.0))
-    assert core.coordinates_match(far, later_merge, TOLERANCE)
-    assert core._quantized_coordinate(geometric, TOLERANCE) != core._quantized_coordinate(far, TOLERANCE), (
-        core._quantized_coordinate(geometric, TOLERANCE),
-        core._quantized_coordinate(far, TOLERANCE),
+    assert matching.coordinates_match(far, later_merge, TOLERANCE)
+    assert matching._quantized_coordinate(geometric, TOLERANCE) != matching._quantized_coordinate(far, TOLERANCE), (
+        matching._quantized_coordinate(geometric, TOLERANCE),
+        matching._quantized_coordinate(far, TOLERANCE),
     )
     plan = [
         _make_cluster(
@@ -1027,7 +1027,7 @@ def _build_two_cluster_finite_plan():
         bm.edges.new((c0, c1)),
         bm.edges.new((d0, d1)),
     )
-    marker = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+    marker = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
     for index, edge in enumerate(edges, start=1):
         edge[marker] = index
     _update_indices(bm)

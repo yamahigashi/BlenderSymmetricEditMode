@@ -21,9 +21,9 @@ from mathutils import Vector
 PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
-from ydd_symmetric_edit import core, stitch  # noqa: E402
+from ydd_symmetric_edit import layer_names, matching, stitch  # noqa: E402
 
-AXIS = core.AXIS_INDEX["X"]
+AXIS = matching.AXIS_INDEX["X"]
 TOLERANCE = 1.0e-5
 MARKER = "YSE_COLLECT_INCREMENTAL_TEST_OK"
 _SIDES = ("POSITIVE", "NEGATIVE", "CROSSES", "PLANE")
@@ -51,13 +51,13 @@ def _update_indices(bm):
 def _build_grid(segments=2):
     bm = bmesh.new()
     bmesh.ops.create_grid(bm, x_segments=segments, y_segments=segments, size=2.0)
-    marker = bm.edges.layers.int.new(core.EDGE_ORIGINAL_LAYER)
-    bm.edges.layers.int.new(core.EDGE_SELECTION_LAYER)
-    bm.verts.layers.int.new(core.VERT_SELECTION_LAYER)
-    face_ids = bm.faces.layers.int.new(core.FACE_ID_LAYER)
+    marker = bm.edges.layers.int.new(layer_names.EDGE_ORIGINAL_LAYER)
+    bm.edges.layers.int.new(layer_names.EDGE_SELECTION_LAYER)
+    bm.verts.layers.int.new(layer_names.VERT_SELECTION_LAYER)
+    face_ids = bm.faces.layers.int.new(layer_names.FACE_ID_LAYER)
     for edge in bm.edges:
         edge[marker] = 0
-        edge[bm.edges.layers.int.get(core.EDGE_SELECTION_LAYER)] = 0
+        edge[bm.edges.layers.int.get(layer_names.EDGE_SELECTION_LAYER)] = 0
     for face in bm.faces:
         face[face_ids] = 1
     _update_indices(bm)
@@ -71,8 +71,8 @@ def _record_bits(by_side):
 def _frozen_collect(bm, axis_index, tolerance):
     """Independent eager oracle; do not call candidate discovery helpers."""
 
-    marker = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
-    face_ids = bm.faces.layers.int.get(core.FACE_ID_LAYER)
+    marker = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
+    face_ids = bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
     by_side = {"POSITIVE": [], "NEGATIVE": [], "CROSSES": [], "PLANE": []}
     for edge in bm.edges:
         if marker is None:
@@ -195,10 +195,10 @@ def _build_crossing_fixture(multiple=False):
     bm = bmesh.new()
     # Layers first: layers.int.new reallocates the whole CustomData domain
     # and would invalidate BMEdge references captured before it.
-    edge_marker = bm.edges.layers.int.new(core.EDGE_ORIGINAL_LAYER)
-    edge_selection = bm.edges.layers.int.new(core.EDGE_SELECTION_LAYER)
-    vertex_selection = bm.verts.layers.int.new(core.VERT_SELECTION_LAYER)
-    bm.faces.layers.int.new(core.FACE_ID_LAYER)
+    edge_marker = bm.edges.layers.int.new(layer_names.EDGE_ORIGINAL_LAYER)
+    edge_selection = bm.edges.layers.int.new(layer_names.EDGE_SELECTION_LAYER)
+    vertex_selection = bm.verts.layers.int.new(layer_names.VERT_SELECTION_LAYER)
+    bm.faces.layers.int.new(layer_names.FACE_ID_LAYER)
     positive = bm.edges.new((bm.verts.new((1.0, -1.0, 0.0)), bm.verts.new((1.0, 1.0, 0.0))))
     negative = bm.edges.new((bm.verts.new((-1.0, -1.0, 0.0)), bm.verts.new((-1.0, 1.0, 0.0))))
     duplicate_positive = (
@@ -278,10 +278,10 @@ def _build_same_face_positive_fixture():
     bm = bmesh.new()
     # Layers first: layers.int.new reallocates the whole CustomData domain
     # and would invalidate element references captured before it.
-    marker = bm.edges.layers.int.new(core.EDGE_ORIGINAL_LAYER)
-    selection = bm.edges.layers.int.new(core.EDGE_SELECTION_LAYER)
-    vertex_selection = bm.verts.layers.int.new(core.VERT_SELECTION_LAYER)
-    face_ids = bm.faces.layers.int.new(core.FACE_ID_LAYER)
+    marker = bm.edges.layers.int.new(layer_names.EDGE_ORIGINAL_LAYER)
+    selection = bm.edges.layers.int.new(layer_names.EDGE_SELECTION_LAYER)
+    vertex_selection = bm.verts.layers.int.new(layer_names.VERT_SELECTION_LAYER)
+    face_ids = bm.faces.layers.int.new(layer_names.FACE_ID_LAYER)
     vertices = [
         bm.verts.new((1.0, -1.0, 0.0)),
         bm.verts.new((3.0, -1.0, 0.0)),
@@ -420,8 +420,8 @@ def check_producer_endpoint_and_pointmerge_flags():
 def check_multi_split_m2_record_order():
     bm = bmesh.new()
     try:
-        marker = bm.edges.layers.int.new(core.EDGE_ORIGINAL_LAYER)
-        bm.faces.layers.int.new(core.FACE_ID_LAYER)
+        marker = bm.edges.layers.int.new(layer_names.EDGE_ORIGINAL_LAYER)
+        bm.faces.layers.int.new(layer_names.FACE_ID_LAYER)
         left = bm.verts.new((1.0, 0.0, 0.0))
         right = bm.verts.new((4.0, 0.0, 0.0))
         source = bm.edges.new((left, right))
@@ -448,8 +448,8 @@ def check_multi_split_m2_record_order():
 def check_side_change_falls_back():
     bm = bmesh.new()
     try:
-        marker = bm.edges.layers.int.new(core.EDGE_ORIGINAL_LAYER)
-        bm.faces.layers.int.new(core.FACE_ID_LAYER)
+        marker = bm.edges.layers.int.new(layer_names.EDGE_ORIGINAL_LAYER)
+        bm.faces.layers.int.new(layer_names.FACE_ID_LAYER)
         left = bm.verts.new((-2.0, 0.0, 0.0))
         right = bm.verts.new((2.0, 0.0, 0.0))
         source = bm.edges.new((left, right))
@@ -478,10 +478,10 @@ def check_side_change_falls_back():
 def check_producer_self_mirrored_side_fallback():
     bm = bmesh.new()
     try:
-        marker = bm.edges.layers.int.new(core.EDGE_ORIGINAL_LAYER)
-        bm.edges.layers.int.new(core.EDGE_SELECTION_LAYER)
-        bm.verts.layers.int.new(core.VERT_SELECTION_LAYER)
-        bm.faces.layers.int.new(core.FACE_ID_LAYER)
+        marker = bm.edges.layers.int.new(layer_names.EDGE_ORIGINAL_LAYER)
+        bm.edges.layers.int.new(layer_names.EDGE_SELECTION_LAYER)
+        bm.verts.layers.int.new(layer_names.VERT_SELECTION_LAYER)
+        bm.faces.layers.int.new(layer_names.FACE_ID_LAYER)
         left = bm.verts.new((-2.0, 0.0, 0.0))
         right = bm.verts.new((2.0, 0.0, 0.0))
         source = bm.edges.new((left, right))
@@ -576,8 +576,8 @@ def check_face_id_closure_logs_and_falls_back():
     logger = logging.getLogger("ydd_symmetric_edit.stitch")
     logger.addHandler(handler)
     try:
-        marker = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
-        face_ids = bm.faces.layers.int.get(core.FACE_ID_LAYER)
+        marker = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
+        face_ids = bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
         for index, face in enumerate(bm.faces, start=1):
             face[face_ids] = index
         for edge in bm.edges:

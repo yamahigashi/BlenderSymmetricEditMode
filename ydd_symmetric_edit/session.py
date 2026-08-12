@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import bmesh
 import bpy
 
-from . import core, rip, session_state
+from . import matching, rip, session_state, snapshot
 from ._types import (
     KnifeSession,
     MeshSelectionMode,
@@ -173,10 +173,10 @@ def _cleanup_object_layers(session: KnifeSession) -> None:
     try:
         if obj.mode == "EDIT":
             bm = bmesh.from_edit_mesh(obj.data)
-            if core.remove_temporary_layers(bm):
+            if snapshot.remove_temporary_layers(bm):
                 bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
         else:
-            core.remove_temporary_mesh_attributes(obj.data)
+            snapshot.remove_temporary_mesh_attributes(obj.data)
     except (ReferenceError, RuntimeError):
         # The object may be in the middle of an Undo or mode transition.  Stale
         # layers are also removed before the next session and before saving.
@@ -307,11 +307,11 @@ def _prepare_session(
     # fixed temporary layer names.
     cleanup_session(window_pointer)
     bm = bmesh.from_edit_mesh(obj.data)
-    core.remove_temporary_layers(bm)
+    snapshot.remove_temporary_layers(bm)
 
-    enabled_axes = core.enabled_mesh_symmetry_axes(obj)
+    enabled_axes = matching.enabled_mesh_symmetry_axes(obj)
     if len(enabled_axes) != 1:
-        core.remove_temporary_layers(bm)
+        snapshot.remove_temporary_layers(bm)
         bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
         return False
 
@@ -326,7 +326,7 @@ def _prepare_session(
             return False
 
     history_token = session_state._new_history_token()
-    topology = core.prepare_topology(
+    topology = snapshot.prepare_topology(
         bm,
         axis_index,
         settings.tolerance,
@@ -348,7 +348,7 @@ def _prepare_session(
             lookup=topology.topology_resolution.vertex_lookup_unresolved,
         )
         if rip_snapshot is None:
-            core.remove_temporary_layers(bm)
+            snapshot.remove_temporary_layers(bm)
             bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
             return False
 

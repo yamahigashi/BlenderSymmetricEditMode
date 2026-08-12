@@ -36,7 +36,7 @@ PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
 import ydd_symmetric_edit as addon  # noqa: E402
-from ydd_symmetric_edit import core, keymaps, operators, session_state  # noqa: E402
+from ydd_symmetric_edit import keymaps, layer_names, matching, operators, session_state, snapshot, stitch  # noqa: E402
 from ydd_symmetric_edit._types import HistoryRecord  # noqa: E402
 
 OBJECT_NAME = "YSE_F9MatrixObject"
@@ -243,7 +243,7 @@ def cleanup_after_case(*, keep_history_record: bool = False) -> None:
     obj = current_object()
     if obj is not None and obj.mode == "EDIT":
         bm = bmesh.from_edit_mesh(obj.data)
-        core.remove_temporary_layers(bm)
+        snapshot.remove_temporary_layers(bm)
         bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
     # prepare_session may have suspended mirror flags; restore baseline.
     if obj is not None:
@@ -264,17 +264,17 @@ def ensure_layers(bm, *, edge=True, face_id=True, token=True):
     face_layer = None
     token_layer = None
     if edge:
-        edge_layer = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+        edge_layer = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
         if edge_layer is None:
-            edge_layer = bm.edges.layers.int.new(core.EDGE_ORIGINAL_LAYER)
+            edge_layer = bm.edges.layers.int.new(layer_names.EDGE_ORIGINAL_LAYER)
     if face_id:
-        face_layer = bm.faces.layers.int.get(core.FACE_ID_LAYER)
+        face_layer = bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
         if face_layer is None:
-            face_layer = bm.faces.layers.int.new(core.FACE_ID_LAYER)
+            face_layer = bm.faces.layers.int.new(layer_names.FACE_ID_LAYER)
     if token:
-        token_layer = bm.faces.layers.int.get(core.HISTORY_TOKEN_LAYER)
+        token_layer = bm.faces.layers.int.get(layer_names.HISTORY_TOKEN_LAYER)
         if token_layer is None:
-            token_layer = bm.faces.layers.int.new(core.HISTORY_TOKEN_LAYER)
+            token_layer = bm.faces.layers.int.new(layer_names.HISTORY_TOKEN_LAYER)
     return edge_layer, face_layer, token_layer
 
 
@@ -297,7 +297,7 @@ def paint_absent(bm, tokens) -> None:
     for index, face in enumerate(faces, start=1):
         face[face_layer] = index
     _paint_tokens(faces, token_layer, tokens)
-    assert core.native_path_edge_state(bm) == "ABSENT", core.native_path_edge_state(bm)
+    assert stitch.native_path_edge_state(bm) == "ABSENT", stitch.native_path_edge_state(bm)
 
 
 def paint_present_marker_zero(bm, tokens) -> None:
@@ -311,7 +311,7 @@ def paint_present_marker_zero(bm, tokens) -> None:
     for index, face in enumerate(faces, start=1):
         face[face_layer] = index
     _paint_tokens(faces, token_layer, tokens)
-    assert core.native_path_edge_state(bm) == "PRESENT", core.native_path_edge_state(bm)
+    assert stitch.native_path_edge_state(bm) == "PRESENT", stitch.native_path_edge_state(bm)
 
 
 def paint_present_face_id_complement(bm, tokens) -> None:
@@ -331,28 +331,28 @@ def paint_present_face_id_complement(bm, tokens) -> None:
         face[face_layer] = shared_id
     _paint_tokens(faces, token_layer, tokens)
     assert all(edge[edge_layer] != 0 for edge in bm.edges)
-    assert core.native_path_edge_state(bm) == "PRESENT", core.native_path_edge_state(bm)
+    assert stitch.native_path_edge_state(bm) == "PRESENT", stitch.native_path_edge_state(bm)
 
 
 def paint_token_layer_only(bm, token: int) -> None:
     """UNKNOWN: history token only (no EDGE_ORIGINAL / FACE_ID)."""
-    core.remove_temporary_layers(bm)
-    token_layer = bm.faces.layers.int.new(core.HISTORY_TOKEN_LAYER)
+    snapshot.remove_temporary_layers(bm)
+    token_layer = bm.faces.layers.int.new(layer_names.HISTORY_TOKEN_LAYER)
     for face in bm.faces:
         face[token_layer] = token
-    assert core.native_path_edge_state(bm) == "UNKNOWN", core.native_path_edge_state(bm)
+    assert stitch.native_path_edge_state(bm) == "UNKNOWN", stitch.native_path_edge_state(bm)
 
 
 def paint_edge_without_face_id(bm, token: int) -> None:
     """UNKNOWN: EDGE layer present, FACE_ID absent."""
-    core.remove_temporary_layers(bm)
-    edge_layer = bm.edges.layers.int.new(core.EDGE_ORIGINAL_LAYER)
-    token_layer = bm.faces.layers.int.new(core.HISTORY_TOKEN_LAYER)
+    snapshot.remove_temporary_layers(bm)
+    edge_layer = bm.edges.layers.int.new(layer_names.EDGE_ORIGINAL_LAYER)
+    token_layer = bm.faces.layers.int.new(layer_names.HISTORY_TOKEN_LAYER)
     for index, edge in enumerate(bm.edges, start=1):
         edge[edge_layer] = index
     for face in bm.faces:
         face[token_layer] = token
-    assert core.native_path_edge_state(bm) == "UNKNOWN", core.native_path_edge_state(bm)
+    assert stitch.native_path_edge_state(bm) == "UNKNOWN", stitch.native_path_edge_state(bm)
 
 
 def repair_queue_armed() -> bool:
@@ -427,7 +427,7 @@ def source_cut_left_vertical(obj, *, extend_selection: bool = False) -> None:
     path edge must be selected (native Loop Cut leaves its ring selected).
     """
     bm = bmesh.from_edit_mesh(obj.data)
-    edge_layer = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+    edge_layer = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
     # Prefer the outer-left bottom edge when several candidates exist.
     bottom_candidates = [
         edge
@@ -491,9 +491,9 @@ def temporary_layers_present(obj) -> bool:
     return any(
         layers.get(name) is not None
         for layers, name in (
-            (bm.edges.layers.int, core.EDGE_ORIGINAL_LAYER),
-            (bm.faces.layers.int, core.FACE_ID_LAYER),
-            (bm.faces.layers.int, core.HISTORY_TOKEN_LAYER),
+            (bm.edges.layers.int, layer_names.EDGE_ORIGINAL_LAYER),
+            (bm.faces.layers.int, layer_names.FACE_ID_LAYER),
+            (bm.faces.layers.int, layer_names.HISTORY_TOKEN_LAYER),
         )
     )
 
@@ -525,13 +525,13 @@ def run_repair_cases() -> None:
         reset_to_dual_quads(obj)
         bm = bmesh.from_edit_mesh(obj.data)
         # prepare_topology writes face maps into CustomData; finish restores them.
-        topology_prep = core.prepare_topology(bm, 0, 1.0e-5, own)
+        topology_prep = snapshot.prepare_topology(bm, 0, 1.0e-5, own)
         assert topology_prep.matched_faces > 0
         bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
         source_cut_left_vertical(obj)
 
         bm = bmesh.from_edit_mesh(obj.data)
-        token_layer = bm.faces.layers.int.get(core.HISTORY_TOKEN_LAYER)
+        token_layer = bm.faces.layers.int.get(layer_names.HISTORY_TOKEN_LAYER)
         assert token_layer is not None
         faces = list(bm.faces)
         assert faces
@@ -546,7 +546,7 @@ def run_repair_cases() -> None:
         assert FOREIGN_TOKEN in operators._object_history_tokens(obj)
         assert FOREIGN_TOKEN not in operators._HISTORY_RECORDS
         assert operators._HISTORY_RECORDS[own].status == "COMMITTED"
-        assert core.native_path_edge_state(bmesh.from_edit_mesh(obj.data)) == "PRESENT"
+        assert stitch.native_path_edge_state(bmesh.from_edit_mesh(obj.data)) == "PRESENT"
         assert not operators._SESSIONS
 
         verts_before = len(bmesh.from_edit_mesh(obj.data).verts)
@@ -557,7 +557,7 @@ def run_repair_cases() -> None:
             operators.cleanup_session(pointer, keep_history_record=True)
 
         bm = bmesh.from_edit_mesh(obj.data)
-        layers_gone = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER) is None
+        layers_gone = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER) is None
         sym = mesh_is_symmetric(obj)
         # Finish should have run: either layers cleaned via finish path and
         # topology grew on the mirror side, or symmetry holds.
@@ -594,7 +594,7 @@ def run_repair_cases() -> None:
         # mirrored before op2 prepares its own unique face-ID domain.
         reset_to_dual_quads(obj)
         bm = bmesh.from_edit_mesh(obj.data)
-        prior_topology = core.prepare_topology(bm, 0, 1.0e-5, own)
+        prior_topology = snapshot.prepare_topology(bm, 0, 1.0e-5, own)
         assert prior_topology.matched_faces > 0
         bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
         source_cut_left_vertical(obj)
@@ -602,7 +602,7 @@ def run_repair_cases() -> None:
         cancel_repair_queue()
         assert mesh_is_symmetric(obj)
         bm = bmesh.from_edit_mesh(obj.data)
-        adjusted_topology = core.prepare_topology(bm, 0, 1.0e-5, adjusted_token)
+        adjusted_topology = snapshot.prepare_topology(bm, 0, 1.0e-5, adjusted_token)
         assert adjusted_topology.matched_faces > 0
         bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
 
@@ -623,7 +623,7 @@ def run_repair_cases() -> None:
 
         reset_to_dual_quads(obj)
         bm = bmesh.from_edit_mesh(obj.data)
-        topology_prep = core.prepare_topology(bm, 0, 1.0e-5, own)
+        topology_prep = snapshot.prepare_topology(bm, 0, 1.0e-5, own)
         assert topology_prep.matched_faces > 0
         bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
         source_cut_left_vertical(obj)  # prior raw path at x=-1.5
@@ -631,7 +631,7 @@ def run_repair_cases() -> None:
         source_cut_left_vertical(obj, extend_selection=True)  # second adjusted path at x=-1.875
 
         bm = bmesh.from_edit_mesh(obj.data)
-        marker_layer = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+        marker_layer = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
         assert marker_layer is not None
         assert any(int(edge[marker_layer]) == 0 and not edge.select for edge in bm.edges)
         assert any(int(edge[marker_layer]) == 0 and edge.select for edge in bm.edges)
@@ -644,9 +644,9 @@ def run_repair_cases() -> None:
             finish_calls.append((live_session.history_token, preserve_history_layers))
             if live_session.history_token == adjusted_token:
                 live_bm = bmesh.from_edit_mesh(obj.data)
-                face_layer = live_bm.faces.layers.int.get(core.FACE_ID_LAYER)
+                face_layer = live_bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
                 assert face_layer is not None
-                source_edges, _side, total_path_edges, _crossing_count = core.collect_source_path_edges(
+                source_edges, _side, total_path_edges, _crossing_count = stitch.collect_source_path_edges(
                     live_bm,
                     live_session.axis_index,
                     live_session.tolerance,
@@ -727,13 +727,13 @@ def run_repair_cases() -> None:
 
         reset_to_dual_quads(obj)
         bm = bmesh.from_edit_mesh(obj.data)
-        topology_prep = core.prepare_topology(bm, 0, 1.0e-5, own)
+        topology_prep = snapshot.prepare_topology(bm, 0, 1.0e-5, own)
         assert topology_prep.matched_faces > 0
         bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
         source_cut_left_vertical(obj)
 
         bm = bmesh.from_edit_mesh(obj.data)
-        token_layer = bm.faces.layers.int.get(core.HISTORY_TOKEN_LAYER)
+        token_layer = bm.faces.layers.int.get(layer_names.HISTORY_TOKEN_LAYER)
         assert token_layer is not None
         faces = list(bm.faces)
         half = max(1, len(faces) // 2)
@@ -768,7 +768,7 @@ def run_matrix() -> None:
 
     run_case(
         "no_tokens_clean",
-        lambda bm: core.remove_temporary_layers(bm),
+        lambda bm: snapshot.remove_temporary_layers(bm),
         expect_true=True,
         expect_repair_queue=False,
     )
@@ -919,7 +919,7 @@ def start_test():
             assert result == {"FINISHED"}, result
             bpy.ops.ed.undo_push(message="YSE F9 matrix baseline")
 
-        assert core.enabled_mesh_symmetry_axes(obj) == (("X", 0),)
+        assert matching.enabled_mesh_symmetry_axes(obj) == (("X", 0),)
         STATE["deadline"] = time.monotonic() + 5.0
         bpy.app.timers.register(wait_for_route, first_interval=0.05)
     except BaseException:

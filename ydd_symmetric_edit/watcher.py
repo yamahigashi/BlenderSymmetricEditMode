@@ -7,7 +7,7 @@ import traceback
 import bmesh
 import bpy
 
-from . import core, rip, session_state
+from . import layer_names, rip, session_state
 from ._types import (
     Coordinate3D,
     KnifeSession,
@@ -55,7 +55,7 @@ def _session_new_path_signature(session: KnifeSession) -> PathSignature | RipSig
             bm = bmesh.from_edit_mesh(obj.data)
             if session.tool_kind == "RIP":
                 return rip.rip_result_signature(bm)
-            marker_layer = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+            marker_layer = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
             if marker_layer is None:
                 return None
             path = []
@@ -93,7 +93,7 @@ def _session_has_new_path(session: KnifeSession) -> bool:
             bm = bmesh.from_edit_mesh(obj.data)
             if session.tool_kind == "RIP":
                 return rip.has_rip_result(bm)
-            marker_layer = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+            marker_layer = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
             if marker_layer is None:
                 return False
             return any(int(edge[marker_layer]) <= 0 for edge in bm.edges)

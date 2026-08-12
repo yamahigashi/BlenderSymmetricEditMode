@@ -8,7 +8,7 @@ import bmesh
 import bpy
 from bpy.app.handlers import persistent
 
-from . import core, session_state
+from . import layer_names, matching, session_state, snapshot, stitch
 from ._types import (
     FaceId,
     HiddenFaceMap,
@@ -58,11 +58,11 @@ def _read_history_tokens(obj) -> set[int]:
         return set()
     if obj.mode == "EDIT":
         bm = bmesh.from_edit_mesh(obj.data)
-        layer = bm.faces.layers.int.get(core.HISTORY_TOKEN_LAYER)
+        layer = bm.faces.layers.int.get(layer_names.HISTORY_TOKEN_LAYER)
         if layer is None:
             return set()
         return {int(face[layer]) for face in bm.faces if int(face[layer])}
-    attribute = obj.data.attributes.get(core.HISTORY_TOKEN_LAYER)
+    attribute = obj.data.attributes.get(layer_names.HISTORY_TOKEN_LAYER)
     if attribute is None:
         return set()
     return {int(item.value) for item in attribute.data if int(item.value)}
@@ -84,12 +84,12 @@ def _object_has_temporary_layers(obj) -> bool:
             return any(
                 layers.get(name) is not None
                 for layers, name in (
-                    (bm.edges.layers.int, core.EDGE_ORIGINAL_LAYER),
-                    (bm.faces.layers.int, core.FACE_ID_LAYER),
-                    (bm.faces.layers.int, core.HISTORY_TOKEN_LAYER),
+                    (bm.edges.layers.int, layer_names.EDGE_ORIGINAL_LAYER),
+                    (bm.faces.layers.int, layer_names.FACE_ID_LAYER),
+                    (bm.faces.layers.int, layer_names.HISTORY_TOKEN_LAYER),
                 )
             )
-        return any(obj.data.attributes.get(name) is not None for name in core.TEMP_LAYER_NAMES)
+        return any(obj.data.attributes.get(name) is not None for name in layer_names.TEMP_LAYER_NAMES)
     except (ReferenceError, RuntimeError):
         return False
 
@@ -99,10 +99,10 @@ def _restore_session_face_maps(session: KnifeSession, obj) -> bool:
         return False
     try:
         bm = bmesh.from_edit_mesh(obj.data)
-        face_id_layer = bm.faces.layers.int.get(core.FACE_ID_LAYER)
-        mirror_id_layer = bm.faces.layers.int.get(core.FACE_MIRROR_ID_LAYER)
-        hidden_layer = bm.faces.layers.int.get(core.FACE_HIDDEN_LAYER)
-        history_layer = bm.faces.layers.int.get(core.HISTORY_TOKEN_LAYER)
+        face_id_layer = bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
+        mirror_id_layer = bm.faces.layers.int.get(layer_names.FACE_MIRROR_ID_LAYER)
+        hidden_layer = bm.faces.layers.int.get(layer_names.FACE_HIDDEN_LAYER)
+        history_layer = bm.faces.layers.int.get(layer_names.HISTORY_TOKEN_LAYER)
         if face_id_layer is None:
             return False
 
@@ -167,14 +167,14 @@ def _cleanup_object_temporary_layers(obj) -> None:
     try:
         if obj.mode == "EDIT":
             bm = bmesh.from_edit_mesh(obj.data)
-            if core.remove_temporary_layers(bm):
+            if snapshot.remove_temporary_layers(bm):
                 bmesh.update_edit_mesh(
                     obj.data,
                     loop_triangles=False,
                     destructive=False,
                 )
         else:
-            core.remove_temporary_mesh_attributes(obj.data)
+            snapshot.remove_temporary_mesh_attributes(obj.data)
     except (ReferenceError, RuntimeError):
         pass
 
@@ -229,7 +229,7 @@ def _select_path_signatures(obj, signatures, tolerance: float, *, mark_as_path: 
         for vertex in edge.verts:
             vertex.select = True
     if mark_as_path:
-        marker_layer = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+        marker_layer = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
         if marker_layer is None:
             return False
         for edge in matches:
@@ -281,11 +281,11 @@ def _adjust_last_operation_repair_plan(obj, prior_record: HistoryRecord):
 
     try:
         bm = bmesh.from_edit_mesh(obj.data)
-        marker_layer = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+        marker_layer = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
         if marker_layer is None:
             return None
         prior_edges = [edge for edge in bm.edges if int(edge[marker_layer]) == 0 and not edge.select]
-        adjusted_edges, _side, total_path_edges, _crossing_count = core.collect_source_path_edges(
+        adjusted_edges, _side, total_path_edges, _crossing_count = stitch.collect_source_path_edges(
             bm,
             adjusted_record.session.axis_index,
             adjusted_record.session.tolerance,
@@ -306,10 +306,10 @@ def _adjust_last_operation_repair_plan(obj, prior_record: HistoryRecord):
 def _live_adjusted_path_face_map(bm, session: KnifeSession):
     """Map the adjusted source carriers onto stage 1's current target faces."""
 
-    face_layer = bm.faces.layers.int.get(core.FACE_ID_LAYER)
+    face_layer = bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
     if face_layer is None:
         return None
-    source_edges, _side, total_path_edges, _crossing_count = core.collect_source_path_edges(
+    source_edges, _side, total_path_edges, _crossing_count = stitch.collect_source_path_edges(
         bm,
         session.axis_index,
         session.tolerance,
@@ -324,8 +324,8 @@ def _live_adjusted_path_face_map(bm, session: KnifeSession):
     for source_edge in source_edges:
         endpoint_face_sets = []
         for vertex in source_edge.verts:
-            expected = core.mirror_coordinate(vertex.co, session.axis_index)
-            kind, exact_vertex, boundary_edge, _factor, _reason = core._resolve_reflected_vertex_on_target(
+            expected = matching.mirror_coordinate(vertex.co, session.axis_index)
+            kind, exact_vertex, boundary_edge, _factor, _reason = stitch._resolve_reflected_vertex_on_target(
                 expected,
                 candidate_faces,
                 session.tolerance,
@@ -363,7 +363,7 @@ def _prepare_adjusted_session_face_maps(session: KnifeSession, obj, path_signatu
     """Build stage 2's carrier IDs from the mesh produced by stage 1."""
 
     bm = bmesh.from_edit_mesh(obj.data)
-    topology = core.prepare_topology(
+    topology = snapshot.prepare_topology(
         bm,
         session.axis_index,
         session.tolerance,
@@ -627,7 +627,7 @@ def _prepare_adjust_last_operation_repeat() -> bool:
     if tokens:
         try:
             bm = bmesh.from_edit_mesh(obj.data)
-            path_state = core.native_path_edge_state(bm)
+            path_state = stitch.native_path_edge_state(bm)
         except Exception:
             return False
         if path_state != "ABSENT":

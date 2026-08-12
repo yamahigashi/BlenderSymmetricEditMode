@@ -15,15 +15,15 @@ import traceback
 import bmesh
 import bpy
 
-from . import core
+from . import layer_names
 from ._types import TopologyBackup
 
 
 def create_topology_backup(bm: bmesh.types.BMesh) -> TopologyBackup:
-    old_id_layer = bm.verts.layers.int.get(core.VERT_BACKUP_ID_LAYER)
+    old_id_layer = bm.verts.layers.int.get(layer_names.VERT_BACKUP_ID_LAYER)
     if old_id_layer is not None:
         bm.verts.layers.int.remove(old_id_layer)
-    id_layer = bm.verts.layers.int.new(core.VERT_BACKUP_ID_LAYER)
+    id_layer = bm.verts.layers.int.new(layer_names.VERT_BACKUP_ID_LAYER)
     for vertex_id, vertex in enumerate(bm.verts, start=1):
         vertex[id_layer] = vertex_id
 
@@ -54,7 +54,7 @@ def restore_topology_backup(mesh, backup: TopologyBackup) -> None:
         bmesh.ops.delete(bm, geom=list(bm.verts), context="VERTS")
     bm.from_mesh(backup.mesh)
 
-    id_layer = bm.verts.layers.int.get(core.VERT_BACKUP_ID_LAYER)
+    id_layer = bm.verts.layers.int.get(layer_names.VERT_BACKUP_ID_LAYER)
     if id_layer is None:
         raise RuntimeError("Topology backup vertex IDs are missing")
     for shape_name, values_by_id in backup.shape_values.items():

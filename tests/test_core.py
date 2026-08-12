@@ -15,7 +15,7 @@ from mathutils import Vector
 PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
-from ydd_symmetric_edit import core, stitch  # noqa: E402
+from ydd_symmetric_edit import layer_names, matching, selection, snapshot, stitch  # noqa: E402
 
 
 def build_two_symmetric_quads():
@@ -57,7 +57,7 @@ def split_left_face_like_native_knife(bm):
 
 def build_marked_graph(coordinates, edges):
     bm = bmesh.new()
-    marker = bm.edges.layers.int.new(core.EDGE_ORIGINAL_LAYER)
+    marker = bm.edges.layers.int.new(layer_names.EDGE_ORIGINAL_LAYER)
     vertices = [bm.verts.new(coordinate) for coordinate in coordinates]
     for a, b in edges:
         edge = bm.edges.new((vertices[a], vertices[b]))
@@ -91,7 +91,7 @@ def check_radius_search_is_the_only_candidate_source():
     fast_bm = build_marked_graph(projected_vertices, expected_edges)
     starved_bm = build_marked_graph(projected_vertices, expected_edges)
     try:
-        fast_result = core.snap_projected_graph(
+        fast_result = stitch.snap_projected_graph(
             fast_bm,
             expected_vertices,
             expected_edges,
@@ -104,7 +104,7 @@ def check_radius_search_is_the_only_candidate_source():
         nearby_candidates = stitch._nearby_projection_candidates
         try:
             stitch._nearby_projection_candidates = lambda *_args: []
-            starved_result = core.snap_projected_graph(
+            starved_result = stitch.snap_projected_graph(
                 starved_bm,
                 expected_vertices,
                 expected_edges,
@@ -143,7 +143,7 @@ def check_constrained_matching_resolves_near_coincident_vertices():
 
     bm = build_marked_graph(projected_vertices, expected_edges)
     try:
-        snapped, _error, reason = core.snap_projected_graph(
+        snapped, _error, reason = stitch.snap_projected_graph(
             bm,
             expected_vertices,
             expected_edges,
@@ -164,7 +164,7 @@ def check_injective_component_counterexample():
 
     targets = [Vector((0.0, 0.0, 0.0)), Vector((1.2, 0.0, 0.0)), Vector((-1.5, 0.0, 0.0))]
     queries = [Vector((0.4, 0.0, 0.0)), Vector((-0.9, 0.0, 0.0)), Vector((-2.0, 0.0, 0.0))]
-    lookup = core.build_vertex_mirror_lookup(targets, 0, 1.0)
+    lookup = matching.build_vertex_mirror_lookup(targets, 0, 1.0)
     assert lookup.find_all_direct(queries) == (1, 0, 2)
 
 
@@ -179,7 +179,7 @@ def check_injective_tie_rejection_is_order_independent():
         [(eps, 11), (eps, 12)],
         [(eps, 12), (1.0, 10)],
     ]
-    result = core._solve_injective_component([0, 1, 2], candidate_lists)
+    result = matching._solve_injective_component([0, 1, 2], candidate_lists)
     assert result is None, result
 
     # A strictly better unique optimum must still be found.
@@ -187,7 +187,7 @@ def check_injective_tie_rejection_is_order_independent():
         [(0.1, 10), (0.4, 11)],
         [(0.1, 11), (0.4, 10)],
     ]
-    result = core._solve_injective_component([0, 1], unique_lists)
+    result = matching._solve_injective_component([0, 1], unique_lists)
     assert result == {0: 10, 1: 11}, result
 
 
@@ -199,8 +199,8 @@ def check_injective_step_limit_rejects_component():
     ]
     # Exhausting the search takes 3 trial assignments; capping at 2 must
     # reject the whole component even though the optimum was already seen.
-    assert core._solve_injective_component([0, 1], candidate_lists, step_limit=2) is None
-    assert core._solve_injective_component([0, 1], candidate_lists) == {0: 10, 1: 11}
+    assert matching._solve_injective_component([0, 1], candidate_lists, step_limit=2) is None
+    assert matching._solve_injective_component([0, 1], candidate_lists) == {0: 10, 1: 11}
 
 
 def check_on_plane_vertices_never_serve_off_plane_queries():
@@ -210,7 +210,7 @@ def check_on_plane_vertices_never_serve_off_plane_queries():
 
     tolerance = 0.001
     registered = [Vector((-0.0002, 0.0, 0.0)), Vector((5.0, 0.0, 0.0))]
-    lookup = core.build_vertex_mirror_lookup(registered, 0, tolerance)
+    lookup = matching.build_vertex_mirror_lookup(registered, 0, tolerance)
     # Reflection of +0.0011 is -0.0011: Chebyshev 0.0009 from the on-plane
     # vertex, i.e. inside tolerance — but the plane partition must reject it.
     assert lookup.find_all_mirrored([Vector((0.0011, 0.0, 0.0))]) == (None,)
@@ -227,7 +227,7 @@ def check_pair_table_involution_and_partial_pairs():
         Vector((0.0, 3.0, 0.0)),
         Vector((7.0, 0.0, 0.0)),  # no counterpart
     ]
-    pairs = core.build_vertex_pair_table(coords, 0, 0.001)
+    pairs = matching.build_vertex_pair_table(coords, 0, 0.001)
     assert all(pairs[pairs[vertex]] == vertex for vertex in pairs)
     assert pairs.get(0) == 2 and pairs.get(2) == 0
     assert pairs.get(1) == 3 and pairs.get(3) == 1
@@ -245,14 +245,14 @@ def check_projection_backtracking_and_failure_reasons():
     candidates = [(0.1, 0, 0), (0.2, 0, 2), (0.1, 1, 1), (0.2, 1, 3)]
     destination_pairs = [(0, 1)]
     expected_edge_set = {(2, 3)}
-    assignment, _distances, reason = core._assign_projection_candidates(
+    assignment, _distances, reason = stitch._assign_projection_candidates(
         candidates, 2, destination_pairs, expected_edge_set
     )
     assert reason == "", reason
     assert assignment == {0: 2, 1: 3}, assignment
 
     # Unsolvable: both destinations forced onto non-adjacent expected verts.
-    _assignment, _distances, reason = core._assign_projection_candidates([(0.0, 0, 0), (0.0, 1, 1)], 2, [(0, 1)], set())
+    _assignment, _distances, reason = stitch._assign_projection_candidates([(0.0, 0, 0), (0.0, 1, 1)], 2, [(0, 1)], set())
     assert reason == "graph adjacency mismatch", reason
 
     # Step limit: with the limit forced to zero, the first real branching
@@ -260,7 +260,7 @@ def check_projection_backtracking_and_failure_reasons():
     original_limit = stitch._PROJECTION_STEP_LIMIT
     try:
         stitch._PROJECTION_STEP_LIMIT = 0
-        _assignment, _distances, reason = core._assign_projection_candidates(
+        _assignment, _distances, reason = stitch._assign_projection_candidates(
             candidates, 2, destination_pairs, expected_edge_set
         )
         assert reason == "ambiguous projection correspondence", reason
@@ -283,7 +283,7 @@ def check_long_graph_fast_path():
     bm = build_marked_graph(projected_vertices, expected_edges)
     try:
         started_at = time.perf_counter()
-        snapped, error, reason = core.snap_projected_graph(
+        snapped, error, reason = stitch.snap_projected_graph(
             bm,
             expected_vertices,
             expected_edges,
@@ -318,21 +318,21 @@ def check_quantized_coordinate_bin_boundary():
     assert abs(left.x - right.x) <= tolerance
     assert abs(left.x - right.x) < 5.0e-6
 
-    primary_left = core._quantized_coordinate(left, tolerance)
-    primary_right = core._quantized_coordinate(right, tolerance)
+    primary_left = matching._quantized_coordinate(left, tolerance)
+    primary_right = matching._quantized_coordinate(right, tolerance)
     assert primary_left != primary_right, (
         primary_left,
         primary_right,
         left.x * inverse,
         right.x * inverse,
     )
-    neighborhood_left = set(core._iter_quantized_neighborhood(left, tolerance))
+    neighborhood_left = set(matching._iter_quantized_neighborhood(left, tolerance))
     assert primary_right in neighborhood_left
-    assert primary_left in set(core._iter_quantized_neighborhood(right, tolerance))
+    assert primary_left in set(matching._iter_quantized_neighborhood(right, tolerance))
 
     far = Vector((boundary + 2.0 * tolerance, 0.0, 0.0))
-    assert primary_left not in set(core._iter_quantized_neighborhood(far, tolerance))
-    assert core._quantized_coordinate(far, tolerance) not in neighborhood_left
+    assert primary_left not in set(matching._iter_quantized_neighborhood(far, tolerance))
+    assert matching._quantized_coordinate(far, tolerance) not in neighborhood_left
 
     # Historical round() bug at half-bin boundaries (float64 sample; inverse=1e5).
     round_left_x = 0.5 * tolerance - 1.0e-10
@@ -340,8 +340,8 @@ def check_quantized_coordinate_bin_boundary():
     assert round(round_left_x * inverse) != round(round_right_x * inverse)
     round_left = Vector((round_left_x, 0.0, 0.0))
     round_right = Vector((round_right_x, 0.0, 0.0))
-    assert core._quantized_coordinate(round_left, tolerance) in set(
-        core._iter_quantized_neighborhood(round_right, tolerance)
+    assert matching._quantized_coordinate(round_left, tolerance) in set(
+        matching._iter_quantized_neighborhood(round_right, tolerance)
     )
 
     # Symmetric quads whose mirrored verts sit on opposite sides of a bin edge
@@ -372,7 +372,7 @@ def check_quantized_coordinate_bin_boundary():
         bm.faces.new(right_face)
         # Mirrored left inner x is +(inner+delta); right stores +(inner-delta).
         # Real gap is ~2e-6, but floor bins differ across the integer boundary.
-        topology = core.prepare_topology(bm, core.AXIS_INDEX["X"], tolerance)
+        topology = snapshot.prepare_topology(bm, matching.AXIS_INDEX["X"], tolerance)
         assert topology.matched_faces == 2 and topology.total_faces == 2, (
             topology.matched_faces,
             topology.total_faces,
@@ -380,13 +380,13 @@ def check_quantized_coordinate_bin_boundary():
         )
 
         existing: dict = {}
-        core._register_edge_endpoint_pair(
+        stitch._register_edge_endpoint_pair(
             existing,
             Vector((inner + delta, -1.0, 0.0)),
             Vector((inner + delta, 1.0, 0.0)),
             tolerance,
         )
-        assert core._edge_coordinate_key_matches(
+        assert stitch._edge_coordinate_key_matches(
             Vector((inner - delta, -1.0, 0.0)),
             Vector((inner - delta, 1.0, 0.0)),
             tolerance,
@@ -402,9 +402,9 @@ def check_interior_edge_factor_uses_absolute_distance():
     edge_length = 1000.0
     tolerance = 1.0e-5
     # Old dimensionless check rejected factor 4e-6; absolute distance is 0.004.
-    assert core._is_interior_edge_factor(4.0e-6, edge_length, tolerance)
-    assert not core._is_interior_edge_factor(1.0e-9, edge_length, tolerance)
-    assert not core._is_interior_edge_factor(0.5, 0.0, tolerance)
+    assert stitch._is_interior_edge_factor(4.0e-6, edge_length, tolerance)
+    assert not stitch._is_interior_edge_factor(1.0e-9, edge_length, tolerance)
+    assert not stitch._is_interior_edge_factor(0.5, 0.0, tolerance)
 
 
 def check_choose_source_side_ignores_coordinate_tolerance():
@@ -416,10 +416,10 @@ def check_choose_source_side_ignores_coordinate_tolerance():
         a = bm.verts.new((-0.0020, 0.0, 0.0))
         b = bm.verts.new((-0.0028, 0.0, 0.0))
         edge = bm.edges.new((a, b))
-        side, crossing = core.choose_source_side([edge], core.AXIS_INDEX["X"], 1.0e-3, "AUTO")
+        side, crossing = stitch.choose_source_side([edge], matching.AXIS_INDEX["X"], 1.0e-3, "AUTO")
         assert side == "NEGATIVE" and crossing == 0
         assert edge.calc_length() < 1.0e-3
-        assert edge.calc_length() > core._MIN_SIDE_LENGTH
+        assert edge.calc_length() > stitch._MIN_SIDE_LENGTH
     finally:
         bm.free()
 
@@ -430,7 +430,7 @@ def check_collapsed_offset_prefers_geometrically_closer_marker():
     tolerance = 1.0e-3
     bm = bmesh.new()
     try:
-        marker_layer = bm.edges.layers.int.new(core.EDGE_ORIGINAL_LAYER)
+        marker_layer = bm.edges.layers.int.new(layer_names.EDGE_ORIGINAL_LAYER)
 
         # Far competitor first (~1.5×tol): old bin-only markers[0] would adopt it.
         far_shift = 1.5 * tolerance
@@ -458,10 +458,10 @@ def check_collapsed_offset_prefers_geometrically_closer_marker():
         source_edge = bm.edges.new((source_a, source_b))
         source_edge[marker_layer] = 0
 
-        markers, reason = core.collapsed_offset_target_edge_markers(
+        markers, reason = stitch.collapsed_offset_target_edge_markers(
             bm,
             [source_edge],
-            core.AXIS_INDEX["X"],
+            matching.AXIS_INDEX["X"],
             tolerance,
         )
         assert reason == "", reason
@@ -475,15 +475,15 @@ def check_reflected_path_lazy_existing_edge_store():
 
     bm = build_two_symmetric_quads()
     try:
-        topology = core.prepare_topology(bm, core.AXIS_INDEX["X"], 1.0e-5)
+        topology = snapshot.prepare_topology(bm, matching.AXIS_INDEX["X"], 1.0e-5)
         path_edge = split_left_face_like_native_knife(bm)
-        marker = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+        marker = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
         assert marker is not None
         path_edge[marker] = 0
-        first = core.apply_reflected_path_topology(
+        first = stitch.apply_reflected_path_topology(
             bm,
             [path_edge],
-            core.AXIS_INDEX["X"],
+            matching.AXIS_INDEX["X"],
             1.0e-5,
             topology.mirror_face_ids,
         )
@@ -499,10 +499,10 @@ def check_reflected_path_lazy_existing_edge_store():
 
         stitch._register_edge_endpoint_pair = count_registration
         try:
-            second = core.apply_reflected_path_topology(
+            second = stitch.apply_reflected_path_topology(
                 bm,
                 [path_edge],
-                core.AXIS_INDEX["X"],
+                matching.AXIS_INDEX["X"],
                 1.0e-5,
                 topology.mirror_face_ids,
             )
@@ -519,7 +519,7 @@ def check_reflected_path_lazy_store_falls_back_after_identity_miss():
 
     bm = build_two_symmetric_quads()
     try:
-        topology = core.prepare_topology(bm, core.AXIS_INDEX["X"], 1.0e-5)
+        topology = snapshot.prepare_topology(bm, matching.AXIS_INDEX["X"], 1.0e-5)
 
         def add_vertical_cut(x):
             bottom = next(
@@ -550,15 +550,15 @@ def check_reflected_path_lazy_store_falls_back_after_identity_miss():
 
         first = add_vertical_cut(-1.6)
         second = add_vertical_cut(-1.3)
-        marker = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+        marker = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
         assert marker is not None
         first[marker] = 0
         second[marker] = 0
 
-        initial = core.apply_reflected_path_topology(
+        initial = stitch.apply_reflected_path_topology(
             bm,
             [first],
-            core.AXIS_INDEX["X"],
+            matching.AXIS_INDEX["X"],
             1.0e-5,
             topology.mirror_face_ids,
         )
@@ -583,7 +583,7 @@ def check_reflected_path_lazy_store_falls_back_after_identity_miss():
             )
             target_vertices.append(target_vertex)
 
-        face_layer = bm.faces.layers.int.get(core.FACE_ID_LAYER)
+        face_layer = bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
         assert face_layer is not None
         # The store only registers edges linked to a face in the pending
         # records' target-id union (the positive quad); registration order
@@ -618,10 +618,10 @@ def check_reflected_path_lazy_store_falls_back_after_identity_miss():
 
         stitch._register_edge_endpoint_pair = count_registration
         try:
-            mixed = core.apply_reflected_path_topology(
+            mixed = stitch.apply_reflected_path_topology(
                 bm,
                 [first, second],
-                core.AXIS_INDEX["X"],
+                matching.AXIS_INDEX["X"],
                 1.0e-5,
                 topology.mirror_face_ids,
             )
@@ -663,9 +663,9 @@ def check_large_ngon_coords_match_without_recursion_error():
         )
         for index in range(vertex_count)
     )
-    assert core._coords_match_chebyshev(first, second, tolerance)
+    assert matching._coords_match_chebyshev(first, second, tolerance)
     broken = second[:-1] + ((100.0, 100.0, 100.0),)
-    assert not core._coords_match_chebyshev(first, broken, tolerance)
+    assert not matching._coords_match_chebyshev(first, broken, tolerance)
 
 
 def check_vertex_mirror_lookup_bin_boundary():
@@ -679,11 +679,11 @@ def check_vertex_mirror_lookup_bin_boundary():
     query = Vector((-(boundary - delta), 0.25, -0.5))
     # Real mirror gap is ~2e-6 << tolerance; primary bins differ.
     assert abs(registered.x - (-query.x)) <= tolerance
-    primary_reg = core._quantized_coordinate(registered, tolerance)
-    primary_mirror = core._quantized_coordinate(core.mirror_coordinate(query, 0), tolerance)
+    primary_reg = matching._quantized_coordinate(registered, tolerance)
+    primary_mirror = matching._quantized_coordinate(matching.mirror_coordinate(query, 0), tolerance)
     assert primary_reg != primary_mirror
 
-    lookup = core.build_vertex_mirror_lookup([registered], core.AXIS_INDEX["X"], tolerance)
+    lookup = matching.build_vertex_mirror_lookup([registered], matching.AXIS_INDEX["X"], tolerance)
     assert lookup.find(query) == 0
 
     # Invariant: any axis gap ≥ 2·tolerance must never hit.
@@ -695,7 +695,7 @@ def check_vertex_mirror_lookup_is_on_plane_boundary():
     """Phase 2a: is_on_plane is true on |axis| ≤ tolerance, false outside."""
 
     tolerance = 1.0e-3
-    lookup = core.build_vertex_mirror_lookup([], core.AXIS_INDEX["Y"], tolerance)
+    lookup = matching.build_vertex_mirror_lookup([], matching.AXIS_INDEX["Y"], tolerance)
     assert lookup.is_on_plane(Vector((1.0, 0.0, 0.0)))
     # mathutils.Vector is float32; assign through the component so the stored
     # value is what is_on_plane actually sees (1e-3 is not binary-exact).
@@ -723,7 +723,7 @@ def check_vertex_mirror_lookup_asymmetric_returns_none():
         Vector((-1.0, 1.0, 0.0)),
         Vector((-1.5, -0.5, 0.5)),
     ]
-    lookup = core.build_vertex_mirror_lookup(coords, core.AXIS_INDEX["X"], tolerance)
+    lookup = matching.build_vertex_mirror_lookup(coords, matching.AXIS_INDEX["X"], tolerance)
     assert lookup.find(Vector((-2.0, 0.0, 0.0))) is None
     assert lookup.find(Vector((3.0, 0.0, 0.0))) is None
     # Exact mirror of coords[1] is present via reflection of a positive query.
@@ -739,9 +739,9 @@ def check_vertex_mirror_lookup_nearest_among_candidates():
     near = Vector((-1.0 - 0.1 * tolerance, 0.0, 0.0))
     mid = Vector((-1.0 - 0.5 * tolerance, 0.0, 0.0))
     # Far first so order-of-registration alone would prefer the wrong index.
-    lookup = core.build_vertex_mirror_lookup(
+    lookup = matching.build_vertex_mirror_lookup(
         [far, near, mid],
-        core.AXIS_INDEX["X"],
+        matching.AXIS_INDEX["X"],
         tolerance,
     )
     assert lookup.find(Vector((1.0, 0.0, 0.0))) == 1
@@ -755,7 +755,7 @@ def check_edge_side_tol_boundary_classification():
     """
 
     tolerance = 0.125  # exact in float32
-    axis = core.AXIS_INDEX["X"]
+    axis = matching.AXIS_INDEX["X"]
     bm = bmesh.new()
     try:
 
@@ -763,7 +763,7 @@ def check_edge_side_tol_boundary_classification():
             a = bm.verts.new((a_x, 0.0, 0.0))
             b = bm.verts.new((b_x, 1.0, 0.0))
             edge = bm.edges.new((a, b))
-            return core._edge_side(edge, axis, tolerance)
+            return stitch._edge_side(edge, axis, tolerance)
 
         # Both endpoints exactly at +tol / beyond → POSITIVE (max > tol).
         assert classify(tolerance, 1.0) == "POSITIVE"
@@ -800,31 +800,31 @@ def check_edge_side_tol_boundary_classification():
 
 def run():
     bm = build_two_symmetric_quads()
-    topology = core.prepare_topology(bm, core.AXIS_INDEX["X"], 1.0e-5)
+    topology = snapshot.prepare_topology(bm, matching.AXIS_INDEX["X"], 1.0e-5)
     assert topology.matched_faces == 2 and topology.total_faces == 2
     assert len(topology.hidden_by_face_id) == 2
 
     path_edge = split_left_face_like_native_knife(bm)
-    marker = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
-    face_ids = bm.faces.layers.int.get(core.FACE_ID_LAYER)
+    marker = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
+    face_ids = bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
     assert path_edge is not None and path_edge[marker] == 0
     assert all(edge[marker] > 0 for edge in bm.edges if edge != path_edge)
 
-    source_edges, side, total, crossing = core.collect_source_path_edges(bm, core.AXIS_INDEX["X"], 1.0e-5, "AUTO")
+    source_edges, side, total, crossing = stitch.collect_source_path_edges(bm, matching.AXIS_INDEX["X"], 1.0e-5, "AUTO")
     assert source_edges == [path_edge]
     assert side == "NEGATIVE" and total == 1 and crossing == 0
 
-    targets, unmatched = core.target_face_ids_for_edges(source_edges, face_ids, topology.mirror_face_ids)
+    targets, unmatched = stitch.target_face_ids_for_edges(source_edges, face_ids, topology.mirror_face_ids)
     assert len(targets) == 1 and not unmatched
-    assert core.reflected_path_uses_only_target_boundaries(
+    assert stitch.reflected_path_uses_only_target_boundaries(
         bm,
         source_edges,
-        core.AXIS_INDEX["X"],
+        matching.AXIS_INDEX["X"],
         1.0e-5,
         topology.mirror_face_ids,
     )
 
-    coordinates, edges, already_present = core.build_reflected_cutter(bm, source_edges, core.AXIS_INDEX["X"], 1.0e-5)
+    coordinates, edges, already_present = stitch.build_reflected_cutter(bm, source_edges, matching.AXIS_INDEX["X"], 1.0e-5)
     assert len(coordinates) == 2 and edges == [(0, 1)]
     assert already_present == 0
     assert all(abs(co.x - 1.5) < 1.0e-8 for co in coordinates)
@@ -834,9 +834,9 @@ def run():
     # ID must still recover the complete native result.
     path_edge[marker] = 999
     path_edge.select = True
-    selected_source, selected_side, selected_total, selected_crossing = core.collect_source_path_edges(
+    selected_source, selected_side, selected_total, selected_crossing = stitch.collect_source_path_edges(
         bm,
-        core.AXIS_INDEX["X"],
+        matching.AXIS_INDEX["X"],
         1.0e-5,
         "AUTO",
         selected_only=True,
@@ -845,10 +845,10 @@ def run():
     assert selected_side == "NEGATIVE"
     assert selected_total == 1 and selected_crossing == 0
 
-    created, present, direct_reason = core.apply_reflected_path_topology(
+    created, present, direct_reason = stitch.apply_reflected_path_topology(
         bm,
         selected_source,
-        core.AXIS_INDEX["X"],
+        matching.AXIS_INDEX["X"],
         1.0e-5,
         topology.mirror_face_ids,
     )
@@ -857,9 +857,9 @@ def run():
     reflected_edge = next(edge for edge in bm.edges if all(abs(vertex.co.x - 1.5) < 1.0e-8 for vertex in edge.verts))
     assert not reflected_edge.select
 
-    core.remove_temporary_layers(bm)
-    assert bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER) is None
-    assert bm.faces.layers.int.get(core.FACE_ID_LAYER) is None
+    snapshot.remove_temporary_layers(bm)
+    assert bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER) is None
+    assert bm.faces.layers.int.get(layer_names.FACE_ID_LAYER) is None
     bm.free()
 
     # Direct loop reconstruction must retain source selection and the exact
@@ -867,32 +867,32 @@ def run():
     hidden_bm = build_two_symmetric_quads()
     target_face = next(face for face in hidden_bm.faces if face.calc_center_median().x > 0.0)
     target_face.hide_set(True)
-    hidden_topology = core.prepare_topology(
+    hidden_topology = snapshot.prepare_topology(
         hidden_bm,
-        core.AXIS_INDEX["X"],
+        matching.AXIS_INDEX["X"],
         1.0e-5,
     )
     hidden_path = split_left_face_like_native_knife(hidden_bm)
     hidden_path.select = True
     for vertex in hidden_path.verts:
         vertex.select = True
-    selection_snapshot = core.add_selection_layers(hidden_bm)
-    hidden_source, _side, _total, _crossing = core.collect_source_path_edges(
+    selection_snapshot = selection.add_selection_layers(hidden_bm)
+    hidden_source, _side, _total, _crossing = stitch.collect_source_path_edges(
         hidden_bm,
-        core.AXIS_INDEX["X"],
+        matching.AXIS_INDEX["X"],
         1.0e-5,
         "AUTO",
         selected_only=True,
     )
-    created, present, reason = core.apply_reflected_path_topology(
+    created, present, reason = stitch.apply_reflected_path_topology(
         hidden_bm,
         hidden_source,
-        core.AXIS_INDEX["X"],
+        matching.AXIS_INDEX["X"],
         1.0e-5,
         hidden_topology.mirror_face_ids,
     )
     assert (created, present, reason) == (1, 0, "")
-    core.restore_visibility_and_selection(
+    selection.restore_visibility_and_selection(
         hidden_bm,
         hidden_topology.hidden_by_face_id,
         selection_snapshot,
@@ -907,16 +907,16 @@ def run():
         edge for edge in hidden_bm.edges if all(abs(vertex.co.x + 1.5) < 1.0e-8 for vertex in edge.verts)
     )
     assert source_path.select and all(vertex.select for vertex in source_path.verts)
-    core.remove_temporary_layers(hidden_bm)
+    snapshot.remove_temporary_layers(hidden_bm)
     hidden_bm.free()
 
     # A multi-click Knife can place an intentional waypoint inside a face.
     # The direct builder realizes it as a face-interior chain, so the
     # boundary preflight must accept it instead of declining to Knife Project.
     bend_bm = build_two_symmetric_quads()
-    bend_topology = core.prepare_topology(
+    bend_topology = snapshot.prepare_topology(
         bend_bm,
-        core.AXIS_INDEX["X"],
+        matching.AXIS_INDEX["X"],
         1.0e-5,
     )
     bottom = next(
@@ -940,24 +940,24 @@ def run():
         bend_top,
         coords=[(-1.2, 0.0, 0.0)],
     )
-    bend_source, bend_side, bend_total, bend_crossing = core.collect_source_path_edges(
+    bend_source, bend_side, bend_total, bend_crossing = stitch.collect_source_path_edges(
         bend_bm,
-        core.AXIS_INDEX["X"],
+        matching.AXIS_INDEX["X"],
         1.0e-5,
         "AUTO",
     )
     assert bend_side == "NEGATIVE" and bend_total == 2 and bend_crossing == 0
-    assert core.reflected_path_uses_only_target_boundaries(
+    assert stitch.reflected_path_uses_only_target_boundaries(
         bend_bm,
         bend_source,
-        core.AXIS_INDEX["X"],
+        matching.AXIS_INDEX["X"],
         1.0e-5,
         bend_topology.mirror_face_ids,
     )
-    bend_created, bend_already, bend_reason = core.apply_reflected_path_topology(
+    bend_created, bend_already, bend_reason = stitch.apply_reflected_path_topology(
         bend_bm,
         bend_source,
-        core.AXIS_INDEX["X"],
+        matching.AXIS_INDEX["X"],
         1.0e-5,
         bend_topology.mirror_face_ids,
     )
@@ -970,11 +970,11 @@ def run():
     a = guard.verts.new((0.0, 0.0, 0.0))
     b = guard.verts.new((1.0, 0.0, 0.0))
     guard.edges.new((a, b))
-    marker = guard.edges.layers.int.new(core.EDGE_ORIGINAL_LAYER)
+    marker = guard.edges.layers.int.new(layer_names.EDGE_ORIGINAL_LAYER)
     edge = next(iter(guard.edges))
     edge[marker] = 0
     before = (a.co.copy(), b.co.copy())
-    snapped, _error, _reason = core.snap_projected_graph(
+    snapped, _error, _reason = stitch.snap_projected_graph(
         guard,
         [Vector((0.1, 0.0, 0.0)), Vector((1.1, 0.0, 0.0))],
         [(0, 1)],
