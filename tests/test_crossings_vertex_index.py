@@ -798,7 +798,9 @@ def check_bin_boundary_neighborhood():
         delta = 1.0e-6
         query = Vector((boundary + delta, 0.5, 0.0))
         existing = Vector((boundary - delta, 0.5, 0.0))
-        assert matching._quantized_coordinate(query, TOLERANCE) != matching._quantized_coordinate(existing, TOLERANCE), (
+        assert matching._quantized_coordinate(query, TOLERANCE) != matching._quantized_coordinate(
+            existing, TOLERANCE
+        ), (
             matching._quantized_coordinate(query, TOLERANCE),
             matching._quantized_coordinate(existing, TOLERANCE),
         )

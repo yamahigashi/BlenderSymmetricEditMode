@@ -1060,7 +1060,9 @@ def case_j_self_mirrored_crosses(window, area, region) -> None:
             1.0e-4,
         )
         assert by_side["CROSSES"], {key: len(value) for key, value in by_side.items()}
-        assert any(stitch_common.is_self_mirrored_edge(edge, matching.AXIS_INDEX["X"], 1.0e-4) for edge in by_side["CROSSES"])
+        assert any(
+            stitch_common.is_self_mirrored_edge(edge, matching.AXIS_INDEX["X"], 1.0e-4) for edge in by_side["CROSSES"]
+        )
 
         finished = bpy.ops.mesh.ydd_symmetric_edit_finish("EXEC_DEFAULT")
         assert finished == {"FINISHED"}, finished
@@ -1490,7 +1492,10 @@ def unit_knife_path_edge_cache() -> None:
     negative = bm.edges.new((bm.verts.new((-2.0, 0.0, 0.0)), bm.verts.new((-1.0, 0.0, 0.0))))
     cache = stitch_pathedges.capture_knife_path_edge_cache(bm, (positive, negative))
     assert cache is not None
-    by_side, total = stitch_pathedges.reclassify_knife_path_edge_cache(bm, matching.AXIS_INDEX["X"], 1.0e-5, cache) or ({}, 0)
+    by_side, total = stitch_pathedges.reclassify_knife_path_edge_cache(bm, matching.AXIS_INDEX["X"], 1.0e-5, cache) or (
+        {},
+        0,
+    )
     assert total == 2, total
     assert len(by_side["POSITIVE"]) == 1 and len(by_side["NEGATIVE"]) == 1, by_side
 

@@ -93,9 +93,7 @@ def selected_vert_keys(bm, precision: int = COORD_PRECISION) -> set[tuple]:
 
 
 def selected_edge_keys(bm, precision: int = COORD_PRECISION) -> set[frozenset]:
-    return {
-        frozenset(coordinate_key(v.co, precision) for v in edge.verts) for edge in bm.edges if edge.select
-    }
+    return {frozenset(coordinate_key(v.co, precision) for v in edge.verts) for edge in bm.edges if edge.select}
 
 
 def history_vert_keys(bm, precision: int = COORD_PRECISION) -> list[tuple]:
@@ -387,8 +385,7 @@ def check_connect_on() -> None:
     assert not mirror_edge.select
     for edge in bm.edges:
         assert not edge.select, (
-            f"edge flags must stay cleared on both sides: "
-            f"{[coordinate_key(v.co) for v in edge.verts]}"
+            f"edge flags must stay cleared on both sides: {[coordinate_key(v.co) for v in edge.verts]}"
         )
 
     selected = selected_vert_keys(bm)

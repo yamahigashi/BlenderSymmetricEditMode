@@ -92,9 +92,7 @@ class _SelectionMutationTracker:
         self._fold_face(face)
 
     def finish(self, *, complete: bool = True) -> SelectionMutationSummary:
-        return SelectionMutationSummary(
-            tuple(self.vertices), tuple(self.edges), tuple(self.faces), complete
-        )
+        return SelectionMutationSummary(tuple(self.vertices), tuple(self.edges), tuple(self.faces), complete)
 
 
 def is_self_mirrored_edge(

@@ -580,11 +580,13 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                         crossing_cache_positions = {
                             hash(edge): position for position, edge in enumerate(previous_crossing_edges)
                         }
-                    _crossings_stitched, crossing_reason, crossing_summary = stitch_crossings.apply_mirrored_path_crossings(
-                        bm,
-                        crossing_plan,
-                        cache_positions=crossing_cache_positions,
-                        return_summary=True,
+                    _crossings_stitched, crossing_reason, crossing_summary = (
+                        stitch_crossings.apply_mirrored_path_crossings(
+                            bm,
+                            crossing_plan,
+                            cache_positions=crossing_cache_positions,
+                            return_summary=True,
+                        )
                     )
                     restore_mutation_summaries.append(crossing_summary.selection_mutations)
                     restore_summary_complete &= crossing_summary.selection_mutations.complete
@@ -648,13 +650,15 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                         source_edges = by_side["POSITIVE"] + by_side["NEGATIVE"]
                     if not source_edges:
                         raise SymmetricKnifeError("The native cut path was lost before mirroring")
-                    created, already_present, direct_reason, reflected_summary = stitch_reflect.apply_reflected_path_topology(
-                        bm,
-                        source_edges,
-                        session.axis_index,
-                        session.tolerance,
-                        live_mirror_face_ids,
-                        return_summary=True,
+                    created, already_present, direct_reason, reflected_summary = (
+                        stitch_reflect.apply_reflected_path_topology(
+                            bm,
+                            source_edges,
+                            session.axis_index,
+                            session.tolerance,
+                            live_mirror_face_ids,
+                            return_summary=True,
+                        )
                     )
                     restore_mutation_summaries.append(reflected_summary)
                     restore_summary_complete &= reflected_summary.complete
@@ -818,11 +822,13 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                 collapsed_target_markers = set()
                 profile = TOOL_PROFILES.get(session.tool_kind)
                 if profile is not None and profile.supports_nested_offset:
-                    collapsed_target_markers, _collapsed_reason = stitch_projection.collapsed_offset_target_edge_markers(
-                        bm,
-                        source_edges,
-                        session.axis_index,
-                        session.tolerance,
+                    collapsed_target_markers, _collapsed_reason = (
+                        stitch_projection.collapsed_offset_target_edge_markers(
+                            bm,
+                            source_edges,
+                            session.axis_index,
+                            session.tolerance,
+                        )
                     )
                 if collapsed_target_markers:
                     # Esc cancels only Offset's Edge Slide child; Blender keeps the
@@ -1006,9 +1012,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                         summary = stitch_common.combine_selection_mutation_summaries(restore_mutation_summaries)
                         if session.tool_kind == "KNIFE" and restore_mutation_summaries:
                             scoped_direct_success = (
-                                direct_topology_success
-                                and projection_committed
-                                and mirror_failure is None
+                                direct_topology_success and projection_committed and mirror_failure is None
                             )
                             selection.restore_selection_for_route(
                                 bm,

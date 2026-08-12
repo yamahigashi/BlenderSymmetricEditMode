@@ -49,7 +49,9 @@ def _oracle_full(bm, edge_layer, face_layer):
 
 def _oracle_selected(bm, edge_layer, face_layer):
     return {
-        edge for edge in bm.edges if edge.select and stitch_pathedges._is_path_edge_by_markers(edge, edge_layer, face_layer)
+        edge
+        for edge in bm.edges
+        if edge.select and stitch_pathedges._is_path_edge_by_markers(edge, edge_layer, face_layer)
     }
 
 

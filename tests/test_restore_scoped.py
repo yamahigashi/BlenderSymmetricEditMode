@@ -176,10 +176,7 @@ def check_scoped_matches_full_restore_matrix():
                     )
                     try:
                         if selected:
-                            native_flags = [
-                                element.select
-                                for element in (*old_bm.verts, *old_bm.edges, *old_bm.faces)
-                            ]
+                            native_flags = [element.select for element in (*old_bm.verts, *old_bm.edges, *old_bm.faces)]
                             assert any(native_flags) and not all(native_flags)
                             assert not next(iter(old_bm.faces)).select
                         _mutate_selection(old_bm, mutation_case=mutation_case)
@@ -228,6 +225,7 @@ def check_fallback_conditions_increment_counter():
 
     selection.restore_visibility_and_selection = counted
     import ydd_symmetric_edit.selection as selection_module
+
     selection_original = selection_module.restore_visibility_and_selection
     selection_module.restore_visibility_and_selection = counted
     try:
@@ -238,9 +236,7 @@ def check_fallback_conditions_increment_counter():
             ("face_true", True),
             ("none", False),
         ):
-            bm, snapshot, hidden, _ = _make_fixture(
-                selected=True, hidden_mode=hidden_mode, with_history=False
-            )
+            bm, snapshot, hidden, _ = _make_fixture(selected=True, hidden_mode=hidden_mode, with_history=False)
             try:
                 _mutate_selection(bm)
                 _route_restore(
@@ -260,12 +256,8 @@ def check_fallback_conditions_increment_counter():
 
 
 def check_summary_omission_is_detected():
-    old_bm, old_snapshot, old_hidden, _ = _make_fixture(
-        selected=True, hidden_mode="none", with_history=False
-    )
-    new_bm, new_snapshot, _new_hidden, _ = _make_fixture(
-        selected=True, hidden_mode="none", with_history=False
-    )
+    old_bm, old_snapshot, old_hidden, _ = _make_fixture(selected=True, hidden_mode="none", with_history=False)
+    new_bm, new_snapshot, _new_hidden, _ = _make_fixture(selected=True, hidden_mode="none", with_history=False)
     try:
         old_face_layer = old_bm.faces.layers.int.get(layer_names.FACE_SELECTION_LAYER)
         new_face_layer = new_bm.faces.layers.int.get(layer_names.FACE_SELECTION_LAYER)

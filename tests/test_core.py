@@ -261,7 +261,9 @@ def check_projection_backtracking_and_failure_reasons():
     assert assignment == {0: 2, 1: 3}, assignment
 
     # Unsolvable: both destinations forced onto non-adjacent expected verts.
-    _assignment, _distances, reason = stitch_projection._assign_projection_candidates([(0.0, 0, 0), (0.0, 1, 1)], 2, [(0, 1)], set())
+    _assignment, _distances, reason = stitch_projection._assign_projection_candidates(
+        [(0.0, 0, 0), (0.0, 1, 1)], 2, [(0, 1)], set()
+    )
     assert reason == "graph adjacency mismatch", reason
 
     # Step limit: with the limit forced to zero, the first real branching
@@ -597,11 +599,7 @@ def check_reflected_path_lazy_store_falls_back_after_identity_miss():
         # The store only registers edges linked to a face in the pending
         # records' target-id union (the positive quad); registration order
         # is non-normative.
-        scoped_ids = {
-            int(face[face_layer])
-            for face in bm.faces
-            if all(vertex.co.x > 0.0 for vertex in face.verts)
-        }
+        scoped_ids = {int(face[face_layer]) for face in bm.faces if all(vertex.co.x > 0.0 for vertex in face.verts)}
         expected_bulk = [
             (
                 tuple(float(component) for component in edge.verts[0].co),
@@ -819,7 +817,9 @@ def run():
     assert path_edge is not None and path_edge[marker] == 0
     assert all(edge[marker] > 0 for edge in bm.edges if edge != path_edge)
 
-    source_edges, side, total, crossing = stitch_pathedges.collect_source_path_edges(bm, matching.AXIS_INDEX["X"], 1.0e-5, "AUTO")
+    source_edges, side, total, crossing = stitch_pathedges.collect_source_path_edges(
+        bm, matching.AXIS_INDEX["X"], 1.0e-5, "AUTO"
+    )
     assert source_edges == [path_edge]
     assert side == "NEGATIVE" and total == 1 and crossing == 0
 
@@ -833,7 +833,9 @@ def run():
         topology.mirror_face_ids,
     )
 
-    coordinates, edges, already_present = stitch_projection.build_reflected_cutter(bm, source_edges, matching.AXIS_INDEX["X"], 1.0e-5)
+    coordinates, edges, already_present = stitch_projection.build_reflected_cutter(
+        bm, source_edges, matching.AXIS_INDEX["X"], 1.0e-5
+    )
     assert len(coordinates) == 2 and edges == [(0, 1)]
     assert already_present == 0
     assert all(abs(co.x - 1.5) < 1.0e-8 for co in coordinates)

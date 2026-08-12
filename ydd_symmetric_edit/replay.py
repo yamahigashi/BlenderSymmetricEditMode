@@ -493,8 +493,12 @@ def _edge_coords_match(
     tolerance: float,
 ) -> bool:
     return (
-        matching.coordinates_match(first_a, second_a, tolerance) and matching.coordinates_match(first_b, second_b, tolerance)
-    ) or (matching.coordinates_match(first_a, second_b, tolerance) and matching.coordinates_match(first_b, second_a, tolerance))
+        matching.coordinates_match(first_a, second_a, tolerance)
+        and matching.coordinates_match(first_b, second_b, tolerance)
+    ) or (
+        matching.coordinates_match(first_a, second_b, tolerance)
+        and matching.coordinates_match(first_b, second_a, tolerance)
+    )
 
 
 def _quantize_co_key(co: Vector, tolerance: float) -> tuple[float, float, float]:

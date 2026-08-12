@@ -346,7 +346,9 @@ def _assert_bin_and_sphere_fixture(axis_index: int):
     inside_key = matching._quantized_coordinate(inside, TOLERANCE)
     outside_key = matching._quantized_coordinate(outside, TOLERANCE)
     assert expected_key != inside_key and expected_key != outside_key
-    assert 0.98 * TOLERANCE <= matching._chebyshev_distance_3d(_vector_tuple(expected), _vector_tuple(inside)) <= TOLERANCE
+    assert (
+        0.98 * TOLERANCE <= matching._chebyshev_distance_3d(_vector_tuple(expected), _vector_tuple(inside)) <= TOLERANCE
+    )
     assert matching._chebyshev_distance_3d(_vector_tuple(expected), _vector_tuple(outside)) > TOLERANCE
     reference = _ReferenceBinLookup((inside, outside), axis_index, TOLERANCE)
     lookup = matching.build_vertex_mirror_lookup((inside, outside), axis_index, TOLERANCE)
@@ -557,7 +559,9 @@ def _check_batch_candidate_contract_edges():
     # negation operates on a fancy-indexed copy).
     owned = numpy.asarray([(0.5, 0.25, 0.0), (-0.5, 0.25, 0.0)], dtype=numpy.float64)
     owned_snapshot = owned.copy()
-    owned_lookup = matching.build_vertex_mirror_lookup((Vector((0.5, 0.25, 0.0)), Vector((-0.5, 0.25, 0.0))), 0, tolerance)
+    owned_lookup = matching.build_vertex_mirror_lookup(
+        (Vector((0.5, 0.25, 0.0)), Vector((-0.5, 0.25, 0.0))), 0, tolerance
+    )
     owned_lookup.find_all_mirrored(owned)
     owned_lookup.find_all_direct(owned)
     assert (owned == owned_snapshot).all()
@@ -1547,19 +1551,13 @@ def _check_rip_scoped_vertex_ids():
 
         snapshot = rip_module.build_snapshot(bm, 0, TOLERANCE, lookup=lookup)
         assert snapshot is not None
-        marked = {
-            vertex.index
-            for vertex in bm.verts
-            if int(vertex[vertex_layer]) > 0
-        }
+        marked = {vertex.index for vertex in bm.verts if int(vertex[vertex_layer]) > 0}
         assert marked == expected_marked_indices
         assert 0 < len(marked) < len(bm.verts)
         assert all(int(bm.verts[index][vertex_layer]) == index + 1 for index in expected_marked_indices)
         assert all(int(bm.verts[index][vertex_layer]) == 0 for index in {5, 7, 9, 10, 24})
         assert expected_region_indices | expected_mirror_indices == expected_marked_indices
-        assert {record.vertex_id for record in snapshot.vertices} == {
-            index + 1 for index in expected_region_indices
-        }
+        assert {record.vertex_id for record in snapshot.vertices} == {index + 1 for index in expected_region_indices}
         assert {record.mirror_vertex_id for record in snapshot.vertices if record.mirror_vertex_id is not None} == {
             index + 1 for index in expected_mirror_indices
         }
@@ -2109,7 +2107,9 @@ def _check_selection_snapshot_bulk_equivalence():
         mesh_object = _BulkMeshObject(bulk_data)
         original_foreach = _install_bulk_polygon_loop_hooks(bulk_data)
         try:
-            compat = snapshot_module.capture_selection_snapshot(bm, domains=("VERT", "EDGE", "FACE"), include_history=True)
+            compat = snapshot_module.capture_selection_snapshot(
+                bm, domains=("VERT", "EDGE", "FACE"), include_history=True
+            )
             captured = snapshot_module.capture_selection_snapshot(
                 bulk,
                 mesh_object=mesh_object,
@@ -3169,7 +3169,8 @@ def _check_lazy_restore_state_matrix():
             assert session.mirror_face_ids == topology.mirror_face_ids
             assert copy.deepcopy(topology.topology_resolution) == topology.topology_resolution
             assert not any(
-                isinstance(value, matching.VertexMirrorLookup) for value in topology.topology_resolution.__dict__.values()
+                isinstance(value, matching.VertexMirrorLookup)
+                for value in topology.topology_resolution.__dict__.values()
             )
             assert not any(name in {"bm", "mesh_object", "callback"} for name in topology.topology_resolution.__dict__)
             mirror_layer = bm.faces.layers.int.get(layer_names.FACE_MIRROR_ID_LAYER)

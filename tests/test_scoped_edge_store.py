@@ -855,22 +855,19 @@ def check_vi_live_descendant_face_closure():
         _update_indices(eager_bm)
         assert mirror_face_ids == eager_mirror_face_ids
         assert _mesh_state(bm) == _mesh_state(eager_bm)
-        assert tuple(
-            tuple(vertex.index for vertex in edge.verts) for edge in bm.edges
-        ) == tuple(tuple(vertex.index for vertex in edge.verts) for edge in eager_bm.edges)
-        assert tuple(
-            tuple(vertex.index for vertex in face.verts) for face in bm.faces
-        ) == tuple(tuple(vertex.index for vertex in face.verts) for face in eager_bm.faces)
+        assert tuple(tuple(vertex.index for vertex in edge.verts) for edge in bm.edges) == tuple(
+            tuple(vertex.index for vertex in edge.verts) for edge in eager_bm.edges
+        )
+        assert tuple(tuple(vertex.index for vertex in face.verts) for face in bm.faces) == tuple(
+            tuple(vertex.index for vertex in face.verts) for face in eager_bm.faces
+        )
 
         def source_signature(edges):
             return tuple(
                 (
                     edge.index,
                     tuple(vertex.index for vertex in edge.verts),
-                    tuple(
-                        tuple(_float_bits(component) for component in vertex.co)
-                        for vertex in edge.verts
-                    ),
+                    tuple(tuple(_float_bits(component) for component in vertex.co) for vertex in edge.verts),
                 )
                 for edge in edges
             )

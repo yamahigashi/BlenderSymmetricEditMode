@@ -230,11 +230,7 @@ def check_decline_degree3_interior():
         _e, left_mid = bmesh.utils.edge_split(left_mid_edge, left_mid_edge.verts[0], 0.5)
         left_mid.co = (-2.0, 0.0, 0.0)
 
-        host = next(
-            face
-            for face in bm.faces
-            if bottom in face.verts and top in face.verts and left_mid in face.verts
-        )
+        host = next(face for face in bm.faces if bottom in face.verts and top in face.verts and left_mid in face.verts)
         # First create bottom--hub--top, then connect left_mid--hub so hub is degree 3.
         bmesh.utils.face_split(host, bottom, top, coords=[(-1.3, 0.0, 0.0)])
         hub = find_vertex(bm, (-1.3, 0.0, 0.0))
@@ -406,7 +402,6 @@ def check_decline_no_common_face():
         bm.free()
 
 
-
 def check_curved_quad_single_candidate():
     """(e) Curved quad (suzanne10 face 75): the boundary end split turns the
     host into a pentagon whose ear-clip triangulation deviates from the
@@ -455,9 +450,7 @@ def check_curved_quad_single_candidate():
         # The realization re-test would run on the target-side pentagon (the
         # mirrored loop, reversed winding), whose ear-clip need not match the
         # source one; pin the old failure condition on that side as well.
-        mirrored_loop = [
-            Vector((-v.co.x, v.co.y, v.co.z)) for v in reversed(list(pentagon.verts))
-        ]
+        mirrored_loop = [Vector((-v.co.x, v.co.y, v.co.z)) for v in reversed(list(pentagon.verts))]
         mirrored_interior = Vector((-interior.x, interior.y, interior.z))
         target_min_dist = min(
             (
@@ -524,7 +517,9 @@ def check_two_chains_same_face():
             if all(abs(vertex.co.y + 1.0) < 1.0e-8 for vertex in edge.verts)
             and max(vertex.co.x for vertex in edge.verts) > -1.5
         )
-        _e, vb2 = bmesh.utils.edge_split(bottom_rest, vb1, (-1.2 - vb1.co.x) / (bottom_rest.other_vert(vb1).co.x - vb1.co.x))
+        _e, vb2 = bmesh.utils.edge_split(
+            bottom_rest, vb1, (-1.2 - vb1.co.x) / (bottom_rest.other_vert(vb1).co.x - vb1.co.x)
+        )
         vb2.co = (-1.2, -1.0, 0.0)
         corner_tl = find_vertex(bm, (-2.0, 1.0, 0.0))
         corner_tr = find_vertex(bm, (-1.0, 1.0, 0.0))
@@ -532,9 +527,7 @@ def check_two_chains_same_face():
 
         host_a = next(face for face in bm.faces if vb1 in face.verts and corner_tl in face.verts)
         bmesh.utils.face_split(host_a, vb1, corner_tl, coords=[(-1.85, 0.0, 0.0)])
-        host_b = next(
-            face for face in bm.faces if face.is_valid and vb2 in face.verts and corner_tr in face.verts
-        )
+        host_b = next(face for face in bm.faces if face.is_valid and vb2 in face.verts and corner_tr in face.verts)
         bmesh.utils.face_split(host_b, vb2, corner_tr, coords=[(-1.15, 0.0, 0.0)])
 
         source = collect_source_path_edges(bm)

@@ -526,10 +526,7 @@ def _repair_history_state():
             if restored_adjusted is None:
                 # Stage 1 committed; the adjusted operation stays unmirrored and
                 # unrepairable because its layers were wiped with the failure.
-                print(
-                    "ydd Symmetric Edit: F9 repair stage 2 failed; "
-                    "the adjusted operation was left unmirrored"
-                )
+                print("ydd Symmetric Edit: F9 repair stage 2 failed; the adjusted operation was left unmirrored")
                 session_state._HISTORY_RECORDS.move_to_end(token)
                 return None
             adjusted_session, adjusted_window, adjusted_area, adjusted_region = restored_adjusted

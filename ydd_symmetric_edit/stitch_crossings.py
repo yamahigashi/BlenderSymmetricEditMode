@@ -800,7 +800,9 @@ class CrossingMutationSummary:
     pre_apply_edge_count: int = 0
     pre_apply_face_count: int = 0
     unexpected_topology_change: bool = False
-    selection_mutations: stitch_common.SelectionMutationSummary = field(default_factory=stitch_common.SelectionMutationSummary)
+    selection_mutations: stitch_common.SelectionMutationSummary = field(
+        default_factory=stitch_common.SelectionMutationSummary
+    )
 
 
 @overload
@@ -841,8 +843,11 @@ def apply_mirrored_path_crossings(
         summary: CrossingMutationSummary | None = None,
     ) -> tuple[int, str] | tuple[int, str, CrossingMutationSummary]:
         if return_summary:
-            return count, reason, summary or CrossingMutationSummary(
-                (), selection_mutations=selection_tracker.finish(complete=not reason)
+            return (
+                count,
+                reason,
+                summary
+                or CrossingMutationSummary((), selection_mutations=selection_tracker.finish(complete=not reason)),
             )
         return count, reason
 

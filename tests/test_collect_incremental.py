@@ -171,7 +171,9 @@ def check_track_a_record_bits_match_full_collect():
             negative=(_make_crossing_occurrence(negative, factor),),
             tolerance=TOLERANCE,
         )
-        result = stitch_crossings.apply_mirrored_path_crossings(bm, [cluster], cache_positions=positions, return_summary=True)
+        result = stitch_crossings.apply_mirrored_path_crossings(
+            bm, [cluster], cache_positions=positions, return_summary=True
+        )
         if result[1]:
             raise RuntimeError(f"Track A producer apply failed: {result}")
         patched = stitch_pathedges.patch_knife_path_edges_by_side(bm, actual, cache, result[2], AXIS, TOLERANCE)
@@ -327,7 +329,9 @@ def check_same_face_cross_source_pure_split():
                     tolerance=TOLERANCE,
                 )
             )
-        result = stitch_crossings.apply_mirrored_path_crossings(bm, clusters, cache_positions=positions, return_summary=True)
+        result = stitch_crossings.apply_mirrored_path_crossings(
+            bm, clusters, cache_positions=positions, return_summary=True
+        )
         if result[1]:
             raise RuntimeError(f"same-face producer apply failed: {result}")
         summary = result[2]
@@ -389,7 +393,10 @@ def check_producer_endpoint_and_pointmerge_flags():
         endpoint_summary = {item.source_edge_id: item for item in endpoint_result[2].edges}
         if not endpoint_summary[hash(positive)].endpoint_reused:
             raise RuntimeError("producer endpoint reuse flag was not set")
-        if stitch_pathedges.patch_knife_path_edges_by_side(bm, previous, cache, endpoint_result[2], AXIS, TOLERANCE) is not None:
+        if (
+            stitch_pathedges.patch_knife_path_edges_by_side(bm, previous, cache, endpoint_result[2], AXIS, TOLERANCE)
+            is not None
+        ):
             raise RuntimeError("producer endpoint reuse was incorrectly accepted by patch")
     finally:
         bm.free()
@@ -503,7 +510,9 @@ def check_producer_self_mirrored_side_fallback():
             negative=(_make_crossing_occurrence(source, 0.25),),
             tolerance=TOLERANCE,
         )
-        result = stitch_crossings.apply_mirrored_path_crossings(bm, [cluster], cache_positions=positions, return_summary=True)
+        result = stitch_crossings.apply_mirrored_path_crossings(
+            bm, [cluster], cache_positions=positions, return_summary=True
+        )
         if result[1]:
             raise RuntimeError(f"self-mirrored producer apply failed: {result}")
         mutation = result[2].edges[0]
@@ -627,7 +636,10 @@ def check_unexpected_topology_fallback():
                 removed_edges=removed_edges,
                 removed_faces=removed_faces,
             )
-            if stitch_pathedges.patch_knife_path_edges_by_side(bm, previous, cache, summary, AXIS, TOLERANCE) is not None:
+            if (
+                stitch_pathedges.patch_knife_path_edges_by_side(bm, previous, cache, summary, AXIS, TOLERANCE)
+                is not None
+            ):
                 raise RuntimeError("unexpected topology fallback was accepted")
             full, _ = stitch_pathedges.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
             if not any(full.values()):

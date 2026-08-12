@@ -472,7 +472,6 @@ def check_u7_census_and_pair_map_equivalence() -> None:
         bm.free()
 
 
-
 def check_u7_far_origin_key_parity() -> None:
     """Vector census keys match the scalar rule far from the origin."""
 

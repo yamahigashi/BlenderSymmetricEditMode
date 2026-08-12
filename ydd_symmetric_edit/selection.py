@@ -252,10 +252,7 @@ def restore_selection_for_route(
     summary_has_scope = all(hasattr(mutation_summary, name) for name in ("vertices", "edges", "faces"))
     summary_is_complete = summary_complete and summary_has_scope and bool(getattr(mutation_summary, "complete", True))
     use_scoped = (
-        direct_topology_success
-        and summary_is_complete
-        and not any(hidden_by_face_id.values())
-        and not hidden_state
+        direct_topology_success and summary_is_complete and not any(hidden_by_face_id.values()) and not hidden_state
     )
     if use_scoped:
         restore_selection_scoped(bm, selection_snapshot, mutation_summary)

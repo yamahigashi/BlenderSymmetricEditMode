@@ -30,9 +30,7 @@ EXPECTED_FACES = 50176  # 224^2
 # Dense one-sided component (§T-0 (e) / spike_one_sided dense mode).
 # ±(1.0 + 0.3·tol·i, 0, 0), i = 0..3 → 8 vertices.
 DENSE_CANDIDATE_COORDS: tuple[tuple[float, float, float], ...] = tuple(
-    (sign * (1.0 + 0.3 * TOLERANCE * i), 0.0, 0.0)
-    for i in range(4)
-    for sign in (1.0, -1.0)
+    (sign * (1.0 + 0.3 * TOLERANCE * i), 0.0, 0.0) for i in range(4) for sign in (1.0, -1.0)
 )
 
 Domain = Literal["vert", "edge", "face"]

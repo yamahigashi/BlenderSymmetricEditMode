@@ -112,6 +112,7 @@ def check_order_guard_detects_reordered_keys():
 
     stitch_crossings._build_crossings_vertex_bin_index_python = observed_python
     try:
+
         def swapped_floor(values, *args, **kwargs):
             result = original_floor(values, *args, **kwargs)
             if getattr(result, "ndim", 0) == 2 and len(result) >= 2:

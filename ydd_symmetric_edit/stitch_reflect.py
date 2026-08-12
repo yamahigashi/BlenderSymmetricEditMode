@@ -877,7 +877,9 @@ def apply_reflected_path_topology(
                 tracker.add_edge(existing)
                 existing_target_ids = {FaceId(int(face[face_layer])) for face in existing.link_faces}
                 if not existing_target_ids.intersection(possible_target_ids):
-                    return _result(created_edges, already_present, "an existing mirrored edge is outside its target face")
+                    return _result(
+                        created_edges, already_present, "an existing mirrored edge is outside its target face"
+                    )
                 already_present += 1
                 progress = True
                 continue
@@ -915,7 +917,11 @@ def apply_reflected_path_topology(
                 possible_target_ids,
             )
             if endpoint_match == "ambiguous":
-                return _result(created_edges, already_present, "multiple coordinate-matching edges are ambiguous across target faces")
+                return _result(
+                    created_edges,
+                    already_present,
+                    "multiple coordinate-matching edges are ambiguous across target faces",
+                )
             if endpoint_match == "match":
                 already_present += 1
                 progress = True

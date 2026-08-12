@@ -965,7 +965,9 @@ def case_f_crosses_plus_crossing(window, area, region) -> None:
     by_side, total = stitch_pathedges.collect_knife_path_edges_by_side(bm, matching.AXIS_INDEX["X"], TOL)
     assert total >= 3, (total, {key: len(value) for key, value in by_side.items()})
     assert by_side["CROSSES"], {key: len(value) for key, value in by_side.items()}
-    assert any(not stitch_common.is_self_mirrored_edge(edge, matching.AXIS_INDEX["X"], TOL) for edge in by_side["CROSSES"])
+    assert any(
+        not stitch_common.is_self_mirrored_edge(edge, matching.AXIS_INDEX["X"], TOL) for edge in by_side["CROSSES"]
+    )
 
     from ydd_symmetric_edit import backup as backup_mod
 

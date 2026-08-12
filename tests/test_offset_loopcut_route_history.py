@@ -106,7 +106,9 @@ def temporary_layer_names():
         bm.edges.layers.int,
         bm.faces.layers.int,
     )
-    return tuple(name for name in layer_names.TEMP_LAYER_NAMES if any(layers.get(name) is not None for layers in groups))
+    return tuple(
+        name for name in layer_names.TEMP_LAYER_NAMES if any(layers.get(name) is not None for layers in groups)
+    )
 
 
 def fail(message=""):

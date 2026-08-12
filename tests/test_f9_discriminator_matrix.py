@@ -662,10 +662,7 @@ def run_repair_cases() -> None:
                     selected_only=True,
                 )
                 source_ids = {
-                    int(face[face_layer])
-                    for edge in source_edges
-                    for face in edge.link_faces
-                    if face.is_valid
+                    int(face[face_layer]) for edge in source_edges for face in edge.link_faces if face.is_valid
                 }
                 live_ids = {int(face[face_layer]) for face in live_bm.faces}
                 target_ids = {int(live_session.mirror_face_ids[source_id]) for source_id in source_ids}
@@ -700,8 +697,7 @@ def run_repair_cases() -> None:
         latest_active_record = next(
             candidate
             for candidate in reversed(tuple(operators._HISTORY_RECORDS.values()))
-            if candidate.status == "COMMITTED"
-            and candidate.session.native_operator_pointer == adjusted_pointer
+            if candidate.status == "COMMITTED" and candidate.session.native_operator_pointer == adjusted_pointer
         )
         assert latest_active_record is operators._HISTORY_RECORDS[adjusted_token]
         assert not operators._object_history_tokens(obj)
