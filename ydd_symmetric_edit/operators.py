@@ -392,6 +392,9 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
         crossing_count = 0
         warning = ""
         selection_state = None
+        restore_mutation_summaries = []
+        direct_topology_success = False
+        restore_summary_complete = True
         side: str | None = None
         mirror_failure: str | None = None
         rollback_failed = False
@@ -507,12 +510,15 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     bm = bmesh.from_edit_mesh(obj.data)
                     by_side, total_path_edges = _collect_knife_path_edges(bm)
                     live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, _all_path_edges(by_side))
-                    stitched, stitch_reason = core.apply_crosses_p_stitch(
+                    stitched, stitch_reason, stitch_summary = core.apply_crosses_p_stitch(
                         bm,
                         by_side["CROSSES"],
                         session.axis_index,
                         session.tolerance,
+                        return_summary=True,
                     )
+                    restore_mutation_summaries.append(stitch_summary)
+                    restore_summary_complete &= stitch_summary.complete
                     if stitch_reason:
                         raise SymmetricKnifeError(stitch_reason)
                     # Half-edges reclassify as POSITIVE/NEGATIVE after the split.
@@ -588,6 +594,8 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                         cache_positions=crossing_cache_positions,
                         return_summary=True,
                     )
+                    restore_mutation_summaries.append(crossing_summary.selection_mutations)
+                    restore_summary_complete &= crossing_summary.selection_mutations.complete
                     if crossing_reason:
                         raise SymmetricKnifeError(crossing_reason)
                     patched = stitch.patch_knife_path_edges_by_side(
@@ -648,17 +656,22 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                         source_edges = by_side["POSITIVE"] + by_side["NEGATIVE"]
                     if not source_edges:
                         raise SymmetricKnifeError("The native cut path was lost before mirroring")
-                    created, already_present, direct_reason = core.apply_reflected_path_topology(
+                    created, already_present, direct_reason, reflected_summary = core.apply_reflected_path_topology(
                         bm,
                         source_edges,
                         session.axis_index,
                         session.tolerance,
                         live_mirror_face_ids,
+                        return_summary=True,
                     )
+                    restore_mutation_summaries.append(reflected_summary)
+                    restore_summary_complete &= reflected_summary.complete
                     if direct_reason:
                         raise SymmetricKnifeError(f"Could not rebuild the mirrored {tool_label}: {direct_reason}")
                     if created + already_present != len(source_edges):
                         raise SymmetricKnifeError(f"The mirrored {tool_label} topology did not match the source")
+
+                    direct_topology_success = True
 
                     projection_committed = True
                     result = {"FINISHED"}
@@ -998,11 +1011,27 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     bm = bmesh.from_edit_mesh(obj.data)
                     context.tool_settings.mesh_select_mode = mesh_select_mode.as_tuple()
                     if selection_state is not None:
-                        core.restore_visibility_and_selection(
-                            bm,
-                            session.hidden_by_face_id,
-                            selection_state,
-                        )
+                        summary = core.combine_selection_mutation_summaries(restore_mutation_summaries)
+                        if session.tool_kind == "KNIFE" and restore_mutation_summaries:
+                            scoped_direct_success = (
+                                direct_topology_success
+                                and projection_committed
+                                and mirror_failure is None
+                            )
+                            core.restore_selection_for_route(
+                                bm,
+                                session.hidden_by_face_id,
+                                selection_state,
+                                summary,
+                                direct_topology_success=scoped_direct_success,
+                                summary_complete=restore_summary_complete and summary.complete,
+                            )
+                        else:
+                            core.restore_visibility_and_selection(
+                                bm,
+                                session.hidden_by_face_id,
+                                selection_state,
+                            )
                     else:
                         face_layer = bm.faces.layers.int.get(core.FACE_ID_LAYER)
                         if face_layer is not None:

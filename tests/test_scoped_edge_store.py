@@ -757,6 +757,7 @@ def _c1_hooks():
         marker_layer,
         existing_edges,
         realized_face_ids,
+        **realize_kwargs,
     ):
         if "pre_chain_store" not in state:
             store = {}
@@ -782,6 +783,7 @@ def _c1_hooks():
             marker_layer,
             existing_edges,
             realized_face_ids,
+            **realize_kwargs,
         )
         state["realized"] += 1
         source_end_coordinates = {

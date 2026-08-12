@@ -4,7 +4,7 @@ import logging
 import math
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 import bmesh
@@ -32,6 +32,86 @@ from .snapshot import EDGE_HIDDEN_LAYER, EDGE_ORIGINAL_LAYER, EDGE_SELECTION_LAY
 
 _MIN_SIDE_LENGTH = 1.0e-9
 _LOGGER = logging.getLogger(__name__)
+
+
+@dataclass
+class SelectionMutationSummary:
+    """Elements whose native selection may have changed during a topology apply.
+
+    The tuples intentionally retain invalid BMesh proxies: the scoped restore
+    filters them with ``is_valid`` and can therefore handle pointmerge safely.
+    ``complete`` is false only when an apply reports a partial/unknown result.
+    """
+
+    vertices: tuple[bmesh.types.BMVert, ...] = ()
+    edges: tuple[bmesh.types.BMEdge, ...] = ()
+    faces: tuple[bmesh.types.BMFace, ...] = ()
+    complete: bool = True
+
+
+def combine_selection_mutation_summaries(
+    summaries: Iterable[SelectionMutationSummary],
+) -> SelectionMutationSummary:
+    vertices: set[bmesh.types.BMVert] = set()
+    edges: set[bmesh.types.BMEdge] = set()
+    faces: set[bmesh.types.BMFace] = set()
+    complete = True
+    for summary in summaries:
+        vertices.update(summary.vertices)
+        edges.update(summary.edges)
+        faces.update(summary.faces)
+        complete &= summary.complete
+    return SelectionMutationSummary(tuple(vertices), tuple(edges), tuple(faces), complete)
+
+
+class _SelectionMutationTracker:
+    def __init__(self) -> None:
+        self.vertices: set[bmesh.types.BMVert] = set()
+        self.edges: set[bmesh.types.BMEdge] = set()
+        self.faces: set[bmesh.types.BMFace] = set()
+
+    # Downward-closure invariant: every face in the summary carries its full
+    # boundary edges/vertices and every edge carries both vertices. Clearing a
+    # summary face/edge flushes deselection down to its boundary, so partial
+    # capture would wipe untracked independently-selected neighbors that the
+    # scoped restore never revisits.
+    def _fold_edge(self, edge) -> None:
+        self.edges.add(edge)
+        if edge.is_valid:
+            self.vertices.update(edge.verts)
+
+    def _fold_face(self, face) -> None:
+        self.faces.add(face)
+        if face.is_valid:
+            for edge in face.edges:
+                if edge.is_valid:
+                    self._fold_edge(edge)
+            self.vertices.update(vertex for vertex in face.verts if vertex.is_valid)
+
+    def add_vertex(self, vertex) -> None:
+        self.vertices.add(vertex)
+        if vertex.is_valid:
+            for edge in vertex.link_edges:
+                if edge.is_valid:
+                    self._fold_edge(edge)
+            for face in vertex.link_faces:
+                if face.is_valid:
+                    self._fold_face(face)
+
+    def add_edge(self, edge) -> None:
+        self._fold_edge(edge)
+        if edge.is_valid:
+            for face in edge.link_faces:
+                if face.is_valid:
+                    self._fold_face(face)
+
+    def add_face(self, face) -> None:
+        self._fold_face(face)
+
+    def finish(self, *, complete: bool = True) -> SelectionMutationSummary:
+        return SelectionMutationSummary(
+            tuple(self.vertices), tuple(self.edges), tuple(self.faces), complete
+        )
 
 
 def _edge_side(
@@ -585,7 +665,9 @@ def apply_crosses_p_stitch(
     crosses_edges: Iterable[bmesh.types.BMEdge],
     axis_index: int,
     tolerance: float,
-) -> tuple[int, str]:
+    *,
+    return_summary: bool = False,
+) -> tuple[int, str] | tuple[int, str, SelectionMutationSummary]:
     """Split non-self-mirrored CROSSES edges at their plane intersection *p*.
 
     All intersections are collected before any mutation, clustered, then
@@ -597,9 +679,18 @@ def apply_crosses_p_stitch(
     already be partially mutated; callers must roll back the whole stage.
     """
 
+    tracker = _SelectionMutationTracker()
+
+    def _result(count: int, reason: str):
+        if return_summary:
+            return count, reason, tracker.finish(complete=not reason)
+        return count, reason
+
     edges = [edge for edge in crosses_edges if edge.is_valid]
+    for edge in edges:
+        tracker.add_edge(edge)
     if not edges:
-        return 0, ""
+        return _result(0, "")
 
     # (i) Collect plane intersections before any mutation.
     records: list[tuple[bmesh.types.BMEdge, Vector, float]] = []
@@ -608,7 +699,7 @@ def apply_crosses_p_stitch(
             continue
         intersection = plane_intersection_of_edge(edge, axis_index)
         if intersection is None:
-            return 0, "a cross-plane cut segment has no plane intersection"
+            return _result(0, "a cross-plane cut segment has no plane intersection")
         point, factor = intersection
         # Degenerate: intersection already at an endpoint within tol → treat as
         # already on-plane (no split); skip so POSITIVE/NEGATIVE reclassification
@@ -618,7 +709,7 @@ def apply_crosses_p_stitch(
         records.append((edge, point, factor))
 
     if not records:
-        return 0, ""
+        return _result(0, "")
 
     points = [point for _edge, point, _factor in records]
     clusters = cluster_points_by_tolerance(points, tolerance)
@@ -639,7 +730,7 @@ def apply_crosses_p_stitch(
             tolerance,
         )
         if reason:
-            return stitched, reason
+            return _result(stitched, reason)
 
         vertex = plan_vertex
         if host_split is not None:
@@ -647,50 +738,62 @@ def apply_crosses_p_stitch(
             try:
                 _new_edge, vertex = bmesh.utils.edge_split(host_edge, host_edge.verts[0], factor)
             except (RuntimeError, ValueError) as exc:
-                return stitched, f"could not split a host edge at the knife stitch point: {exc}"
+                return _result(stitched, f"could not split a host edge at the knife stitch point: {exc}")
+            tracker.add_edge(host_edge)
+            tracker.add_edge(_new_edge)
+            tracker.add_vertex(vertex)
         if vertex is None:
             # Priority (3): create p by splitting the lex-first member edge.
             seed = _lex_first_edge(member_edges, axis_index)
             intersection = plane_intersection_of_edge(seed, axis_index)
             if intersection is None:
-                return stitched, "a cross-plane cut segment has no plane intersection"
+                return _result(stitched, "a cross-plane cut segment has no plane intersection")
             _point, factor = intersection
             try:
                 _new_edge, vertex = bmesh.utils.edge_split(seed, seed.verts[0], factor)
             except (RuntimeError, ValueError) as exc:
-                return stitched, f"could not split a cross-plane cut at the mirror plane: {exc}"
+                return _result(stitched, f"could not split a cross-plane cut at the mirror plane: {exc}")
+            tracker.add_edge(seed)
+            tracker.add_edge(_new_edge)
+            tracker.add_vertex(vertex)
             stitched += 1
 
         assert vertex is not None
+        tracker.add_vertex(vertex)
         vertex.co = representative.copy()
         vertex.co[axis_index] = 0.0
         vertex.select = False
 
         for edge in member_edges:
             if not edge.is_valid:
-                return stitched, "a cross-plane cut edge was lost during p-stitch"
+                return _result(stitched, "a cross-plane cut edge was lost during p-stitch")
+            tracker.add_edge(edge)
             if any(endpoint == vertex for endpoint in edge.verts):
                 continue
             if any(coordinates_match(endpoint.co, vertex.co, tolerance) for endpoint in edge.verts):
                 for endpoint in edge.verts:
                     if coordinates_match(endpoint.co, vertex.co, tolerance) and endpoint != vertex:
+                        tracker.add_vertex(endpoint)
                         try:
                             # pointmerge keeps verts[0] as the survivor
                             # (bmo_pointmerge_exec); put the cluster representative first.
                             bmesh.ops.pointmerge(bm, verts=[vertex, endpoint], merge_co=vertex.co)
                         except (RuntimeError, ValueError) as exc:
-                            return stitched, f"could not merge plane-stitch vertices: {exc}"
+                            return _result(stitched, f"could not merge plane-stitch vertices: {exc}")
                         break
                 continue
 
             recomputed = plane_intersection_of_edge(edge, axis_index)
             if recomputed is None:
-                return stitched, "a cross-plane cut segment lost its plane intersection"
+                return _result(stitched, "a cross-plane cut segment lost its plane intersection")
             _point, factor = recomputed
             try:
                 _new_edge, new_vertex = bmesh.utils.edge_split(edge, edge.verts[0], factor)
             except (RuntimeError, ValueError) as exc:
-                return stitched, f"could not split a cross-plane cut at the mirror plane: {exc}"
+                return _result(stitched, f"could not split a cross-plane cut at the mirror plane: {exc}")
+            tracker.add_edge(edge)
+            tracker.add_edge(_new_edge)
+            tracker.add_vertex(new_vertex)
             new_vertex.co = vertex.co.copy()
             new_vertex.select = False
             if new_vertex != vertex:
@@ -699,13 +802,14 @@ def apply_crosses_p_stitch(
                     # one cluster (multi-segment X at p).
                     bmesh.ops.pointmerge(bm, verts=[vertex, new_vertex], merge_co=vertex.co)
                 except (RuntimeError, ValueError) as exc:
-                    return stitched, f"could not unify plane-stitch vertices: {exc}"
+                    return _result(stitched, f"could not unify plane-stitch vertices: {exc}")
+                tracker.add_vertex(new_vertex)
             stitched += 1
 
     bm.verts.ensure_lookup_table()
     bm.edges.ensure_lookup_table()
     bm.normal_update()
-    return stitched, ""
+    return _result(stitched, "")
 
 
 def _mirror_invariant_endpoint_key(
@@ -1592,6 +1696,7 @@ class CrossingMutationSummary:
     pre_apply_edge_count: int = 0
     pre_apply_face_count: int = 0
     unexpected_topology_change: bool = False
+    selection_mutations: SelectionMutationSummary = field(default_factory=SelectionMutationSummary)
 
 
 def apply_mirrored_path_crossings(
@@ -1608,13 +1713,17 @@ def apply_mirrored_path_crossings(
     source-edge mutation facts via ``return_summary=True``.
     """
 
+    selection_tracker = _SelectionMutationTracker()
+
     def _result(
         count: int,
         reason: str,
         summary: CrossingMutationSummary | None = None,
     ) -> tuple[int, str] | tuple[int, str, CrossingMutationSummary]:
         if return_summary:
-            return count, reason, summary or CrossingMutationSummary(())
+            return count, reason, summary or CrossingMutationSummary(
+                (), selection_mutations=selection_tracker.finish(complete=not reason)
+            )
         return count, reason
 
     if not plan:
@@ -1628,7 +1737,6 @@ def apply_mirrored_path_crossings(
     bm.edges.ensure_lookup_table()
     pre_apply_edge_count = len(bm.edges)
     pre_apply_face_count = len(bm.faces)
-
     applications: list[tuple[Vector, tuple[_MirroredPathOccurrence, ...]]] = []
     for cluster in plan:
         if cluster.positive:
@@ -1648,6 +1756,7 @@ def apply_mirrored_path_crossings(
             if not edge.is_valid:
                 return _result(0, "a mirrored crossing source edge was lost before stitching")
             edge_key = occurrence.edge_id
+            selection_tracker.add_edge(edge)
             native_edge_selection.setdefault(edge_key, bool(edge.select))
             edge_marker.setdefault(edge_key, int(edge[marker_layer]))
             if occurrence.endpoint_index is not None:
@@ -1805,10 +1914,12 @@ def apply_mirrored_path_crossings(
                 return _result(0, f"could not split a mirrored path crossing edge: {exc}")
 
             for half_edge in (descendant, new_edge):
+                selection_tracker.add_edge(half_edge)
                 half_edge[marker_layer] = marker
                 half_edge.select = selected
                 half_edge[edge_selection_layer] = int(selected)
             new_vertex.select = selected
+            selection_tracker.add_vertex(new_vertex)
             new_vertex[vertex_selection_layer] = int(selected)
             native_vertex_selection[hash(new_vertex)] = selected
             vertex_by_occurrence[id(occurrence)] = new_vertex
@@ -1852,11 +1963,13 @@ def apply_mirrored_path_crossings(
             bool(vertex[vertex_selection_layer]) for vertex in vertices if vertex.is_valid
         )
         old_survivor_co = survivor.co.copy()
+        selection_tracker.add_vertex(survivor)
         survivor.co = coordinate.copy()
         _index_rebin(survivor, old_survivor_co, coordinate)
         for vertex in list(vertices):
             if vertex == survivor:
                 continue
+            selection_tracker.add_vertex(vertex)
             discard_co = vertex.co.copy() if vertex.is_valid else None
             try:
                 bmesh.ops.pointmerge(
@@ -1868,6 +1981,7 @@ def apply_mirrored_path_crossings(
                 return _result(0, f"could not unify mirrored crossing vertices: {exc}")
             for occurrence in occurrences:
                 pointmerged_by_edge[occurrence.edge_id] = True
+            selection_tracker.add_vertex(vertex)
             if discard_co is not None:
                 _index_unregister(vertex, discard_co)
             if not survivor.is_valid:
@@ -1914,6 +2028,7 @@ def apply_mirrored_path_crossings(
         pre_apply_edge_count=pre_apply_edge_count,
         pre_apply_face_count=pre_apply_face_count,
         unexpected_topology_change=unexpected_topology_change,
+        selection_mutations=selection_tracker.finish(complete=not unexpected_topology_change),
     )
     return _result(len(applications), "", summary)
 
@@ -2473,6 +2588,8 @@ def _realize_interior_chain(
     marker_layer,
     existing_edges: dict | None,
     realized_face_ids: set[FaceId],
+    *,
+    selection_tracker: _SelectionMutationTracker | None = None,
 ) -> tuple[int, int, str, dict | None]:
     """face_split one accepted interior chain. Returns created/already_present delta."""
 
@@ -2512,6 +2629,10 @@ def _realize_interior_chain(
         target_face = containing_faces[0]
 
     try:
+        if selection_tracker is not None:
+            selection_tracker.add_vertex(end_a)
+            selection_tracker.add_vertex(end_b)
+            selection_tracker.add_face(target_face)
         new_face, _new_loop = bmesh.utils.face_split(
             target_face,
             end_a,
@@ -2523,6 +2644,9 @@ def _realize_interior_chain(
     if new_face is None or not new_face.is_valid or not target_face.is_valid:
         return 0, 0, "could not split a target face for interior chain", existing_edges
     realized_face_ids.add(chain.target_face_id)
+    if selection_tracker is not None:
+        selection_tracker.add_face(target_face)
+        selection_tracker.add_face(new_face)
 
     # The coords vertices lie exactly on the cut path both descendants share,
     # so they are the shared vertices minus the chain ends.  This stays local
@@ -2541,6 +2665,8 @@ def _realize_interior_chain(
         remaining.sort(key=lambda vertex: (vertex.co - expected).length)
         chosen = remaining.pop(0)
         chosen.co = expected.copy()
+        if selection_tracker is not None:
+            selection_tracker.add_vertex(chosen)
         chosen.select = False
         target_vertex_by_source_key[member] = chosen
 
@@ -2557,8 +2683,12 @@ def _realize_interior_chain(
         if edge is None:
             return created, already, "interior chain face_split missed a chain edge", existing_edges
         edge[marker_layer] = 0
+        if selection_tracker is not None:
+            selection_tracker.add_edge(edge)
         edge.select = False
         for face in edge.link_faces:
+            if selection_tracker is not None:
+                selection_tracker.add_face(face)
             face.select = False
         created += 1
         if existing_edges is not None:
@@ -2640,7 +2770,9 @@ def apply_reflected_path_topology(
     axis_index: int,
     tolerance: float,
     mirror_face_ids: MirrorFaceMap,
-) -> tuple[int, int, str]:
+    *,
+    return_summary: bool = False,
+) -> tuple[int, int, str] | tuple[int, int, str, SelectionMutationSummary]:
     """Rebuild a native cut path exactly on its mirrored faces.
 
     Unlike Knife Project, this is independent of the viewport and cannot cut a
@@ -2668,14 +2800,21 @@ def apply_reflected_path_topology(
     earlier target edge has already been split.
     """
 
+    tracker = _SelectionMutationTracker()
+
+    def _result(created: int, already: int, reason: str):
+        if return_summary:
+            return created, already, reason, tracker.finish(complete=not reason)
+        return created, already, reason
+
     source_edges = list(source_edges)
     if not source_edges:
-        return 0, 0, "no source cut edges were supplied"
+        return _result(0, 0, "no source cut edges were supplied")
 
     marker_layer = bm.edges.layers.int.get(EDGE_ORIGINAL_LAYER)
     face_layer = bm.faces.layers.int.get(FACE_ID_LAYER)
     if marker_layer is None or face_layer is None:
-        return 0, 0, "temporary topology markers are missing"
+        return _result(0, 0, "temporary topology markers are missing")
 
     # Capture every source-side relationship before modifying the target. This
     # also makes faces which touch the symmetry plane safe to process.
@@ -2693,13 +2832,9 @@ def apply_reflected_path_topology(
     )
 
     if unmatched_face_ids:
-        return (
-            0,
-            0,
-            f"{len(unmatched_face_ids)} source face(s) have no mirrored counterpart",
-        )
+        return _result(0, 0, f"{len(unmatched_face_ids)} source face(s) have no mirrored counterpart")
     if any(not target_ids for _a, _b, target_ids in edge_records):
-        return 0, 0, "a source cut edge has no mirrored target face"
+        return _result(0, 0, "a source cut edge has no mirrored target face")
 
     needed_target_ids = {target_id for target_ids in target_ids_by_vertex.values() for target_id in target_ids}
     target_faces_by_id = _target_faces_by_id(bm, face_layer, needed_target_ids)
@@ -2711,7 +2846,7 @@ def apply_reflected_path_topology(
         tolerance,
     )
     if classify_reason:
-        return 0, 0, classify_reason
+        return _result(0, 0, classify_reason)
 
     adjacency = _path_adjacency(edge_records)
     chains, chain_reason = _find_interior_chains(
@@ -2725,7 +2860,7 @@ def apply_reflected_path_topology(
         tolerance,
     )
     if chain_reason:
-        return 0, 0, chain_reason
+        return _result(0, 0, chain_reason)
 
     chain_edge_keys = _chain_source_edge_keys(chains)
     target_vertex_by_source_key: dict[int, bmesh.types.BMVert] = {}
@@ -2754,17 +2889,20 @@ def apply_reflected_path_topology(
             target_vertex_by_source_key[source_key] = exact_vertex
             continue
         if kind in {"missing", "ambiguous"}:
-            return 0, 0, reason
+            return _result(0, 0, reason)
 
         assert target_edge is not None
         try:
+            tracker.add_edge(target_edge)
             _new_edge, target_vertex = bmesh.utils.edge_split(
                 target_edge,
                 target_edge.verts[0],
                 factor,
             )
         except (RuntimeError, ValueError) as exc:
-            return 0, 0, f"could not split a mirrored target edge: {exc}"
+            return _result(0, 0, f"could not split a mirrored target edge: {exc}")
+        tracker.add_edge(_new_edge)
+        tracker.add_vertex(target_vertex)
         target_vertex.co = expected
         target_vertex.select = False
         target_vertex_by_source_key[source_key] = target_vertex
@@ -2786,9 +2924,10 @@ def apply_reflected_path_topology(
             marker_layer,
             existing_edges,
             realized_face_ids,
+            selection_tracker=tracker,
         )
         if fail_reason:
-            return created_edges, already_present, fail_reason
+            return _result(created_edges, already_present, fail_reason)
         created_edges += created_delta
         already_present += already_delta
 
@@ -2811,13 +2950,10 @@ def apply_reflected_path_topology(
             target_b = target_vertex_by_source_key[source_b]
             existing = bm.edges.get([target_a, target_b])
             if existing is not None:
+                tracker.add_edge(existing)
                 existing_target_ids = {FaceId(int(face[face_layer])) for face in existing.link_faces}
                 if not existing_target_ids.intersection(possible_target_ids):
-                    return (
-                        created_edges,
-                        already_present,
-                        "an existing mirrored edge is outside its target face",
-                    )
+                    return _result(created_edges, already_present, "an existing mirrored edge is outside its target face")
                 already_present += 1
                 progress = True
                 continue
@@ -2855,11 +2991,7 @@ def apply_reflected_path_topology(
                 possible_target_ids,
             )
             if endpoint_match == "ambiguous":
-                return (
-                    created_edges,
-                    already_present,
-                    "multiple coordinate-matching edges are ambiguous across target faces",
-                )
+                return _result(created_edges, already_present, "multiple coordinate-matching edges are ambiguous across target faces")
             if endpoint_match == "match":
                 already_present += 1
                 progress = True
@@ -2878,19 +3010,18 @@ def apply_reflected_path_topology(
                 continue
 
             try:
+                tracker.add_face(candidate_faces[0])
                 bmesh.utils.face_split(candidate_faces[0], target_a, target_b)
             except (RuntimeError, ValueError) as exc:
-                return (
-                    created_edges,
-                    already_present,
-                    f"could not split a target face: {exc}",
-                )
+                return _result(created_edges, already_present, f"could not split a target face: {exc}")
             new_edge = bm.edges.get([target_a, target_b])
             if new_edge is None:
-                return created_edges, already_present, "target face split made no edge"
+                return _result(created_edges, already_present, "target face split made no edge")
+            tracker.add_edge(new_edge)
             new_edge[marker_layer] = 0
             new_edge.select = False
             for face in new_edge.link_faces:
+                tracker.add_face(face)
                 face.select = False
             assert existing_edges is not None
             _register_edge_endpoint_pair(
@@ -2904,15 +3035,11 @@ def apply_reflected_path_topology(
             progress = True
 
         if deferred and not progress:
-            return (
-                created_edges,
-                already_present,
-                f"could not place {len(deferred)} mirrored cut segment(s)",
-            )
+            return _result(created_edges, already_present, f"could not place {len(deferred)} mirrored cut segment(s)")
         pending = deferred
 
     bm.normal_update()
-    return created_edges, already_present, ""
+    return _result(created_edges, already_present, "")
 
 
 apply_reflected_loop_topology = apply_reflected_path_topology

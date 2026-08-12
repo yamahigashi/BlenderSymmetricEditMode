@@ -96,8 +96,8 @@ def run():
         source_cut(obj)
 
         def forced_apply(*args, **kwargs):
-            created, present, _reason = original_apply(*args, **kwargs)
-            return created, present, "forced rollback test"
+            result = original_apply(*args, **kwargs)
+            return (*result[:2], "forced rollback test", *result[3:])
 
         core.apply_reflected_path_topology = forced_apply
         try:

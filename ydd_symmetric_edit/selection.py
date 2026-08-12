@@ -22,6 +22,7 @@ from .snapshot import (
     EDGE_HIDDEN_LAYER,
     EDGE_ORIGINAL_LAYER,
     EDGE_SELECTION_LAYER,
+    FACE_HIDDEN_LAYER,
     FACE_ID_LAYER,
     FACE_SELECTION_LAYER,
     VERT_HIDDEN_LAYER,
@@ -30,13 +31,28 @@ from .snapshot import (
 )
 
 
+def saved_hidden_state_present(bm: bmesh.types.BMesh) -> bool:
+    """Return whether any saved hidden flag is true (false-only layers do not)."""
+
+    for sequence, name in (
+        (bm.verts, VERT_HIDDEN_LAYER),
+        (bm.edges, EDGE_HIDDEN_LAYER),
+        (bm.faces, FACE_HIDDEN_LAYER),
+    ):
+        layer = sequence.layers.int.get(name)
+        if layer is not None and any(bool(element[layer]) for element in sequence):
+            return True
+    return False
+
+
 def add_selection_layers(bm: bmesh.types.BMesh) -> SelectionSnapshot:
     """Snapshot native Knife's selection immediately before Knife Project."""
 
-    for layers, name in (
-        (bm.verts.layers.int, VERT_SELECTION_LAYER),
-        (bm.edges.layers.int, EDGE_SELECTION_LAYER),
-        (bm.faces.layers.int, FACE_SELECTION_LAYER),
+    saved_hidden_state_present = False
+    for layers, name, _hidden_name in (
+        (bm.verts.layers.int, VERT_SELECTION_LAYER, VERT_HIDDEN_LAYER),
+        (bm.edges.layers.int, EDGE_SELECTION_LAYER, EDGE_HIDDEN_LAYER),
+        (bm.faces.layers.int, FACE_SELECTION_LAYER, FACE_HIDDEN_LAYER),
     ):
         old = layers.get(name)
         if old is not None:
@@ -49,12 +65,15 @@ def add_selection_layers(bm: bmesh.types.BMesh) -> SelectionSnapshot:
     face_id_layer = bm.faces.layers.int.get(FACE_ID_LAYER)
 
     # As above, acquire all elements only after creating every layer.
-    for vertex in bm.verts:
-        vertex[vertex_layer] = int(vertex.select)
-    for edge in bm.edges:
-        edge[edge_layer] = int(edge.select)
-    for face in bm.faces:
-        face[face_layer] = int(face.select)
+    for sequence, selection_layer, hidden_name in (
+        (bm.verts, vertex_layer, VERT_HIDDEN_LAYER),
+        (bm.edges, edge_layer, EDGE_HIDDEN_LAYER),
+        (bm.faces, face_layer, FACE_HIDDEN_LAYER),
+    ):
+        hidden_layer = sequence.layers.int.get(hidden_name)
+        for element in sequence:
+            element[selection_layer] = int(element.select)
+            saved_hidden_state_present |= hidden_layer is not None and bool(element[hidden_layer])
 
     path_vertices_selected = False
     path_edges_selected = False
@@ -91,12 +110,16 @@ def add_selection_layers(bm: bmesh.types.BMesh) -> SelectionSnapshot:
                 )
             )
 
-    return SelectionSnapshot(
+    snapshot = SelectionSnapshot(
         path_vertices_selected=path_vertices_selected,
         path_edges_selected=path_edges_selected,
         path_faces_selected=path_faces_selected,
         history=history,
     )
+    # SelectionSnapshot is intentionally not slotted for compatibility with
+    # older callers; retain the hidden-state bit as an additive attribute.
+    snapshot.saved_hidden_state_present = saved_hidden_state_present
+    return snapshot
 
 
 def restore_visibility_and_selection(
@@ -162,6 +185,83 @@ def restore_visibility_and_selection(
             face.select = True
 
     _restore_selection_history(bm, selection_snapshot.history)
+
+
+def restore_selection_scoped(
+    bm: bmesh.types.BMesh,
+    selection_snapshot: SelectionSnapshot,
+    mutation_summary,
+) -> None:
+    """Restore selection for the topology elements changed by direct Knife.
+
+    Direct topology never changes visibility.  The summary is deliberately
+    supplied by the topology mutators and may contain invalidated BMesh
+    proxies; those are ignored.  Selection history retains the established
+    full-resolution algorithm and is restored last.
+    """
+
+    vertex_layer = bm.verts.layers.int.get(VERT_SELECTION_LAYER)
+    edge_layer = bm.edges.layers.int.get(EDGE_SELECTION_LAYER)
+    face_layer = bm.faces.layers.int.get(FACE_SELECTION_LAYER)
+
+    vertices = [vertex for vertex in mutation_summary.vertices if vertex.is_valid]
+    edges = [edge for edge in mutation_summary.edges if edge.is_valid]
+    faces = [face for face in mutation_summary.faces if face.is_valid]
+
+    # Match restore_visibility_and_selection's broad-to-narrow ordering.  The
+    # summary includes local incident faces/edges, so selection cascades stay
+    # inside the mutation scope.
+    for face in faces:
+        face.select = False
+    for edge in edges:
+        edge.select = False
+    for vertex in vertices:
+        vertex.select = False
+
+    if vertex_layer is not None:
+        for vertex in vertices:
+            if vertex[vertex_layer]:
+                vertex.select = True
+    if edge_layer is not None:
+        for edge in edges:
+            if edge[edge_layer]:
+                edge.select = True
+    if face_layer is not None:
+        for face in faces:
+            if face[face_layer]:
+                face.select = True
+
+    _restore_selection_history(bm, selection_snapshot.history)
+
+
+def restore_selection_for_route(
+    bm: bmesh.types.BMesh,
+    hidden_by_face_id: HiddenFaceMap,
+    selection_snapshot: SelectionSnapshot,
+    mutation_summary,
+    *,
+    direct_topology_success: bool,
+    summary_complete: bool,
+) -> bool:
+    """Apply the production restore gate and return whether it was scoped."""
+
+    hidden_state = getattr(selection_snapshot, "saved_hidden_state_present", None)
+    if hidden_state is None:
+        # Compatibility for snapshots made before C7-4's additive bit.
+        hidden_state = saved_hidden_state_present(bm)
+    summary_has_scope = all(hasattr(mutation_summary, name) for name in ("vertices", "edges", "faces"))
+    summary_is_complete = summary_complete and summary_has_scope and bool(getattr(mutation_summary, "complete", True))
+    use_scoped = (
+        direct_topology_success
+        and summary_is_complete
+        and not any(hidden_by_face_id.values())
+        and not hidden_state
+    )
+    if use_scoped:
+        restore_selection_scoped(bm, selection_snapshot, mutation_summary)
+        return True
+    restore_visibility_and_selection(bm, hidden_by_face_id, selection_snapshot)
+    return False
 
 
 def _restore_selection_history(

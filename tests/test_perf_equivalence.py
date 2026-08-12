@@ -2454,6 +2454,8 @@ def _check_finish_scope_warning_matrix():
         def count_apply(_bm, source_edges, *_args, **_kwargs):
             nonlocal apply_calls
             apply_calls += 1
+            if _kwargs.get("return_summary"):
+                return len(source_edges), 0, "", core.SelectionMutationSummary()
             return len(source_edges), 0, ""
 
         setattr(core, "plan_mirrored_path_crossings", lambda *_args, **_kwargs: ([], ""))

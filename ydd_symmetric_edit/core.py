@@ -68,7 +68,10 @@ from .selection import (
     _selection_element_coordinate,
     add_selection_layers,
     extend_selection_to_mirror,
+    restore_selection_for_route,
+    restore_selection_scoped,
     restore_visibility_and_selection,
+    saved_hidden_state_present,
 )  # noqa: F401
 from .snapshot import (
     EDGE_HIDDEN_LAYER,
@@ -102,6 +105,7 @@ from .snapshot import (
 from .stitch import (
     _MIN_SIDE_LENGTH,
     _PROJECTION_STEP_LIMIT,
+    SelectionMutationSummary,
     _assign_projection_candidates,
     _canonical_edge_endpoints,
     _classify_segment_contact,
@@ -157,6 +161,7 @@ from .stitch import (
     collapsed_offset_target_edge_markers,
     collect_knife_path_edges_by_side,
     collect_source_path_edges,
+    combine_selection_mutation_summaries,
     is_self_mirrored_edge,
     native_path_edge_state,
     path_ring_includes_pre_hidden_edges,

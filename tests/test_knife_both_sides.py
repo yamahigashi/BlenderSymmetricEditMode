@@ -699,8 +699,8 @@ def case_f_partial_failure_rollback(window, area, region) -> None:
 
         def forced_apply(*args, **kwargs):
             # Apply fully then fail: exercises post-partial rollback (contract §2.2).
-            created, present, _reason = original_apply(*args, **kwargs)
-            return created, present, "forced partial mirror failure"
+            result = original_apply(*args, **kwargs)
+            return (*result[:2], "forced partial mirror failure", *result[3:])
 
         core.apply_reflected_path_topology = forced_apply
         try:
