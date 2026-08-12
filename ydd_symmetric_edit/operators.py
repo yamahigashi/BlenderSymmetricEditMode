@@ -11,7 +11,7 @@ import bpy
 from bpy.app.handlers import persistent
 from bpy.props import BoolProperty, StringProperty
 
-from . import backup, core, rip, session_state
+from . import backup, core, rip, session_state, stitch
 from ._types import (
     Coordinate3D,
     FaceId,
@@ -563,13 +563,45 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                         if not crossing_plan:
                             raise SymmetricKnifeError("The mirrored path crossing plan changed before apply")
 
-                    _crossings_stitched, crossing_reason = core.apply_mirrored_path_crossings(
+                    previous_crossing_by_side = {
+                        side_name: list(by_side.get(side_name, ()))
+                        for side_name in ("POSITIVE", "NEGATIVE", "CROSSES", "PLANE")
+                    }
+                    previous_crossing_edges = [
+                        edge
+                        for side_name in ("POSITIVE", "NEGATIVE", "CROSSES", "PLANE")
+                        for edge in previous_crossing_by_side[side_name]
+                    ]
+                    crossing_cache_positions = None
+                    if (
+                        knife_path_edge_cache is not None
+                        and len(knife_path_edge_cache) == len(previous_crossing_edges)
+                        and len({hash(edge) for edge in previous_crossing_edges}) == len(previous_crossing_edges)
+                        and len(set(knife_path_edge_cache)) == len(knife_path_edge_cache)
+                    ):
+                        crossing_cache_positions = {
+                            hash(edge): position for position, edge in enumerate(previous_crossing_edges)
+                        }
+                    _crossings_stitched, crossing_reason, crossing_summary = core.apply_mirrored_path_crossings(
                         bm,
                         crossing_plan,
+                        cache_positions=crossing_cache_positions,
+                        return_summary=True,
                     )
                     if crossing_reason:
                         raise SymmetricKnifeError(crossing_reason)
-                    by_side, total_path_edges = _collect_knife_path_edges(bm, topology_changed=True)
+                    patched = stitch.patch_knife_path_edges_by_side(
+                        bm,
+                        previous_crossing_by_side,
+                        knife_path_edge_cache,
+                        crossing_summary,
+                        session.axis_index,
+                        session.tolerance,
+                    )
+                    if patched is None:
+                        by_side, total_path_edges = _collect_knife_path_edges(bm, topology_changed=True)
+                    else:
+                        by_side, total_path_edges = patched
                     live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, _all_path_edges(by_side))
                     _edge_layer, face_layer = core.get_required_layers(bm)
 

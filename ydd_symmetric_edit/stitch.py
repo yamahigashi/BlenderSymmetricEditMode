@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import logging
 import math
 from collections import defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -29,6 +30,7 @@ from .matching import (
 from .snapshot import EDGE_HIDDEN_LAYER, EDGE_ORIGINAL_LAYER, EDGE_SELECTION_LAYER, FACE_ID_LAYER, VERT_SELECTION_LAYER
 
 _MIN_SIDE_LENGTH = 1.0e-9
+_LOGGER = logging.getLogger(__name__)
 
 
 def _edge_side(
@@ -308,6 +310,180 @@ def collect_knife_path_edges_by_side(
     all_path_edges = _discover_path_edges(bm, selected_only=False)
     by_side = classify_path_edges_by_side(all_path_edges, axis_index, tolerance)
     return by_side, len(all_path_edges)
+
+
+def patch_knife_path_edges_by_side(
+    bm: bmesh.types.BMesh,
+    previous_by_side: Mapping[str, Sequence[bmesh.types.BMEdge]],
+    cache: _KnifePathEdgeCache | None,
+    summary: CrossingMutationSummary,
+    axis_index: int,
+    tolerance: float,
+) -> tuple[dict[str, list[bmesh.types.BMEdge]], int] | None:
+    """Patch a Knife collect result from a crossings mutation summary.
+
+    ``None`` means the strict §I-3b conditions were not met and callers must
+    perform the ordinary full collect.  The returned bucket order is formed
+    by replacing each source edge in-place and appending descendants to its
+    original bucket.
+    """
+
+    if cache is None or not summary.edges:
+        return None
+    if summary.removed_edge_count or summary.removed_face_count:
+        return None
+    bm.edges.ensure_lookup_table()
+    previous = [
+        edge for side in ("POSITIVE", "NEGATIVE", "CROSSES", "PLANE") for edge in previous_by_side.get(side, ())
+    ]
+    if len(previous) != len(cache):
+        return None
+    if len(set(cache)) != len(cache):
+        return None
+    cache_positions = {hash(edge): position for position, edge in enumerate(previous)}
+    replacement: dict[str, list[bmesh.types.BMEdge]] = {
+        side: list(previous_by_side.get(side, ())) for side in ("POSITIVE", "NEGATIVE", "CROSSES", "PLANE")
+    }
+    bucket_positions: dict[tuple[str, int], int] = {}
+    for side, bucket in replacement.items():
+        for local_position, edge in enumerate(bucket):
+            cache_position = cache_positions.get(hash(edge))
+            if cache_position is None or (side, cache_position) in bucket_positions:
+                return None
+            bucket_positions[(side, cache_position)] = local_position
+    edge_layer = bm.edges.layers.int.get(EDGE_ORIGINAL_LAYER)
+    face_layer = bm.faces.layers.int.get(FACE_ID_LAYER)
+    if edge_layer is None:
+        return None
+    previous_by_id = {
+        hash(edge): (edge, side, position)
+        for side, bucket in replacement.items()
+        for position, edge in enumerate(bucket)
+    }
+    expected_side_by_edge: dict[int, tuple[bmesh.types.BMEdge, str]] = {}
+    for side, bucket in replacement.items():
+        for edge in bucket:
+            if not edge.is_valid or not _is_path_edge_by_markers(edge, edge_layer, face_layer):
+                _LOGGER.warning("incremental Knife collect declined: cached path-edge membership changed")
+                return None
+            if _edge_side(edge, axis_index, tolerance) != side:
+                _LOGGER.warning("incremental Knife collect declined: cached path-edge side changed")
+                return None
+            expected_side_by_edge[hash(edge)] = (edge, side)
+    for mutation in summary.edges:
+        if mutation.endpoint_reused or mutation.pointmerged:
+            return None
+        source_info = previous_by_id.get(mutation.source_edge_id)
+        source = source_info[0] if source_info is not None else None
+        source_position = mutation.cache_position
+        if (
+            source is None
+            or source_position is None
+            or source_position < 0
+            or source_position >= len(previous)
+            or previous[source_position] is not source
+        ):
+            return None
+        side = source_info[1] if source_info is not None else None
+        if side is None or not mutation.final_edges:
+            return None
+        final_edges = [edge for edge in mutation.final_edges if edge.is_valid]
+        if len(final_edges) != len(mutation.final_edges):
+            return None
+        if any(not _is_path_edge_by_markers(edge, edge_layer, face_layer) for edge in final_edges):
+            _LOGGER.warning("incremental Knife collect declined: split path-edge membership changed")
+            return None
+        if any(_edge_side(edge, axis_index, tolerance) != side for edge in final_edges):
+            return None
+        if source not in final_edges or len({hash(edge) for edge in final_edges}) != len(final_edges):
+            return None
+        for edge in final_edges:
+            edge_id = hash(edge)
+            prior = expected_side_by_edge.get(edge_id)
+            if prior is not None and prior[1] != side:
+                _LOGGER.warning("incremental Knife collect declined: mutation side assignment conflicts")
+                return None
+            expected_side_by_edge[edge_id] = (edge, side)
+        # Remove the old record by its flattened cache position.  Descendants
+        # are appended below in live BMesh order after all source replacements.
+        bucket = replacement[side]
+        local_position = bucket_positions.get((side, source_position))
+        if local_position is None or bucket[local_position] is not source:
+            return None
+        bucket[local_position] = source
+
+    if summary.unexpected_topology_change:
+        return None
+    tail = [bm.edges[index] for index in range(summary.pre_apply_edge_count, len(bm.edges))]
+    source_ids = set(previous_by_id)
+    mutation_non_sources = [
+        edge
+        for mutation in summary.edges
+        for edge in mutation.final_edges
+        if edge.is_valid and hash(edge) != mutation.source_edge_id
+    ]
+    if any(edge not in tail for edge in mutation_non_sources):
+        _LOGGER.warning("incremental Knife collect declined: a split edge is not after pre-apply edges")
+        return None
+    final_non_sources = [edge for edge, _side in expected_side_by_edge.values() if hash(edge) not in source_ids]
+    if len(tail) != len(final_non_sources) or any(edge not in tail for edge in final_non_sources):
+        _LOGGER.warning("incremental Knife collect declined: a split edge is not after pre-apply edges")
+        return None
+    if len(expected_side_by_edge) != len(previous) + len(tail):
+        _LOGGER.warning("incremental Knife collect declined: mutation edge set is incomplete")
+        return None
+    # FACE_ID complement closure is checked after all source mutations so
+    # cross-source new half-edges have their expected side available.
+    tracked_ids = set(expected_side_by_edge)
+    closure_faces = []
+    closure_face_ids: set[int] = set()
+
+    def add_closure_face(face: bmesh.types.BMFace) -> None:
+        face_id = hash(face)
+        if face_id not in closure_face_ids:
+            closure_face_ids.add(face_id)
+            closure_faces.append(face)
+
+    for mutation in summary.edges:
+        for face in mutation.pre_faces:
+            if not face.is_valid:
+                _LOGGER.warning("incremental Knife collect declined: a pre-split FACE_ID face disappeared")
+                return None
+            add_closure_face(face)
+        for edge in mutation.final_edges:
+            if edge.is_valid:
+                for face in edge.link_faces:
+                    if face.is_valid:
+                        add_closure_face(face)
+    if face_layer is not None:
+        for face in closure_faces:
+            for closed_edge in face.edges:
+                if not closed_edge.is_valid:
+                    continue
+                closed_id = hash(closed_edge)
+                is_path = _is_path_edge_by_markers(closed_edge, edge_layer, face_layer)
+                if closed_id not in tracked_ids:
+                    if is_path:
+                        _LOGGER.warning(
+                            "incremental Knife collect declined: FACE_ID closure contains an untracked path edge"
+                        )
+                        return None
+                    continue
+                expected = expected_side_by_edge[closed_id][1]
+                if not is_path or _edge_side(closed_edge, axis_index, tolerance) != expected:
+                    _LOGGER.warning("incremental Knife collect declined: FACE_ID closure membership or side changed")
+                    return None
+
+    for side in ("POSITIVE", "NEGATIVE", "CROSSES", "PLANE"):
+        replacement[side].extend(
+            edge for edge in tail if expected_side_by_edge.get(hash(edge), (None, None))[1] == side
+        )
+
+    patched = {side: list(replacement[side]) for side in ("POSITIVE", "NEGATIVE", "CROSSES", "PLANE")}
+    all_edges = [edge for side in ("POSITIVE", "NEGATIVE", "CROSSES", "PLANE") for edge in patched[side]]
+    if len({hash(edge) for edge in all_edges}) != len(all_edges):
+        return None
+    return patched, len(all_edges)
 
 
 def is_self_mirrored_edge(
@@ -1289,19 +1465,64 @@ def _scan_crossings_vertices_indexed(
     return matches
 
 
+@dataclass(frozen=True, slots=True)
+class CrossingEdgeMutation:
+    """Mutation facts for one source edge in a crossings transaction."""
+
+    source_edge_id: int
+    final_edges: tuple[bmesh.types.BMEdge, ...]
+    cache_position: int | None
+    endpoint_reused: bool
+    pointmerged: bool
+    pre_faces: tuple[bmesh.types.BMFace, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class CrossingMutationSummary:
+    """Source-edge mutation summary consumed by incremental collect."""
+
+    edges: tuple[CrossingEdgeMutation, ...]
+    removed_edge_count: int = 0
+    removed_face_count: int = 0
+    pre_apply_edge_count: int = 0
+    pre_apply_face_count: int = 0
+    unexpected_topology_change: bool = False
+
+
 def apply_mirrored_path_crossings(
     bm: bmesh.types.BMesh,
     plan: Sequence[_MirroredPathCrossingCluster],
-) -> tuple[int, str]:
-    """Apply a mirrored crossing plan on its live BMesh transaction."""
+    *,
+    cache_positions: Mapping[int, int] | None = None,
+    return_summary: bool = False,
+) -> tuple[int, str] | tuple[int, str, CrossingMutationSummary]:
+    """Apply a mirrored crossing plan on its live BMesh transaction.
+
+    The historical ``(count, reason)`` result remains the default.  Callers
+    that own the Knife collect cache may opt into a third result containing
+    source-edge mutation facts via ``return_summary=True``.
+    """
+
+    def _result(
+        count: int,
+        reason: str,
+        summary: CrossingMutationSummary | None = None,
+    ) -> tuple[int, str] | tuple[int, str, CrossingMutationSummary]:
+        if return_summary:
+            return count, reason, summary or CrossingMutationSummary(())
+        return count, reason
 
     if not plan:
-        return 0, ""
+        return _result(0, "")
     marker_layer = bm.edges.layers.int.get(EDGE_ORIGINAL_LAYER)
     vertex_selection_layer = bm.verts.layers.int.get(VERT_SELECTION_LAYER)
     edge_selection_layer = bm.edges.layers.int.get(EDGE_SELECTION_LAYER)
     if marker_layer is None or vertex_selection_layer is None or edge_selection_layer is None:
-        return 0, "temporary topology or selection markers are missing"
+        return _result(0, "temporary topology or selection markers are missing")
+
+    bm.edges.ensure_lookup_table()
+    pre_apply_edge_count = len(bm.edges)
+    pre_apply_face_count = len(bm.faces)
 
     applications: list[tuple[Vector, tuple[_MirroredPathOccurrence, ...]]] = []
     for cluster in plan:
@@ -1320,7 +1541,7 @@ def apply_mirrored_path_crossings(
         for occurrence in occurrences:
             edge = occurrence.edge
             if not edge.is_valid:
-                return 0, "a mirrored crossing source edge was lost before stitching"
+                return _result(0, "a mirrored crossing source edge was lost before stitching")
             edge_key = occurrence.edge_id
             native_edge_selection.setdefault(edge_key, bool(edge.select))
             edge_marker.setdefault(edge_key, int(edge[marker_layer]))
@@ -1425,7 +1646,7 @@ def apply_mirrored_path_crossings(
     for application_index, (coordinate, _occurrences) in enumerate(applications):
         extras = _collect_extras(application_index, coordinate)
         if len(extras) > 1:
-            return 0, "multiple existing vertices are ambiguous at a mirrored cut intersection"
+            return _result(0, "multiple existing vertices are ambiguous at a mirrored cut intersection")
         reusable_vertex.append(extras[0] if extras else None)
         if extras:
             native_vertex_selection.setdefault(hash(extras[0]), bool(extras[0].select))
@@ -1435,19 +1656,28 @@ def apply_mirrored_path_crossings(
         list[tuple[float, int, _MirroredPathOccurrence]],
     ] = defaultdict(list)
     edge_by_key: dict[int, bmesh.types.BMEdge] = {}
+    pre_faces_by_edge: dict[int, tuple[bmesh.types.BMFace, ...]] = {}
+    endpoint_reused_by_edge: dict[int, bool] = defaultdict(bool)
+    pointmerged_by_edge: dict[int, bool] = defaultdict(bool)
+    created_edges_by_edge: dict[int, list[bmesh.types.BMEdge]] = defaultdict(list)
     for application_index, (_coordinate, occurrences) in enumerate(applications):
         for occurrence in occurrences:
-            if occurrence.endpoint_index is not None:
-                continue
             key = occurrence.edge_id
             edge_by_key[key] = occurrence.edge
+            pre_faces_by_edge.setdefault(
+                key,
+                tuple(face for face in occurrence.edge.link_faces if face.is_valid),
+            )
+            endpoint_reused_by_edge[occurrence.edge_id] |= occurrence.endpoint_index is not None
+            if occurrence.endpoint_index is not None:
+                continue
             split_entries_by_edge[key].append((occurrence.factor, application_index, occurrence))
 
     vertex_by_occurrence: dict[int, bmesh.types.BMVert] = dict(endpoint_vertex_by_occurrence)
     for edge_key, entries in split_entries_by_edge.items():
         original_edge = edge_by_key[edge_key]
         if not original_edge.is_valid:
-            return 0, "a mirrored crossing source edge was lost during stitching"
+            return _result(0, "a mirrored crossing source edge was lost during stitching")
         original_start = original_edge.verts[0]
         original_end = original_edge.verts[1]
         descendant = original_edge
@@ -1458,7 +1688,7 @@ def apply_mirrored_path_crossings(
         entries.sort(key=lambda entry: entry[0])
         for factor, _application_index, occurrence in entries:
             if factor <= interval_start or factor >= 1.0:
-                return 0, "a mirrored crossing split factor is not interior to its descendant edge"
+                return _result(0, "a mirrored crossing split factor is not interior to its descendant edge")
             local_factor = (factor - interval_start) / (1.0 - interval_start)
             try:
                 new_edge, new_vertex = bmesh.utils.edge_split(
@@ -1467,7 +1697,7 @@ def apply_mirrored_path_crossings(
                     local_factor,
                 )
             except (RuntimeError, ValueError) as exc:
-                return 0, f"could not split a mirrored path crossing edge: {exc}"
+                return _result(0, f"could not split a mirrored path crossing edge: {exc}")
 
             for half_edge in (descendant, new_edge):
                 half_edge[marker_layer] = marker
@@ -1478,10 +1708,11 @@ def apply_mirrored_path_crossings(
             native_vertex_selection[hash(new_vertex)] = selected
             vertex_by_occurrence[id(occurrence)] = new_vertex
             _index_register(new_vertex)
+            created_edges_by_edge[edge_key].append(new_edge)
 
             descendants = [edge for edge in (descendant, new_edge) if original_end in edge.verts]
             if len(descendants) != 1:
-                return 0, "could not track a mirrored crossing descendant edge"
+                return _result(0, "could not track a mirrored crossing descendant edge")
             descendant = descendants[0]
             descendant_start = new_vertex
             interval_start = factor
@@ -1492,7 +1723,7 @@ def apply_mirrored_path_crossings(
         for occurrence in occurrences:
             vertex = vertex_by_occurrence.get(id(occurrence))
             if vertex is None or not vertex.is_valid:
-                return 0, "a mirrored crossing vertex was lost before cluster unification"
+                return _result(0, "a mirrored crossing vertex was lost before cluster unification")
             if vertex not in vertices:
                 vertices.append(vertex)
             vertex_key = hash(vertex)
@@ -1503,7 +1734,7 @@ def apply_mirrored_path_crossings(
         existing = reusable_vertex[application_index]
         if existing is not None:
             if not existing.is_valid:
-                return 0, "an existing mirrored crossing vertex was lost before reuse"
+                return _result(0, "an existing mirrored crossing vertex was lost before reuse")
             if existing not in vertices:
                 vertices.append(existing)
             survivor = existing
@@ -1529,11 +1760,13 @@ def apply_mirrored_path_crossings(
                     merge_co=coordinate,
                 )
             except (RuntimeError, ValueError) as exc:
-                return 0, f"could not unify mirrored crossing vertices: {exc}"
+                return _result(0, f"could not unify mirrored crossing vertices: {exc}")
+            for occurrence in occurrences:
+                pointmerged_by_edge[occurrence.edge_id] = True
             if discard_co is not None:
                 _index_unregister(vertex, discard_co)
             if not survivor.is_valid:
-                return 0, "the mirrored crossing survivor was lost during point merge"
+                return _result(0, "the mirrored crossing survivor was lost during point merge")
         old_survivor_co = survivor.co.copy()
         survivor.co = coordinate.copy()
         _index_rebin(survivor, old_survivor_co, coordinate)
@@ -1542,12 +1775,42 @@ def apply_mirrored_path_crossings(
 
         ambiguous = _collect_ambiguous(coordinate, survivor)
         if ambiguous:
-            return 0, "a separate existing vertex remains within tolerance of a mirrored cut intersection"
+            return _result(0, "a separate existing vertex remains within tolerance of a mirrored cut intersection")
 
     bm.verts.ensure_lookup_table()
     bm.edges.ensure_lookup_table()
     bm.normal_update()
-    return len(applications), ""
+    bm.edges.ensure_lookup_table()
+    created_count = sum(len(edges) for edges in created_edges_by_edge.values())
+    expected_edge_count = pre_apply_edge_count + created_count
+    unexpected_topology_change = len(bm.edges) != expected_edge_count or len(bm.faces) != pre_apply_face_count
+    removed_edge_count = max(0, expected_edge_count - len(bm.edges))
+    removed_face_count = max(0, pre_apply_face_count - len(bm.faces))
+    tail = tuple(bm.edges[index] for index in range(pre_apply_edge_count, len(bm.edges)))
+    if len(tail) != created_count:
+        unexpected_topology_change = True
+    final_edges_by_id = {
+        edge_key: (edge_by_key[edge_key], *created_edges_by_edge.get(edge_key, ())) for edge_key in edge_by_key
+    }
+    summary = CrossingMutationSummary(
+        tuple(
+            CrossingEdgeMutation(
+                source_edge_id=edge_key,
+                final_edges=final_edges_by_id.get(edge_key, ()),
+                cache_position=None if cache_positions is None else cache_positions.get(edge_key),
+                endpoint_reused=endpoint_reused_by_edge.get(edge_key, False),
+                pointmerged=pointmerged_by_edge.get(edge_key, False),
+                pre_faces=pre_faces_by_edge.get(edge_key, ()),
+            )
+            for edge_key in edge_by_key
+        ),
+        removed_edge_count=removed_edge_count,
+        removed_face_count=removed_face_count,
+        pre_apply_edge_count=pre_apply_edge_count,
+        pre_apply_face_count=pre_apply_face_count,
+        unexpected_topology_change=unexpected_topology_change,
+    )
+    return _result(len(applications), "", summary)
 
 
 def _plan_tolerance(plan: Sequence[_MirroredPathCrossingCluster]) -> float:
@@ -2089,7 +2352,7 @@ def _chain_source_edge_keys(chains: list[_InteriorChain]) -> set[frozenset[int]]
     keys: set[frozenset[int]] = set()
     for chain in chains:
         sequence = (chain.end_a, *chain.members, chain.end_b)
-        for left, right in zip(sequence, sequence[1:]):
+        for left, right in zip(sequence, sequence[1:], strict=False):
             keys.add(frozenset((left, right)))
     return keys
 
@@ -2169,7 +2432,7 @@ def _realize_interior_chain(
         return 0, 0, "interior chain face_split created too few vertices", existing_edges
 
     remaining = list(new_verts)
-    for member, expected in zip(chain.members, reflected_coords):
+    for member, expected in zip(chain.members, reflected_coords, strict=False):
         remaining.sort(key=lambda vertex: (vertex.co - expected).length)
         chosen = remaining.pop(0)
         chosen.co = expected.copy()
@@ -2182,7 +2445,7 @@ def _realize_interior_chain(
     created = 0
     already = 0
     sequence_keys = (chain.end_a, *chain.members, chain.end_b)
-    for left_key, right_key in zip(sequence_keys, sequence_keys[1:]):
+    for left_key, right_key in zip(sequence_keys, sequence_keys[1:], strict=False):
         left = target_vertex_by_source_key[left_key]
         right = target_vertex_by_source_key[right_key]
         edge = bm.edges.get([left, right])
@@ -2719,7 +2982,7 @@ def build_reflected_cutter(
             continue
 
         cutter_edge = []
-        for source_vertex, coordinate in zip(edge.verts, reflected, strict=True):
+        for source_vertex, coordinate in zip(edge.verts, reflected, strict=False):
             source_index = source_vertex.index
             cutter_index = vertex_indices.get(source_index)
             if cutter_index is None:
