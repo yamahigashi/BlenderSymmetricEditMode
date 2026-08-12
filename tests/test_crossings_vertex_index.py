@@ -24,7 +24,7 @@ from mathutils import Vector
 PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
-from ydd_symmetric_edit import layer_names, matching, stitch  # noqa: E402
+from ydd_symmetric_edit import layer_names, matching, stitch_crossings  # noqa: E402
 
 AXIS = matching.AXIS_INDEX["X"]
 TOLERANCE = 1.0e-5
@@ -341,11 +341,11 @@ def _ensure_layers(bm):
 
 
 def _edge_key_for_occurrence(edge, axis_index=AXIS):
-    return stitch._edge_survivor_key(edge, axis_index)
+    return stitch_crossings._edge_survivor_key(edge, axis_index)
 
 
 def _make_occurrence(edge, factor, endpoint_index=None, axis_index=AXIS):
-    return stitch._MirroredPathOccurrence(
+    return stitch_crossings._MirroredPathOccurrence(
         edge=edge,
         edge_id=hash(edge),
         factor=float(factor),
@@ -355,7 +355,7 @@ def _make_occurrence(edge, factor, endpoint_index=None, axis_index=AXIS):
 
 
 def _make_cluster(positive_coord, negative_coord, positive, negative, tolerance=TOLERANCE):
-    return stitch._MirroredPathCrossingCluster(
+    return stitch_crossings._MirroredPathCrossingCluster(
         positive_coordinate=Vector(positive_coord),
         negative_coordinate=Vector(negative_coord),
         positive=tuple(positive),
@@ -378,7 +378,7 @@ def _remap_plan(plan, source_bm, target_bm):
                 edge_index = occurrence.edge.index
                 target_edge = target_bm.edges[edge_index]
                 result.append(
-                    stitch._MirroredPathOccurrence(
+                    stitch_crossings._MirroredPathOccurrence(
                         edge=target_edge,
                         edge_id=hash(target_edge),
                         factor=occurrence.factor,
@@ -389,7 +389,7 @@ def _remap_plan(plan, source_bm, target_bm):
             return tuple(result)
 
         remapped.append(
-            stitch._MirroredPathCrossingCluster(
+            stitch_crossings._MirroredPathCrossingCluster(
                 positive_coordinate=cluster.positive_coordinate.copy(),
                 negative_coordinate=cluster.negative_coordinate.copy(),
                 positive=remap_occurrences(cluster.positive),
@@ -415,7 +415,7 @@ def _assert_differential(bm, plan):
     oracle_bm = _clone_bmesh(bm)
     try:
         oracle_plan = _remap_plan(plan, bm, oracle_bm)
-        candidate = _run_apply(stitch.apply_mirrored_path_crossings, bm, plan)
+        candidate = _run_apply(stitch_crossings.apply_mirrored_path_crossings, bm, plan)
         oracle = _run_apply(_frozen_apply_mirrored_path_crossings, oracle_bm, oracle_plan)
         assert candidate == oracle, (candidate, oracle)
     finally:
@@ -849,13 +849,13 @@ def _assert_noop_index_updates_break_differential(build_mesh_and_plan, helper_na
 
     if isinstance(helper_names, str):
         helper_names = (helper_names,)
-    originals = {name: getattr(stitch, name) for name in helper_names}
+    originals = {name: getattr(stitch_crossings, name) for name in helper_names}
 
     def _noop(*_args, **_kwargs):
         return True
 
     for name in helper_names:
-        setattr(stitch, name, _noop)
+        setattr(stitch_crossings, name, _noop)
     try:
         bm, plan = build_mesh_and_plan()
         try:
@@ -872,7 +872,7 @@ def _assert_noop_index_updates_break_differential(build_mesh_and_plan, helper_na
             bm.free()
     finally:
         for name, original in originals.items():
-            setattr(stitch, name, original)
+            setattr(stitch_crossings, name, original)
 
 
 def _build_prior_split_observed_by_later_ambiguous():
@@ -1058,7 +1058,7 @@ def check_mid_process_nonfinite_fallback_matches_oracle():
     """
 
     for helper_name in ("_register_crossings_vertex", "_rebin_crossings_vertex"):
-        original = getattr(stitch, helper_name)
+        original = getattr(stitch_crossings, helper_name)
         calls = {"n": 0, "forced": 0}
 
         def flaky(*args, _original=original, _calls=calls, **kwargs):
@@ -1068,7 +1068,7 @@ def check_mid_process_nonfinite_fallback_matches_oracle():
                 return False
             return _original(*args, **kwargs)
 
-        setattr(stitch, helper_name, flaky)
+        setattr(stitch_crossings, helper_name, flaky)
         try:
             bm, plan = _build_two_cluster_finite_plan()
             try:
@@ -1079,7 +1079,7 @@ def check_mid_process_nonfinite_fallback_matches_oracle():
             finally:
                 bm.free()
         finally:
-            setattr(stitch, helper_name, original)
+            setattr(stitch_crossings, helper_name, original)
 
 
 def run():

@@ -15,7 +15,16 @@ from mathutils import Vector
 PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
-from ydd_symmetric_edit import layer_names, matching, selection, snapshot, stitch  # noqa: E402
+from ydd_symmetric_edit import (  # noqa: E402
+    layer_names,
+    matching,
+    selection,
+    snapshot,
+    stitch_common,
+    stitch_pathedges,
+    stitch_projection,
+    stitch_reflect,
+)
 
 
 def build_two_symmetric_quads():
@@ -91,7 +100,7 @@ def check_radius_search_is_the_only_candidate_source():
     fast_bm = build_marked_graph(projected_vertices, expected_edges)
     starved_bm = build_marked_graph(projected_vertices, expected_edges)
     try:
-        fast_result = stitch.snap_projected_graph(
+        fast_result = stitch_projection.snap_projected_graph(
             fast_bm,
             expected_vertices,
             expected_edges,
@@ -101,17 +110,17 @@ def check_radius_search_is_the_only_candidate_source():
         assert fast_result[2] == ""
         assert coordinate_signature(fast_bm) == tuple(sorted(tuple(coordinate) for coordinate in expected_vertices))
 
-        nearby_candidates = stitch._nearby_projection_candidates
+        nearby_candidates = stitch_projection._nearby_projection_candidates
         try:
-            stitch._nearby_projection_candidates = lambda *_args: []
-            starved_result = stitch.snap_projected_graph(
+            stitch_projection._nearby_projection_candidates = lambda *_args: []
+            starved_result = stitch_projection.snap_projected_graph(
                 starved_bm,
                 expected_vertices,
                 expected_edges,
                 1.0e-5,
             )
         finally:
-            stitch._nearby_projection_candidates = nearby_candidates
+            stitch_projection._nearby_projection_candidates = nearby_candidates
 
         assert not starved_result[0]
         assert starved_result[2] == "could not match every projected graph vertex"
@@ -143,7 +152,7 @@ def check_constrained_matching_resolves_near_coincident_vertices():
 
     bm = build_marked_graph(projected_vertices, expected_edges)
     try:
-        snapped, _error, reason = stitch.snap_projected_graph(
+        snapped, _error, reason = stitch_projection.snap_projected_graph(
             bm,
             expected_vertices,
             expected_edges,
@@ -245,27 +254,27 @@ def check_projection_backtracking_and_failure_reasons():
     candidates = [(0.1, 0, 0), (0.2, 0, 2), (0.1, 1, 1), (0.2, 1, 3)]
     destination_pairs = [(0, 1)]
     expected_edge_set = {(2, 3)}
-    assignment, _distances, reason = stitch._assign_projection_candidates(
+    assignment, _distances, reason = stitch_projection._assign_projection_candidates(
         candidates, 2, destination_pairs, expected_edge_set
     )
     assert reason == "", reason
     assert assignment == {0: 2, 1: 3}, assignment
 
     # Unsolvable: both destinations forced onto non-adjacent expected verts.
-    _assignment, _distances, reason = stitch._assign_projection_candidates([(0.0, 0, 0), (0.0, 1, 1)], 2, [(0, 1)], set())
+    _assignment, _distances, reason = stitch_projection._assign_projection_candidates([(0.0, 0, 0), (0.0, 1, 1)], 2, [(0, 1)], set())
     assert reason == "graph adjacency mismatch", reason
 
     # Step limit: with the limit forced to zero, the first real branching
     # trial must fail as ambiguity, not raise.
-    original_limit = stitch._PROJECTION_STEP_LIMIT
+    original_limit = stitch_projection._PROJECTION_STEP_LIMIT
     try:
-        stitch._PROJECTION_STEP_LIMIT = 0
-        _assignment, _distances, reason = stitch._assign_projection_candidates(
+        stitch_projection._PROJECTION_STEP_LIMIT = 0
+        _assignment, _distances, reason = stitch_projection._assign_projection_candidates(
             candidates, 2, destination_pairs, expected_edge_set
         )
         assert reason == "ambiguous projection correspondence", reason
     finally:
-        stitch._PROJECTION_STEP_LIMIT = original_limit
+        stitch_projection._PROJECTION_STEP_LIMIT = original_limit
 
 
 def check_long_graph_fast_path():
@@ -283,7 +292,7 @@ def check_long_graph_fast_path():
     bm = build_marked_graph(projected_vertices, expected_edges)
     try:
         started_at = time.perf_counter()
-        snapped, error, reason = stitch.snap_projected_graph(
+        snapped, error, reason = stitch_projection.snap_projected_graph(
             bm,
             expected_vertices,
             expected_edges,
@@ -380,13 +389,13 @@ def check_quantized_coordinate_bin_boundary():
         )
 
         existing: dict = {}
-        stitch._register_edge_endpoint_pair(
+        stitch_common._register_edge_endpoint_pair(
             existing,
             Vector((inner + delta, -1.0, 0.0)),
             Vector((inner + delta, 1.0, 0.0)),
             tolerance,
         )
-        assert stitch._edge_coordinate_key_matches(
+        assert stitch_common._edge_coordinate_key_matches(
             Vector((inner - delta, -1.0, 0.0)),
             Vector((inner - delta, 1.0, 0.0)),
             tolerance,
@@ -402,9 +411,9 @@ def check_interior_edge_factor_uses_absolute_distance():
     edge_length = 1000.0
     tolerance = 1.0e-5
     # Old dimensionless check rejected factor 4e-6; absolute distance is 0.004.
-    assert stitch._is_interior_edge_factor(4.0e-6, edge_length, tolerance)
-    assert not stitch._is_interior_edge_factor(1.0e-9, edge_length, tolerance)
-    assert not stitch._is_interior_edge_factor(0.5, 0.0, tolerance)
+    assert stitch_common._is_interior_edge_factor(4.0e-6, edge_length, tolerance)
+    assert not stitch_common._is_interior_edge_factor(1.0e-9, edge_length, tolerance)
+    assert not stitch_common._is_interior_edge_factor(0.5, 0.0, tolerance)
 
 
 def check_choose_source_side_ignores_coordinate_tolerance():
@@ -416,10 +425,10 @@ def check_choose_source_side_ignores_coordinate_tolerance():
         a = bm.verts.new((-0.0020, 0.0, 0.0))
         b = bm.verts.new((-0.0028, 0.0, 0.0))
         edge = bm.edges.new((a, b))
-        side, crossing = stitch.choose_source_side([edge], matching.AXIS_INDEX["X"], 1.0e-3, "AUTO")
+        side, crossing = stitch_pathedges.choose_source_side([edge], matching.AXIS_INDEX["X"], 1.0e-3, "AUTO")
         assert side == "NEGATIVE" and crossing == 0
         assert edge.calc_length() < 1.0e-3
-        assert edge.calc_length() > stitch._MIN_SIDE_LENGTH
+        assert edge.calc_length() > stitch_pathedges._MIN_SIDE_LENGTH
     finally:
         bm.free()
 
@@ -458,7 +467,7 @@ def check_collapsed_offset_prefers_geometrically_closer_marker():
         source_edge = bm.edges.new((source_a, source_b))
         source_edge[marker_layer] = 0
 
-        markers, reason = stitch.collapsed_offset_target_edge_markers(
+        markers, reason = stitch_projection.collapsed_offset_target_edge_markers(
             bm,
             [source_edge],
             matching.AXIS_INDEX["X"],
@@ -480,7 +489,7 @@ def check_reflected_path_lazy_existing_edge_store():
         marker = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
         assert marker is not None
         path_edge[marker] = 0
-        first = stitch.apply_reflected_path_topology(
+        first = stitch_reflect.apply_reflected_path_topology(
             bm,
             [path_edge],
             matching.AXIS_INDEX["X"],
@@ -490,16 +499,16 @@ def check_reflected_path_lazy_existing_edge_store():
         assert first == (1, 0, "")
 
         registrations = 0
-        original_register = stitch._register_edge_endpoint_pair
+        original_register = stitch_common._register_edge_endpoint_pair
 
         def count_registration(*args, **kwargs):
             nonlocal registrations
             registrations += 1
             return original_register(*args, **kwargs)
 
-        stitch._register_edge_endpoint_pair = count_registration
+        stitch_common._register_edge_endpoint_pair = count_registration
         try:
-            second = stitch.apply_reflected_path_topology(
+            second = stitch_reflect.apply_reflected_path_topology(
                 bm,
                 [path_edge],
                 matching.AXIS_INDEX["X"],
@@ -507,7 +516,7 @@ def check_reflected_path_lazy_existing_edge_store():
                 topology.mirror_face_ids,
             )
         finally:
-            stitch._register_edge_endpoint_pair = original_register
+            stitch_common._register_edge_endpoint_pair = original_register
         assert second == (0, 1, "")
         assert registrations == 0
     finally:
@@ -555,7 +564,7 @@ def check_reflected_path_lazy_store_falls_back_after_identity_miss():
         first[marker] = 0
         second[marker] = 0
 
-        initial = stitch.apply_reflected_path_topology(
+        initial = stitch_reflect.apply_reflected_path_topology(
             bm,
             [first],
             matching.AXIS_INDEX["X"],
@@ -604,7 +613,7 @@ def check_reflected_path_lazy_store_falls_back_after_identity_miss():
         ]
 
         registrations = []
-        original_register = stitch._register_edge_endpoint_pair
+        original_register = stitch_common._register_edge_endpoint_pair
 
         def count_registration(*args, **kwargs):
             registrations.append(
@@ -616,9 +625,9 @@ def check_reflected_path_lazy_store_falls_back_after_identity_miss():
             )
             return original_register(*args, **kwargs)
 
-        stitch._register_edge_endpoint_pair = count_registration
+        stitch_common._register_edge_endpoint_pair = count_registration
         try:
-            mixed = stitch.apply_reflected_path_topology(
+            mixed = stitch_reflect.apply_reflected_path_topology(
                 bm,
                 [first, second],
                 matching.AXIS_INDEX["X"],
@@ -626,7 +635,7 @@ def check_reflected_path_lazy_store_falls_back_after_identity_miss():
                 topology.mirror_face_ids,
             )
         finally:
-            stitch._register_edge_endpoint_pair = original_register
+            stitch_common._register_edge_endpoint_pair = original_register
         assert mixed == (1, 1, "")
         assert len(registrations) == len(expected_bulk) + 1
         assert set(registrations[: len(expected_bulk)]) == set(expected_bulk)
@@ -763,7 +772,7 @@ def check_edge_side_tol_boundary_classification():
             a = bm.verts.new((a_x, 0.0, 0.0))
             b = bm.verts.new((b_x, 1.0, 0.0))
             edge = bm.edges.new((a, b))
-            return stitch._edge_side(edge, axis, tolerance)
+            return stitch_pathedges._edge_side(edge, axis, tolerance)
 
         # Both endpoints exactly at +tol / beyond → POSITIVE (max > tol).
         assert classify(tolerance, 1.0) == "POSITIVE"
@@ -810,13 +819,13 @@ def run():
     assert path_edge is not None and path_edge[marker] == 0
     assert all(edge[marker] > 0 for edge in bm.edges if edge != path_edge)
 
-    source_edges, side, total, crossing = stitch.collect_source_path_edges(bm, matching.AXIS_INDEX["X"], 1.0e-5, "AUTO")
+    source_edges, side, total, crossing = stitch_pathedges.collect_source_path_edges(bm, matching.AXIS_INDEX["X"], 1.0e-5, "AUTO")
     assert source_edges == [path_edge]
     assert side == "NEGATIVE" and total == 1 and crossing == 0
 
-    targets, unmatched = stitch.target_face_ids_for_edges(source_edges, face_ids, topology.mirror_face_ids)
+    targets, unmatched = stitch_pathedges.target_face_ids_for_edges(source_edges, face_ids, topology.mirror_face_ids)
     assert len(targets) == 1 and not unmatched
-    assert stitch.reflected_path_uses_only_target_boundaries(
+    assert stitch_reflect.reflected_path_uses_only_target_boundaries(
         bm,
         source_edges,
         matching.AXIS_INDEX["X"],
@@ -824,7 +833,7 @@ def run():
         topology.mirror_face_ids,
     )
 
-    coordinates, edges, already_present = stitch.build_reflected_cutter(bm, source_edges, matching.AXIS_INDEX["X"], 1.0e-5)
+    coordinates, edges, already_present = stitch_projection.build_reflected_cutter(bm, source_edges, matching.AXIS_INDEX["X"], 1.0e-5)
     assert len(coordinates) == 2 and edges == [(0, 1)]
     assert already_present == 0
     assert all(abs(co.x - 1.5) < 1.0e-8 for co in coordinates)
@@ -834,7 +843,7 @@ def run():
     # ID must still recover the complete native result.
     path_edge[marker] = 999
     path_edge.select = True
-    selected_source, selected_side, selected_total, selected_crossing = stitch.collect_source_path_edges(
+    selected_source, selected_side, selected_total, selected_crossing = stitch_pathedges.collect_source_path_edges(
         bm,
         matching.AXIS_INDEX["X"],
         1.0e-5,
@@ -845,7 +854,7 @@ def run():
     assert selected_side == "NEGATIVE"
     assert selected_total == 1 and selected_crossing == 0
 
-    created, present, direct_reason = stitch.apply_reflected_path_topology(
+    created, present, direct_reason = stitch_reflect.apply_reflected_path_topology(
         bm,
         selected_source,
         matching.AXIS_INDEX["X"],
@@ -877,14 +886,14 @@ def run():
     for vertex in hidden_path.verts:
         vertex.select = True
     selection_snapshot = selection.add_selection_layers(hidden_bm)
-    hidden_source, _side, _total, _crossing = stitch.collect_source_path_edges(
+    hidden_source, _side, _total, _crossing = stitch_pathedges.collect_source_path_edges(
         hidden_bm,
         matching.AXIS_INDEX["X"],
         1.0e-5,
         "AUTO",
         selected_only=True,
     )
-    created, present, reason = stitch.apply_reflected_path_topology(
+    created, present, reason = stitch_reflect.apply_reflected_path_topology(
         hidden_bm,
         hidden_source,
         matching.AXIS_INDEX["X"],
@@ -940,21 +949,21 @@ def run():
         bend_top,
         coords=[(-1.2, 0.0, 0.0)],
     )
-    bend_source, bend_side, bend_total, bend_crossing = stitch.collect_source_path_edges(
+    bend_source, bend_side, bend_total, bend_crossing = stitch_pathedges.collect_source_path_edges(
         bend_bm,
         matching.AXIS_INDEX["X"],
         1.0e-5,
         "AUTO",
     )
     assert bend_side == "NEGATIVE" and bend_total == 2 and bend_crossing == 0
-    assert stitch.reflected_path_uses_only_target_boundaries(
+    assert stitch_reflect.reflected_path_uses_only_target_boundaries(
         bend_bm,
         bend_source,
         matching.AXIS_INDEX["X"],
         1.0e-5,
         bend_topology.mirror_face_ids,
     )
-    bend_created, bend_already, bend_reason = stitch.apply_reflected_path_topology(
+    bend_created, bend_already, bend_reason = stitch_reflect.apply_reflected_path_topology(
         bend_bm,
         bend_source,
         matching.AXIS_INDEX["X"],
@@ -974,7 +983,7 @@ def run():
     edge = next(iter(guard.edges))
     edge[marker] = 0
     before = (a.co.copy(), b.co.copy())
-    snapped, _error, _reason = stitch.snap_projected_graph(
+    snapped, _error, _reason = stitch_projection.snap_projected_graph(
         guard,
         [Vector((0.1, 0.0, 0.0)), Vector((1.1, 0.0, 0.0))],
         [(0, 1)],

@@ -8,7 +8,14 @@ import bmesh
 import bpy
 from bpy.app.handlers import persistent
 
-from . import layer_names, matching, session_state, snapshot, stitch
+from . import (
+    layer_names,
+    matching,
+    session_state,
+    snapshot,
+    stitch_pathedges,
+    stitch_reflect,
+)
 from ._types import (
     FaceId,
     HiddenFaceMap,
@@ -285,7 +292,7 @@ def _adjust_last_operation_repair_plan(obj, prior_record: HistoryRecord):
         if marker_layer is None:
             return None
         prior_edges = [edge for edge in bm.edges if int(edge[marker_layer]) == 0 and not edge.select]
-        adjusted_edges, _side, total_path_edges, _crossing_count = stitch.collect_source_path_edges(
+        adjusted_edges, _side, total_path_edges, _crossing_count = stitch_pathedges.collect_source_path_edges(
             bm,
             adjusted_record.session.axis_index,
             adjusted_record.session.tolerance,
@@ -309,7 +316,7 @@ def _live_adjusted_path_face_map(bm, session: KnifeSession):
     face_layer = bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
     if face_layer is None:
         return None
-    source_edges, _side, total_path_edges, _crossing_count = stitch.collect_source_path_edges(
+    source_edges, _side, total_path_edges, _crossing_count = stitch_pathedges.collect_source_path_edges(
         bm,
         session.axis_index,
         session.tolerance,
@@ -325,7 +332,7 @@ def _live_adjusted_path_face_map(bm, session: KnifeSession):
         endpoint_face_sets = []
         for vertex in source_edge.verts:
             expected = matching.mirror_coordinate(vertex.co, session.axis_index)
-            kind, exact_vertex, boundary_edge, _factor, _reason = stitch._resolve_reflected_vertex_on_target(
+            kind, exact_vertex, boundary_edge, _factor, _reason = stitch_reflect._resolve_reflected_vertex_on_target(
                 expected,
                 candidate_faces,
                 session.tolerance,
@@ -627,7 +634,7 @@ def _prepare_adjust_last_operation_repeat() -> bool:
     if tokens:
         try:
             bm = bmesh.from_edit_mesh(obj.data)
-            path_state = stitch.native_path_edge_state(bm)
+            path_state = stitch_pathedges.native_path_edge_state(bm)
         except Exception:
             return False
         if path_state != "ABSENT":

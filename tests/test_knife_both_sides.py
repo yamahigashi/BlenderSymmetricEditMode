@@ -42,7 +42,16 @@ PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
 import ydd_symmetric_edit as addon  # noqa: E402
-from ydd_symmetric_edit import face_mapping, layer_names, matching, operators, stitch  # noqa: E402
+from ydd_symmetric_edit import (  # noqa: E402
+    face_mapping,
+    layer_names,
+    matching,
+    operators,
+    stitch_common,
+    stitch_pathedges,
+    stitch_pstitch,
+    stitch_reflect,
+)
 from ydd_symmetric_edit._types import FaceId  # noqa: E402
 
 MARKER_OK = "YSE_KNIFE_BOTH_SIDES_OK"
@@ -507,7 +516,7 @@ def case_a_straddle(window, area, region) -> None:
         simulate_straddle_via_plane(obj)
 
         bm = bmesh.from_edit_mesh(obj.data)
-        by_side, total = stitch.collect_knife_path_edges_by_side(
+        by_side, total = stitch_pathedges.collect_knife_path_edges_by_side(
             bm,
             matching.AXIS_INDEX["X"],
             1.0e-4,
@@ -550,7 +559,7 @@ def case_b_crosses(window, area, region) -> None:
         simulate_cross_plane_segment(obj)
 
         bm = bmesh.from_edit_mesh(obj.data)
-        by_side, total = stitch.collect_knife_path_edges_by_side(
+        by_side, total = stitch_pathedges.collect_knife_path_edges_by_side(
             bm,
             matching.AXIS_INDEX["X"],
             1.0e-4,
@@ -611,7 +620,7 @@ def case_d_mixed_crosses(window, area, region) -> None:
         simulate_mixed_crosses(obj)
 
         bm = bmesh.from_edit_mesh(obj.data)
-        by_side, total = stitch.collect_knife_path_edges_by_side(
+        by_side, total = stitch_pathedges.collect_knife_path_edges_by_side(
             bm,
             matching.AXIS_INDEX["X"],
             1.0e-4,
@@ -645,7 +654,7 @@ def case_e_knife_project_fallback(window, area, region) -> None:
         simulate_bent_both_sides(obj)
 
         bm = bmesh.from_edit_mesh(obj.data)
-        by_side, total = stitch.collect_knife_path_edges_by_side(
+        by_side, total = stitch_pathedges.collect_knife_path_edges_by_side(
             bm,
             matching.AXIS_INDEX["X"],
             1.0e-4,
@@ -655,7 +664,7 @@ def case_e_knife_project_fallback(window, area, region) -> None:
         assert source_edges, {key: len(value) for key, value in by_side.items()}
         assert not by_side["CROSSES"]
         session = next(iter(operators._SESSIONS.values()))
-        assert not stitch.reflected_path_uses_only_target_boundaries(
+        assert not stitch_reflect.reflected_path_uses_only_target_boundaries(
             bm,
             source_edges,
             session.axis_index,
@@ -688,7 +697,7 @@ def case_f_partial_failure_rollback(window, area, region) -> None:
     print("YSE_KNIFE_BOTH_SIDES_CASE=f_partial_rollback", flush=True)
     clear_scene()
     obj = make_two_quads()
-    original_apply = stitch.apply_reflected_path_topology
+    original_apply = stitch_reflect.apply_reflected_path_topology
     with bpy.context.temp_override(window=window, area=area, region=region):
         bpy.ops.object.mode_set(mode="EDIT")
         bpy.context.tool_settings.mesh_select_mode = (True, False, False)
@@ -702,11 +711,11 @@ def case_f_partial_failure_rollback(window, area, region) -> None:
             result = original_apply(*args, **kwargs)
             return (*result[:2], "forced partial mirror failure", *result[3:])
 
-        stitch.apply_reflected_path_topology = forced_apply
+        stitch_reflect.apply_reflected_path_topology = forced_apply
         try:
             finished = bpy.ops.mesh.ydd_symmetric_edit_finish("EXEC_DEFAULT")
         finally:
-            stitch.apply_reflected_path_topology = original_apply
+            stitch_reflect.apply_reflected_path_topology = original_apply
         assert finished == {"FINISHED"}, finished
 
     bm = bmesh.from_edit_mesh(obj.data)
@@ -995,7 +1004,7 @@ def case_i_bowtie(window, area, region) -> None:
         simulate_bowtie_crosses(obj)
 
         bm = bmesh.from_edit_mesh(obj.data)
-        by_side, total = stitch.collect_knife_path_edges_by_side(
+        by_side, total = stitch_pathedges.collect_knife_path_edges_by_side(
             bm,
             matching.AXIS_INDEX["X"],
             1.0e-4,
@@ -1045,13 +1054,13 @@ def case_j_self_mirrored_crosses(window, area, region) -> None:
         native_counts = simulate_self_mirrored_crosses(obj)
 
         bm = bmesh.from_edit_mesh(obj.data)
-        by_side, _total = stitch.collect_knife_path_edges_by_side(
+        by_side, _total = stitch_pathedges.collect_knife_path_edges_by_side(
             bm,
             matching.AXIS_INDEX["X"],
             1.0e-4,
         )
         assert by_side["CROSSES"], {key: len(value) for key, value in by_side.items()}
-        assert any(stitch.is_self_mirrored_edge(edge, matching.AXIS_INDEX["X"], 1.0e-4) for edge in by_side["CROSSES"])
+        assert any(stitch_common.is_self_mirrored_edge(edge, matching.AXIS_INDEX["X"], 1.0e-4) for edge in by_side["CROSSES"])
 
         finished = bpy.ops.mesh.ydd_symmetric_edit_finish("EXEC_DEFAULT")
         assert finished == {"FINISHED"}, finished
@@ -1134,7 +1143,7 @@ def case_k_mixed_symmetrized(window, area, region) -> None:
         simulate_crosses_plus_asymmetric_half(obj)
 
         bm = bmesh.from_edit_mesh(obj.data)
-        by_side, total = stitch.collect_knife_path_edges_by_side(
+        by_side, total = stitch_pathedges.collect_knife_path_edges_by_side(
             bm,
             matching.AXIS_INDEX["X"],
             1.0e-4,
@@ -1172,7 +1181,7 @@ def case_l_asymmetric_decline(window, area, region) -> None:
         native_counts = simulate_asymmetric_crosses(obj)
 
         bm = bmesh.from_edit_mesh(obj.data)
-        by_side, total = stitch.collect_knife_path_edges_by_side(
+        by_side, total = stitch_pathedges.collect_knife_path_edges_by_side(
             bm,
             matching.AXIS_INDEX["X"],
             1.0e-4,
@@ -1335,7 +1344,7 @@ def unit_host_edge_selection() -> None:
     h1 = bm.verts.new((1.0, 0.0, 0.0))
     bm.edges.new((h0, h1))
     rep = p.co.copy()
-    vertex, host_split, reason = stitch._plan_plane_stitch_vertex(bm, rep, [member], axis, tol)
+    vertex, host_split, reason = stitch_pstitch._plan_plane_stitch_vertex(bm, rep, [member], axis, tol)
     assert reason == "", reason
     assert vertex is p and host_split is None
     bm.free()
@@ -1353,7 +1362,7 @@ def unit_host_edge_selection() -> None:
     from mathutils import Vector
 
     rep = Vector((0.0, 0.0, 0.0))
-    vertex, host_split, reason = stitch._plan_plane_stitch_vertex(bm, rep, [member], axis, tol)
+    vertex, host_split, reason = stitch_pstitch._plan_plane_stitch_vertex(bm, rep, [member], axis, tol)
     assert reason == "", reason
     assert vertex is None and host_split is None  # fall through to member seed
     bm.free()
@@ -1370,7 +1379,7 @@ def unit_host_edge_selection() -> None:
     h3 = bm.verts.new((0.0, 1.0, 0.0))
     bm.edges.new((h2, h3))
     rep = Vector((0.0, 0.0, 0.0))
-    vertex, host_split, reason = stitch._plan_plane_stitch_vertex(bm, rep, [member], axis, tol)
+    vertex, host_split, reason = stitch_pstitch._plan_plane_stitch_vertex(bm, rep, [member], axis, tol)
     assert "ambiguous host edges" in reason, reason
     assert vertex is None and host_split is None
     bm.free()
@@ -1394,7 +1403,7 @@ def unit_three_crosses_pointmerge_survivor() -> None:
         a = bm.verts.new(a_co)
         b = bm.verts.new(b_co)
         crosses.append(bm.edges.new((a, b)))
-    stitched, reason = stitch.apply_crosses_p_stitch(bm, crosses, matching.AXIS_INDEX["X"], 1.0e-4)
+    stitched, reason = stitch_pstitch.apply_crosses_p_stitch(bm, crosses, matching.AXIS_INDEX["X"], 1.0e-4)
     assert reason == "", reason
     assert stitched == 3, stitched
     p_verts = [
@@ -1423,7 +1432,7 @@ def unit_nontransitive_tol_clustering() -> None:
         Vector((0.0, 0.27, 0.0)),
     ]
     # p0 absorbs p1 (0.09≤0.1); p2 is 0.18 from p0 → new cluster, absorbs p3.
-    clusters = stitch.cluster_points_by_tolerance(points, tol)
+    clusters = stitch_common.cluster_points_by_tolerance(points, tol)
     assert len(clusters) == 2, clusters
     assert sorted(len(cluster) for cluster in clusters) == [2, 2], clusters
 
@@ -1459,7 +1468,7 @@ def unit_nontransitive_tol_clustering() -> None:
         # Simpler: create free-standing edges for the stitch unit (no face needed).
         crosses.append(bm.edges.new((left, right)))
     del face  # face unused after construction
-    stitched, reason = stitch.apply_crosses_p_stitch(bm, crosses, matching.AXIS_INDEX["X"], tol)
+    stitched, reason = stitch_pstitch.apply_crosses_p_stitch(bm, crosses, matching.AXIS_INDEX["X"], tol)
     assert reason == "", reason
     assert stitched >= 2, stitched
     on_plane = [vertex for vertex in bm.verts if abs(vertex.co.x) <= 1.0e-6 and vertex.is_valid]
@@ -1479,14 +1488,14 @@ def unit_knife_path_edge_cache() -> None:
     bm = bmesh.new()
     positive = bm.edges.new((bm.verts.new((1.0, 0.0, 0.0)), bm.verts.new((2.0, 0.0, 0.0))))
     negative = bm.edges.new((bm.verts.new((-2.0, 0.0, 0.0)), bm.verts.new((-1.0, 0.0, 0.0))))
-    cache = stitch.capture_knife_path_edge_cache(bm, (positive, negative))
+    cache = stitch_pathedges.capture_knife_path_edge_cache(bm, (positive, negative))
     assert cache is not None
-    by_side, total = stitch.reclassify_knife_path_edge_cache(bm, matching.AXIS_INDEX["X"], 1.0e-5, cache) or ({}, 0)
+    by_side, total = stitch_pathedges.reclassify_knife_path_edge_cache(bm, matching.AXIS_INDEX["X"], 1.0e-5, cache) or ({}, 0)
     assert total == 2, total
     assert len(by_side["POSITIVE"]) == 1 and len(by_side["NEGATIVE"]) == 1, by_side
 
     positive.verts[0].co.x = 1.25
-    assert stitch.reclassify_knife_path_edge_cache(bm, matching.AXIS_INDEX["X"], 1.0e-5, cache) is None
+    assert stitch_pathedges.reclassify_knife_path_edge_cache(bm, matching.AXIS_INDEX["X"], 1.0e-5, cache) is None
     bm.free()
     print("YSE_KNIFE_BOTH_SIDES_UNIT_CACHE=OK", flush=True)
 

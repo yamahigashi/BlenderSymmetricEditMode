@@ -21,7 +21,12 @@ from mathutils import Vector
 PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
-from ydd_symmetric_edit import layer_names, matching, stitch  # noqa: E402
+from ydd_symmetric_edit import (  # noqa: E402
+    layer_names,
+    matching,
+    stitch_crossings,
+    stitch_pathedges,
+)
 
 AXIS = matching.AXIS_INDEX["X"]
 TOLERANCE = 1.0e-5
@@ -111,9 +116,9 @@ def _summary(
     removed_edges=0,
     removed_faces=0,
 ):
-    return stitch.CrossingMutationSummary(
+    return stitch_crossings.CrossingMutationSummary(
         (
-            stitch.CrossingEdgeMutation(
+            stitch_crossings.CrossingEdgeMutation(
                 source_edge_id=hash(source),
                 final_edges=tuple(final_edges),
                 cache_position=cache_position,
@@ -130,17 +135,17 @@ def _summary(
 
 
 def _fallback_collect(bm, previous, cache, summary):
-    patched = stitch.patch_knife_path_edges_by_side(bm, previous, cache, summary, AXIS, TOLERANCE)
+    patched = stitch_pathedges.patch_knife_path_edges_by_side(bm, previous, cache, summary, AXIS, TOLERANCE)
     if patched is not None:
         raise RuntimeError("incremental patch unexpectedly accepted a fallback case")
-    return stitch.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
+    return stitch_pathedges.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
 
 
 def check_track_a_record_bits_match_full_collect():
     bm = _build_grid(8)
     try:
         expected, expected_count = _frozen_collect(bm, AXIS, TOLERANCE)
-        actual, actual_count = stitch.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
+        actual, actual_count = stitch_pathedges.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
         if (actual_count, _record_bits(actual)) != (expected_count, _record_bits(expected)):
             raise RuntimeError("full collect differs from independent record oracle")
         candidates = []
@@ -154,23 +159,23 @@ def check_track_a_record_bits_match_full_collect():
         positive = next(edge for edge in candidates if edge.verts[0].co.x > 0 and edge.verts[1].co.x > 0)
         negative = next(edge for edge in candidates if edge.verts[0].co.x < 0 and edge.verts[1].co.x < 0)
         previous = [edge for side in ("POSITIVE", "NEGATIVE", "CROSSES", "PLANE") for edge in actual[side]]
-        cache = stitch.capture_knife_path_edge_cache(bm, previous)
+        cache = stitch_pathedges.capture_knife_path_edge_cache(bm, previous)
         positions = {hash(edge): index for index, edge in enumerate(previous)}
         factor = 0.37
         positive_co = positive.verts[0].co.lerp(positive.verts[1].co, factor)
         negative_co = negative.verts[0].co.lerp(negative.verts[1].co, factor)
-        cluster = stitch._MirroredPathCrossingCluster(
+        cluster = stitch_crossings._MirroredPathCrossingCluster(
             positive_coordinate=positive_co,
             negative_coordinate=negative_co,
             positive=(_make_crossing_occurrence(positive, factor),),
             negative=(_make_crossing_occurrence(negative, factor),),
             tolerance=TOLERANCE,
         )
-        result = stitch.apply_mirrored_path_crossings(bm, [cluster], cache_positions=positions, return_summary=True)
+        result = stitch_crossings.apply_mirrored_path_crossings(bm, [cluster], cache_positions=positions, return_summary=True)
         if result[1]:
             raise RuntimeError(f"Track A producer apply failed: {result}")
-        patched = stitch.patch_knife_path_edges_by_side(bm, actual, cache, result[2], AXIS, TOLERANCE)
-        full, _ = stitch.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
+        patched = stitch_pathedges.patch_knife_path_edges_by_side(bm, actual, cache, result[2], AXIS, TOLERANCE)
+        full, _ = stitch_pathedges.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
         if (
             patched is None
             or patched[1] != sum(len(bucket) for bucket in full.values())
@@ -182,12 +187,12 @@ def check_track_a_record_bits_match_full_collect():
 
 
 def _make_crossing_occurrence(edge, factor):
-    return stitch._MirroredPathOccurrence(
+    return stitch_crossings._MirroredPathOccurrence(
         edge=edge,
         edge_id=hash(edge),
         factor=factor,
         endpoint_index=None,
-        edge_key=stitch._edge_survivor_key(edge, AXIS),
+        edge_key=stitch_crossings._edge_survivor_key(edge, AXIS),
     )
 
 
@@ -221,16 +226,16 @@ def _build_crossing_fixture(multiple=False):
 def check_producer_summary_and_patch_m2():
     bm, positive, negative, _duplicate_positive, _duplicate_negative = _build_crossing_fixture()
     try:
-        before, _ = stitch.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
+        before, _ = stitch_pathedges.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
         previous = [edge for side in ("POSITIVE", "NEGATIVE", "CROSSES", "PLANE") for edge in before[side]]
-        cache = stitch.capture_knife_path_edge_cache(bm, previous)
+        cache = stitch_pathedges.capture_knife_path_edge_cache(bm, previous)
         cache_positions = {hash(edge): index for index, edge in enumerate(previous)}
         positive_factors = (0.25, 0.75)
         negative_factors = (0.25, 0.75)
         clusters = []
         for positive_factor, negative_factor in zip(positive_factors, negative_factors, strict=True):
             clusters.append(
-                stitch._MirroredPathCrossingCluster(
+                stitch_crossings._MirroredPathCrossingCluster(
                     positive_coordinate=Vector((1.0, -1.0 + 2.0 * positive_factor, 0.0)),
                     negative_coordinate=Vector((-1.0, -1.0 + 2.0 * negative_factor, 0.0)),
                     positive=(_make_crossing_occurrence(positive, positive_factor),),
@@ -238,7 +243,7 @@ def check_producer_summary_and_patch_m2():
                     tolerance=TOLERANCE,
                 )
             )
-        result = stitch.apply_mirrored_path_crossings(
+        result = stitch_crossings.apply_mirrored_path_crossings(
             bm,
             clusters,
             cache_positions=cache_positions,
@@ -266,8 +271,8 @@ def check_producer_summary_and_patch_m2():
             tail_cursor += 2
         if tail_cursor != len(tail):
             raise RuntimeError("producer tail ownership was incomplete")
-        patched = stitch.patch_knife_path_edges_by_side(bm, before, cache, summary, AXIS, TOLERANCE)
-        full, _ = stitch.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
+        patched = stitch_pathedges.patch_knife_path_edges_by_side(bm, before, cache, summary, AXIS, TOLERANCE)
+        full, _ = stitch_pathedges.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
         if patched is None or _record_bits(patched[0]) != _record_bits(full):
             raise RuntimeError("producer incremental patch differs from full collect")
     finally:
@@ -302,19 +307,19 @@ def _build_same_face_positive_fixture():
 def check_same_face_cross_source_pure_split():
     bm, face = _build_same_face_positive_fixture()
     try:
-        before, _ = stitch.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
+        before, _ = stitch_pathedges.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
         sources = [edge for edge in face.edges if _edge_side_for_test(edge) == "POSITIVE"]
         if len(sources) != 4:
             raise RuntimeError("same-face fixture did not create four positive boundary sources")
         first, second = sources[0], sources[2]
         previous = [edge for side in _SIDES for edge in before[side]]
-        cache = stitch.capture_knife_path_edge_cache(bm, previous)
+        cache = stitch_pathedges.capture_knife_path_edge_cache(bm, previous)
         positions = {hash(edge): index for index, edge in enumerate(previous)}
         clusters = []
         for edge, factor in ((first, 0.25), (second, 0.75)):
             coordinate = edge.verts[0].co.lerp(edge.verts[1].co, factor)
             clusters.append(
-                stitch._MirroredPathCrossingCluster(
+                stitch_crossings._MirroredPathCrossingCluster(
                     positive_coordinate=coordinate,
                     negative_coordinate=coordinate.copy(),
                     positive=(_make_crossing_occurrence(edge, factor),),
@@ -322,15 +327,15 @@ def check_same_face_cross_source_pure_split():
                     tolerance=TOLERANCE,
                 )
             )
-        result = stitch.apply_mirrored_path_crossings(bm, clusters, cache_positions=positions, return_summary=True)
+        result = stitch_crossings.apply_mirrored_path_crossings(bm, clusters, cache_positions=positions, return_summary=True)
         if result[1]:
             raise RuntimeError(f"same-face producer apply failed: {result}")
         summary = result[2]
         by_source = {mutation.source_edge_id: mutation for mutation in summary.edges}
         if any(len(by_source[hash(edge)].final_edges) != 2 for edge in (first, second)):
             raise RuntimeError("same-face source summary did not report m+1 edges")
-        patched = stitch.patch_knife_path_edges_by_side(bm, before, cache, summary, AXIS, TOLERANCE)
-        full, _ = stitch.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
+        patched = stitch_pathedges.patch_knife_path_edges_by_side(bm, before, cache, summary, AXIS, TOLERANCE)
+        full, _ = stitch_pathedges.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
         if patched is None or _record_bits(patched[0]) != _record_bits(full):
             raise RuntimeError("same-face cross-source patch differs from full collect")
     finally:
@@ -340,12 +345,12 @@ def check_same_face_cross_source_pure_split():
 def check_producer_endpoint_and_pointmerge_flags():
     bm, positive, negative, _duplicate_positive, _duplicate_negative = _build_crossing_fixture()
     try:
-        previous, _ = stitch.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
+        previous, _ = stitch_pathedges.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
         previous_edges = [edge for side in ("POSITIVE", "NEGATIVE", "CROSSES", "PLANE") for edge in previous[side]]
-        cache = stitch.capture_knife_path_edge_cache(bm, previous_edges)
+        cache = stitch_pathedges.capture_knife_path_edge_cache(bm, previous_edges)
         cache_positions = {hash(edge): index for index, edge in enumerate(previous_edges)}
         endpoint_plan = [
-            stitch._MirroredPathCrossingCluster(
+            stitch_crossings._MirroredPathCrossingCluster(
                 positive_coordinate=positive.verts[0].co.copy(),
                 negative_coordinate=negative.verts[0].co.copy(),
                 positive=(_make_crossing_occurrence(positive, 0.0),),
@@ -353,30 +358,30 @@ def check_producer_endpoint_and_pointmerge_flags():
                 tolerance=TOLERANCE,
             )
         ]
-        endpoint_plan[0] = stitch._MirroredPathCrossingCluster(
+        endpoint_plan[0] = stitch_crossings._MirroredPathCrossingCluster(
             positive_coordinate=endpoint_plan[0].positive_coordinate,
             negative_coordinate=endpoint_plan[0].negative_coordinate,
             positive=(
-                stitch._MirroredPathOccurrence(
+                stitch_crossings._MirroredPathOccurrence(
                     edge=positive,
                     edge_id=hash(positive),
                     factor=0.0,
                     endpoint_index=0,
-                    edge_key=stitch._edge_survivor_key(positive, AXIS),
+                    edge_key=stitch_crossings._edge_survivor_key(positive, AXIS),
                 ),
             ),
             negative=(
-                stitch._MirroredPathOccurrence(
+                stitch_crossings._MirroredPathOccurrence(
                     edge=negative,
                     edge_id=hash(negative),
                     factor=0.0,
                     endpoint_index=0,
-                    edge_key=stitch._edge_survivor_key(negative, AXIS),
+                    edge_key=stitch_crossings._edge_survivor_key(negative, AXIS),
                 ),
             ),
             tolerance=TOLERANCE,
         )
-        endpoint_result = stitch.apply_mirrored_path_crossings(
+        endpoint_result = stitch_crossings.apply_mirrored_path_crossings(
             bm, endpoint_plan, cache_positions=cache_positions, return_summary=True
         )
         if endpoint_result[1]:
@@ -384,26 +389,26 @@ def check_producer_endpoint_and_pointmerge_flags():
         endpoint_summary = {item.source_edge_id: item for item in endpoint_result[2].edges}
         if not endpoint_summary[hash(positive)].endpoint_reused:
             raise RuntimeError("producer endpoint reuse flag was not set")
-        if stitch.patch_knife_path_edges_by_side(bm, previous, cache, endpoint_result[2], AXIS, TOLERANCE) is not None:
+        if stitch_pathedges.patch_knife_path_edges_by_side(bm, previous, cache, endpoint_result[2], AXIS, TOLERANCE) is not None:
             raise RuntimeError("producer endpoint reuse was incorrectly accepted by patch")
     finally:
         bm.free()
 
     bm, positive, negative, duplicate_positive, duplicate_negative = _build_crossing_fixture(multiple=True)
     try:
-        previous, _ = stitch.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
+        previous, _ = stitch_pathedges.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
         previous_edges = [edge for side in ("POSITIVE", "NEGATIVE", "CROSSES", "PLANE") for edge in previous[side]]
-        cache = stitch.capture_knife_path_edge_cache(bm, previous_edges)
+        cache = stitch_pathedges.capture_knife_path_edge_cache(bm, previous_edges)
         cache_positions = {hash(edge): index for index, edge in enumerate(previous_edges)}
         source_ids = tuple(hash(edge) for edge in (positive, negative, duplicate_positive, duplicate_negative))
-        cluster = stitch._MirroredPathCrossingCluster(
+        cluster = stitch_crossings._MirroredPathCrossingCluster(
             positive_coordinate=Vector((1.0, 0.0, 0.0)),
             negative_coordinate=Vector((-1.0, 0.0, 0.0)),
             positive=(_make_crossing_occurrence(positive, 0.5), _make_crossing_occurrence(duplicate_positive, 0.5)),
             negative=(_make_crossing_occurrence(negative, 0.5), _make_crossing_occurrence(duplicate_negative, 0.5)),
             tolerance=TOLERANCE,
         )
-        result = stitch.apply_mirrored_path_crossings(
+        result = stitch_crossings.apply_mirrored_path_crossings(
             bm, [cluster], cache_positions=cache_positions, return_summary=True
         )
         if result[1]:
@@ -411,7 +416,7 @@ def check_producer_endpoint_and_pointmerge_flags():
         summary = {item.source_edge_id: item for item in result[2].edges}
         if not all(summary[source_id].pointmerged for source_id in source_ids):
             raise RuntimeError("producer pointmerge flag was not set")
-        if stitch.patch_knife_path_edges_by_side(bm, previous, cache, result[2], AXIS, TOLERANCE) is not None:
+        if stitch_pathedges.patch_knife_path_edges_by_side(bm, previous, cache, result[2], AXIS, TOLERANCE) is not None:
             raise RuntimeError("producer pointmerge was incorrectly accepted by patch")
     finally:
         bm.free()
@@ -427,8 +432,8 @@ def check_multi_split_m2_record_order():
         source = bm.edges.new((left, right))
         source[marker] = 0
         _update_indices(bm)
-        before, _ = stitch.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
-        cache = stitch.capture_knife_path_edge_cache(bm, [source])
+        before, _ = stitch_pathedges.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
+        cache = stitch_pathedges.capture_knife_path_edge_cache(bm, [source])
         cache_position = 0
         pre_count = len(bm.edges)
         first, _ = bmesh.utils.edge_split(source, left, 0.25)
@@ -438,7 +443,7 @@ def check_multi_split_m2_record_order():
         _update_indices(bm)
         expected, expected_count = _frozen_collect(bm, AXIS, TOLERANCE)
         summary = _summary(source, (source, first, second), cache_position, pre_count=pre_count)
-        patched = stitch.patch_knife_path_edges_by_side(bm, before, cache, summary, AXIS, TOLERANCE)
+        patched = stitch_pathedges.patch_knife_path_edges_by_side(bm, before, cache, summary, AXIS, TOLERANCE)
         if patched is None or patched[1] != expected_count or _record_bits(patched[0]) != _record_bits(expected):
             raise RuntimeError("m>=2 split record order differs from full collect")
     finally:
@@ -456,7 +461,7 @@ def check_side_change_falls_back():
         source[marker] = 0
         _update_indices(bm)
         previous = {"POSITIVE": [], "NEGATIVE": [], "CROSSES": [source], "PLANE": []}
-        cache = stitch.capture_knife_path_edge_cache(bm, [source])
+        cache = stitch_pathedges.capture_knife_path_edge_cache(bm, [source])
         position = 0
         first, _ = bmesh.utils.edge_split(source, left, 0.5)
         second, _ = bmesh.utils.edge_split(first, first.verts[0], 0.5)
@@ -487,18 +492,18 @@ def check_producer_self_mirrored_side_fallback():
         source = bm.edges.new((left, right))
         source[marker] = 0
         bm.edges.ensure_lookup_table()
-        before, _ = stitch.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
+        before, _ = stitch_pathedges.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
         previous = [edge for side in _SIDES for edge in before[side]]
-        cache = stitch.capture_knife_path_edge_cache(bm, previous)
+        cache = stitch_pathedges.capture_knife_path_edge_cache(bm, previous)
         positions = {hash(edge): index for index, edge in enumerate(previous)}
-        cluster = stitch._MirroredPathCrossingCluster(
+        cluster = stitch_crossings._MirroredPathCrossingCluster(
             positive_coordinate=Vector((1.0, 0.0, 0.0)),
             negative_coordinate=Vector((-1.0, 0.0, 0.0)),
             positive=(_make_crossing_occurrence(source, 0.75),),
             negative=(_make_crossing_occurrence(source, 0.25),),
             tolerance=TOLERANCE,
         )
-        result = stitch.apply_mirrored_path_crossings(bm, [cluster], cache_positions=positions, return_summary=True)
+        result = stitch_crossings.apply_mirrored_path_crossings(bm, [cluster], cache_positions=positions, return_summary=True)
         if result[1]:
             raise RuntimeError(f"self-mirrored producer apply failed: {result}")
         mutation = result[2].edges[0]
@@ -506,9 +511,9 @@ def check_producer_self_mirrored_side_fallback():
             _edge_side_for_test(edge) != "CROSSES" for edge in mutation.final_edges
         ):
             raise RuntimeError("self-mirrored producer did not create side-changing final edges")
-        if stitch.patch_knife_path_edges_by_side(bm, before, cache, result[2], AXIS, TOLERANCE) is not None:
+        if stitch_pathedges.patch_knife_path_edges_by_side(bm, before, cache, result[2], AXIS, TOLERANCE) is not None:
             raise RuntimeError("self-mirrored side change was incorrectly accepted")
-        full, _ = stitch.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
+        full, _ = stitch_pathedges.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
         if _record_bits(full) != _record_bits(_frozen_collect(bm, AXIS, TOLERANCE)[0]):
             raise RuntimeError("self-mirrored fallback differs from frozen full collect")
     finally:
@@ -518,12 +523,12 @@ def check_producer_self_mirrored_side_fallback():
 def check_pointmerge_endpoint_and_order_fallbacks():
     bm = _build_grid(2)
     try:
-        previous, _ = stitch.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
+        previous, _ = stitch_pathedges.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
         all_edges = [edge for bucket in previous.values() for edge in bucket]
-        cache = stitch.capture_knife_path_edge_cache(bm, all_edges)
+        cache = stitch_pathedges.capture_knife_path_edge_cache(bm, all_edges)
         source = all_edges[0]
         position = next(index for index, edge in enumerate(all_edges) if edge is source)
-        full_bits = _record_bits(stitch.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)[0])
+        full_bits = _record_bits(stitch_pathedges.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)[0])
         for endpoint, pointmerge, final_edges in (
             (True, False, (source,)),
             (False, True, (source,)),
@@ -548,18 +553,18 @@ def check_order_fallback_warning():
     records = []
     handler = logging.Handler()
     handler.emit = lambda record: records.append(record)
-    logger = logging.getLogger("ydd_symmetric_edit.stitch")
+    logger = logging.getLogger("ydd_symmetric_edit.stitch_pathedges")
     logger.addHandler(handler)
     try:
-        previous, _ = stitch.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
+        previous, _ = stitch_pathedges.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
         all_edges = [edge for bucket in previous.values() for edge in bucket]
-        cache = stitch.capture_knife_path_edge_cache(bm, all_edges)
+        cache = stitch_pathedges.capture_knife_path_edge_cache(bm, all_edges)
         source = all_edges[0]
         source_side = next(side for side in previous if source in previous[side])
         peer = next(edge for edge in previous[source_side] if edge is not source)
         position = next(index for index, edge in enumerate(all_edges) if edge is source)
         summary = _summary(source, (source, peer), position, pre_count=len(bm.edges))
-        if stitch.patch_knife_path_edges_by_side(bm, previous, cache, summary, AXIS, TOLERANCE) is not None:
+        if stitch_pathedges.patch_knife_path_edges_by_side(bm, previous, cache, summary, AXIS, TOLERANCE) is not None:
             raise RuntimeError("order fallback was accepted")
         if not any("not after pre-apply edges" in record.getMessage() for record in records):
             raise RuntimeError("order fallback warning was not observed")
@@ -573,7 +578,7 @@ def check_face_id_closure_logs_and_falls_back():
     records = []
     handler = logging.Handler()
     handler.emit = lambda record: records.append(record)
-    logger = logging.getLogger("ydd_symmetric_edit.stitch")
+    logger = logging.getLogger("ydd_symmetric_edit.stitch_pathedges")
     logger.addHandler(handler)
     try:
         marker = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
@@ -584,7 +589,7 @@ def check_face_id_closure_logs_and_falls_back():
             edge[marker] = 1
         source = next(edge for edge in bm.edges if edge.link_faces)
         source[marker] = 0
-        previous, _ = stitch.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
+        previous, _ = stitch_pathedges.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
         # An untracked path edge in a carrier face is a closure contradiction.
         extra = next(edge for face in source.link_faces for edge in face.edges if edge is not source)
         extra[marker] = 0
@@ -592,10 +597,10 @@ def check_face_id_closure_logs_and_falls_back():
             if extra in bucket:
                 bucket.remove(extra)
         all_edges = [edge for bucket in previous.values() for edge in bucket]
-        cache = stitch.capture_knife_path_edge_cache(bm, all_edges)
+        cache = stitch_pathedges.capture_knife_path_edge_cache(bm, all_edges)
         position = next(index for index, edge in enumerate(all_edges) if edge is source)
         summary = _summary(source, (source,), position, pre_count=len(bm.edges), pre_faces=source.link_faces)
-        if stitch.patch_knife_path_edges_by_side(bm, previous, cache, summary, AXIS, TOLERANCE) is not None:
+        if stitch_pathedges.patch_knife_path_edges_by_side(bm, previous, cache, summary, AXIS, TOLERANCE) is not None:
             raise RuntimeError("FACE_ID closure contradiction was accepted")
         if not any("FACE_ID closure" in record.getMessage() for record in records):
             raise RuntimeError("FACE_ID closure fallback emitted no warning")
@@ -607,9 +612,9 @@ def check_face_id_closure_logs_and_falls_back():
 def check_unexpected_topology_fallback():
     bm = _build_grid(2)
     try:
-        previous, _ = stitch.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
+        previous, _ = stitch_pathedges.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
         all_edges = [edge for bucket in previous.values() for edge in bucket]
-        cache = stitch.capture_knife_path_edge_cache(bm, all_edges)
+        cache = stitch_pathedges.capture_knife_path_edge_cache(bm, all_edges)
         source = all_edges[0]
         position = next(index for index, edge in enumerate(all_edges) if edge is source)
         for removed_edges, removed_faces in ((1, 0), (0, 1)):
@@ -622,9 +627,9 @@ def check_unexpected_topology_fallback():
                 removed_edges=removed_edges,
                 removed_faces=removed_faces,
             )
-            if stitch.patch_knife_path_edges_by_side(bm, previous, cache, summary, AXIS, TOLERANCE) is not None:
+            if stitch_pathedges.patch_knife_path_edges_by_side(bm, previous, cache, summary, AXIS, TOLERANCE) is not None:
                 raise RuntimeError("unexpected topology fallback was accepted")
-            full, _ = stitch.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
+            full, _ = stitch_pathedges.collect_knife_path_edges_by_side(bm, AXIS, TOLERANCE)
             if not any(full.values()):
                 raise RuntimeError("full fallback result was empty")
     finally:

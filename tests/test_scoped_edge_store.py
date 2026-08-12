@@ -22,15 +22,23 @@ from mathutils import Vector
 PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
-from ydd_symmetric_edit import layer_names, matching, snapshot, stitch  # noqa: E402
+from ydd_symmetric_edit import (  # noqa: E402
+    layer_names,
+    matching,
+    snapshot,
+    stitch_common,
+    stitch_pathedges,
+    stitch_projection,
+    stitch_reflect,
+)
 from ydd_symmetric_edit._types import FaceId  # noqa: E402
 
 AXIS = matching.AXIS_INDEX["X"]
 TOLERANCE = 1.0e-5
 MISSING_FACE_ID = FaceId(9001)
 
-_ORIGINAL_COLLECT_CONTEXT = stitch._collect_reflected_path_context
-_ORIGINAL_REALIZE_CHAIN = stitch._realize_interior_chain
+_ORIGINAL_COLLECT_CONTEXT = stitch_reflect._collect_reflected_path_context
+_ORIGINAL_REALIZE_CHAIN = stitch_reflect._realize_interior_chain
 
 
 def _frozen_eager_apply_reflected_path_topology(
@@ -57,7 +65,7 @@ def _frozen_eager_apply_reflected_path_topology(
         edge_records,
         unmatched_face_ids,
         _status,
-    ) = stitch._collect_reflected_path_context(
+    ) = stitch_reflect._collect_reflected_path_context(
         source_edges,
         face_layer,
         mirror_face_ids,
@@ -74,8 +82,8 @@ def _frozen_eager_apply_reflected_path_topology(
         return 0, 0, "a source cut edge has no mirrored target face"
 
     needed_target_ids = {target_id for target_ids in target_ids_by_vertex.values() for target_id in target_ids}
-    target_faces_by_id = stitch._target_faces_by_id(bm, face_layer, needed_target_ids)
-    classification, classify_reason = stitch._classify_reflected_vertices(
+    target_faces_by_id = stitch_reflect._target_faces_by_id(bm, face_layer, needed_target_ids)
+    classification, classify_reason = stitch_reflect._classify_reflected_vertices(
         source_vertex_by_key,
         target_ids_by_vertex,
         target_faces_by_id,
@@ -85,8 +93,8 @@ def _frozen_eager_apply_reflected_path_topology(
     if classify_reason:
         return 0, 0, classify_reason
 
-    adjacency = stitch._path_adjacency(edge_records)
-    chains, chain_reason = stitch._find_interior_chains(
+    adjacency = stitch_reflect._path_adjacency(edge_records)
+    chains, chain_reason = stitch_reflect._find_interior_chains(
         classification,
         adjacency,
         source_vertex_by_key,
@@ -99,7 +107,7 @@ def _frozen_eager_apply_reflected_path_topology(
     if chain_reason:
         return 0, 0, chain_reason
 
-    chain_edge_keys = stitch._chain_source_edge_keys(chains)
+    chain_edge_keys = stitch_reflect._chain_source_edge_keys(chains)
     target_vertex_by_source_key = {}
 
     for source_key, source_vertex in source_vertex_by_key.items():
@@ -112,7 +120,7 @@ def _frozen_eager_apply_reflected_path_topology(
             for face in target_faces_by_id.get(target_id, ())
             if face.is_valid
         }
-        kind, exact_vertex, target_edge, factor, reason = stitch._resolve_reflected_vertex_on_target(
+        kind, exact_vertex, target_edge, factor, reason = stitch_reflect._resolve_reflected_vertex_on_target(
             expected,
             candidate_faces,
             tolerance,
@@ -143,7 +151,7 @@ def _frozen_eager_apply_reflected_path_topology(
 
     realized_face_ids = set()
     for chain in chains:
-        created_delta, already_delta, fail_reason, existing_edges = stitch._realize_interior_chain(
+        created_delta, already_delta, fail_reason, existing_edges = stitch_reflect._realize_interior_chain(
             bm,
             chain,
             source_vertex_by_key,
@@ -184,7 +192,7 @@ def _frozen_eager_apply_reflected_path_topology(
                 existing_edges = {}
                 for edge in bm.edges:
                     if edge.is_valid:
-                        stitch._register_edge_endpoint_pair(
+                        stitch_common._register_edge_endpoint_pair(
                             existing_edges,
                             edge.verts[0].co,
                             edge.verts[1].co,
@@ -192,7 +200,7 @@ def _frozen_eager_apply_reflected_path_topology(
                             face_ids={FaceId(int(face[face_layer])) for face in edge.link_faces},
                         )
 
-            endpoint_match = stitch._match_edge_endpoint_pair_for_faces(
+            endpoint_match = stitch_common._match_edge_endpoint_pair_for_faces(
                 target_a.co,
                 target_b.co,
                 tolerance,
@@ -238,7 +246,7 @@ def _frozen_eager_apply_reflected_path_topology(
             for face in new_edge.link_faces:
                 face.select = False
             assert existing_edges is not None
-            stitch._register_edge_endpoint_pair(
+            stitch_common._register_edge_endpoint_pair(
                 existing_edges,
                 new_edge.verts[0].co,
                 new_edge.verts[1].co,
@@ -402,7 +410,7 @@ def _assert_differential(bm, source_edges, mirror_face_ids):
     eager_bm = _clone_bmesh(bm)
     eager_sources = [eager_bm.edges[index] for index in source_indices]
     candidate = _run_apply(
-        stitch.apply_reflected_path_topology,
+        stitch_reflect.apply_reflected_path_topology,
         bm,
         source_edges,
         mirror_face_ids,
@@ -490,14 +498,14 @@ def check_i_out_of_scope_same_bin():
         source = _add_source_diagonal(bm)
         _add_loose_edge(bm, (1.0, -1.0, 0.0), (2.0, 1.0, 0.0))
         matches = []
-        original_match = stitch._match_edge_endpoint_pair_for_faces
+        original_match = stitch_common._match_edge_endpoint_pair_for_faces
 
         def capture_match(*args, **kwargs):
             result = original_match(*args, **kwargs)
             matches.append(result)
             return result
 
-        with _replace(stitch, "_match_edge_endpoint_pair_for_faces", capture_match):
+        with _replace(stitch_common, "_match_edge_endpoint_pair_for_faces", capture_match):
             result = _assert_differential(bm, [source], mirror_face_ids)
         assert result[0] == ("return", (1, 0, "")), result[0]
         assert matches == ["no_match", "no_match"], matches
@@ -535,7 +543,7 @@ def check_ii_zero_live_faces_for_u():
                 include_real_record=False,
             )
 
-        with _replace(stitch, "_collect_reflected_path_context", injected):
+        with _replace(stitch_reflect, "_collect_reflected_path_context", injected):
             result = _assert_differential(bm, [source], mirror_face_ids)
         assert result[0] == (
             "return",
@@ -561,8 +569,8 @@ def check_iii_deferred_retry_uses_frozen_u():
         target_id = _target_id_for_source(boundary, bm, mirror_face_ids)
         registrations = []
         retries = 0
-        original_register = stitch._register_edge_endpoint_pair
-        original_match = stitch._match_edge_endpoint_pair_for_faces
+        original_register = stitch_common._register_edge_endpoint_pair
+        original_match = stitch_common._match_edge_endpoint_pair_for_faces
 
         def injected(source_edges, face_layer, face_map, *, require_all_mirrored):
             assert not require_all_mirrored
@@ -587,17 +595,17 @@ def check_iii_deferred_retry_uses_frozen_u():
         source_indices = (source.index, boundary.index)
         eager_sources = [eager_bm.edges[index] for index in source_indices]
         with (
-            _replace(stitch, "_collect_reflected_path_context", injected),
-            _replace(stitch, "_register_edge_endpoint_pair", capture_register),
-            _replace(stitch, "_match_edge_endpoint_pair_for_faces", capture_retry),
+            _replace(stitch_reflect, "_collect_reflected_path_context", injected),
+            _replace(stitch_common, "_register_edge_endpoint_pair", capture_register),
+            _replace(stitch_common, "_match_edge_endpoint_pair_for_faces", capture_retry),
         ):
             candidate = _run_apply(
-                stitch.apply_reflected_path_topology,
+                stitch_reflect.apply_reflected_path_topology,
                 bm,
                 [source, boundary],
                 mirror_face_ids,
             )
-        with _replace(stitch, "_collect_reflected_path_context", injected):
+        with _replace(stitch_reflect, "_collect_reflected_path_context", injected):
             eager = _run_apply(
                 _frozen_eager_apply_reflected_path_topology,
                 eager_bm,
@@ -624,7 +632,7 @@ def check_iv_nonfinite_u_disjoint_edges():
             source_index = source.index
             eager_bm = _clone_bmesh(bm)
             candidate = _run_apply(
-                stitch.apply_reflected_path_topology,
+                stitch_reflect.apply_reflected_path_topology,
                 bm,
                 [source],
                 mirror_face_ids,
@@ -699,7 +707,7 @@ def _build_two_chain_fixture():
     bmesh.utils.face_split(host_a, vb1, corner_tl, coords=[(-1.85, 0.0, 0.0)])
     host_b = next(face for face in bm.faces if face.is_valid and vb2 in face.verts and corner_tr in face.verts)
     bmesh.utils.face_split(host_b, vb2, corner_tr, coords=[(-1.15, 0.0, 0.0)])
-    chain_edges, side, total, crossing = stitch.collect_source_path_edges(
+    chain_edges, side, total, crossing = stitch_pathedges.collect_source_path_edges(
         bm,
         AXIS,
         TOLERANCE,
@@ -763,7 +771,7 @@ def _c1_hooks():
             store = {}
             for edge in bm.edges:
                 if edge.is_valid:
-                    stitch._register_edge_endpoint_pair(
+                    stitch_common._register_edge_endpoint_pair(
                         store,
                         edge.verts[0].co,
                         edge.verts[1].co,
@@ -806,7 +814,7 @@ def _c1_hooks():
         assert descendant is not None
         assert all(FaceId(int(face[face_layer])) == state["target_id"] for face in descendant.link_faces)
 
-        state["pre_chain_match"] = stitch._match_edge_endpoint_pair_for_faces(
+        state["pre_chain_match"] = stitch_common._match_edge_endpoint_pair_for_faces(
             query_a.co,
             query_b.co,
             tolerance,
@@ -816,14 +824,14 @@ def _c1_hooks():
         live_store = {}
         for edge in bm.edges:
             if edge.is_valid:
-                stitch._register_edge_endpoint_pair(
+                stitch_common._register_edge_endpoint_pair(
                     live_store,
                     edge.verts[0].co,
                     edge.verts[1].co,
                     tolerance,
                     face_ids={FaceId(int(face[face_layer])) for face in edge.link_faces},
                 )
-        state["live_eager_match"] = stitch._match_edge_endpoint_pair_for_faces(
+        state["live_eager_match"] = stitch_common._match_edge_endpoint_pair_for_faces(
             query_a.co,
             query_b.co,
             tolerance,
@@ -870,11 +878,11 @@ def check_vi_live_descendant_face_closure():
         assert source_signature(source_edges) == source_signature(eager_source_edges)
         collect, realize, state = _c1_hooks()
         with (
-            _replace(stitch, "_collect_reflected_path_context", collect),
-            _replace(stitch, "_realize_interior_chain", realize),
+            _replace(stitch_reflect, "_collect_reflected_path_context", collect),
+            _replace(stitch_reflect, "_realize_interior_chain", realize),
         ):
             candidate = _run_apply(
-                stitch.apply_reflected_path_topology,
+                stitch_reflect.apply_reflected_path_topology,
                 bm,
                 source_edges,
                 mirror_face_ids,
@@ -882,8 +890,8 @@ def check_vi_live_descendant_face_closure():
 
         eager_collect, eager_realize, eager_state = _c1_hooks()
         with (
-            _replace(stitch, "_collect_reflected_path_context", eager_collect),
-            _replace(stitch, "_realize_interior_chain", eager_realize),
+            _replace(stitch_reflect, "_collect_reflected_path_context", eager_collect),
+            _replace(stitch_reflect, "_realize_interior_chain", eager_realize),
         ):
             eager = _run_apply(
                 _frozen_eager_apply_reflected_path_topology,
@@ -957,7 +965,7 @@ def check_vii_shared_edge_registered_once():
         assert upper_boundary is not None
         shared_key = frozenset(((1.0, 0.0, 0.0), (2.0, 0.0, 0.0)))
         shared_registrations = 0
-        original_register = stitch._register_edge_endpoint_pair
+        original_register = stitch_common._register_edge_endpoint_pair
 
         def capture_register(store, edge_a, edge_b, tolerance, marker=None, face_ids=None):
             nonlocal shared_registrations
@@ -973,7 +981,7 @@ def check_vii_shared_edge_registered_once():
                 face_ids=face_ids,
             )
 
-        with _replace(stitch, "_register_edge_endpoint_pair", capture_register):
+        with _replace(stitch_common, "_register_edge_endpoint_pair", capture_register):
             result = _assert_differential(
                 bm,
                 [source, upper_boundary],
@@ -1015,7 +1023,7 @@ def check_vii_coordinate_duplicate_edges_are_ambiguous():
             records = [(records[0][0], records[0][1], {MISSING_FACE_ID})]
             return source_vertex_by_key, target_ids_by_vertex, records, unmatched, status
 
-        with _replace(stitch, "_collect_reflected_path_context", injected):
+        with _replace(stitch_reflect, "_collect_reflected_path_context", injected):
             result = _assert_differential(bm, [source], mirror_face_ids)
         assert result[0] == (
             "return",
@@ -1135,7 +1143,7 @@ def check_viii_unscoped_helper_boundaries():
         _add_loose_edge(cutter, (1.0, 0.0, 0.0), (1.0, 1.0, 0.0))
         cutter_oracle = _clone_bmesh(cutter)
         cutter_source_indices = (matched_source.index, unmatched_source.index)
-        candidate_cutter = stitch.build_reflected_cutter(
+        candidate_cutter = stitch_projection.build_reflected_cutter(
             cutter,
             [matched_source, unmatched_source],
             AXIS,
@@ -1160,7 +1168,7 @@ def check_viii_unscoped_helper_boundaries():
             )
             target[marker_layer] = marker
         collapsed_oracle = _clone_bmesh(collapsed)
-        candidate_markers = stitch.collapsed_offset_target_edge_markers(
+        candidate_markers = stitch_projection.collapsed_offset_target_edge_markers(
             collapsed,
             [source],
             AXIS,

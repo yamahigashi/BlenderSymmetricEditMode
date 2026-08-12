@@ -17,7 +17,7 @@ from mathutils import Vector
 
 PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
-from ydd_symmetric_edit import layer_names, matching, snapshot, stitch  # noqa: E402
+from ydd_symmetric_edit import layer_names, matching, snapshot, stitch_pathedges, stitch_reflect  # noqa: E402
 
 TOLERANCE = 1.0e-5
 AXIS = matching.AXIS_INDEX["X"]
@@ -99,7 +99,7 @@ def find_vertex(bm, expected, tolerance=1.0e-7):
 
 
 def collect_source_path_edges(bm):
-    source, side, total, crossing = stitch.collect_source_path_edges(bm, AXIS, TOLERANCE, "AUTO")
+    source, side, total, crossing = stitch_pathedges.collect_source_path_edges(bm, AXIS, TOLERANCE, "AUTO")
     assert side == "NEGATIVE", (side, total, crossing)
     assert crossing == 0
     return source
@@ -119,7 +119,7 @@ def check_interior_chain_n1():
         source = collect_source_path_edges(bm)
         assert len(source) == 2, len(source)
 
-        assert stitch.reflected_path_uses_only_target_boundaries(
+        assert stitch_reflect.reflected_path_uses_only_target_boundaries(
             bm,
             source,
             AXIS,
@@ -127,7 +127,7 @@ def check_interior_chain_n1():
             topology.mirror_face_ids,
         )
 
-        created, already, reason = stitch.apply_reflected_path_topology(
+        created, already, reason = stitch_reflect.apply_reflected_path_topology(
             bm,
             source,
             AXIS,
@@ -175,7 +175,7 @@ def check_interior_chain_n2():
         source = collect_source_path_edges(bm)
         assert len(source) == 3, len(source)
 
-        assert stitch.reflected_path_uses_only_target_boundaries(
+        assert stitch_reflect.reflected_path_uses_only_target_boundaries(
             bm,
             source,
             AXIS,
@@ -183,7 +183,7 @@ def check_interior_chain_n2():
             topology.mirror_face_ids,
         )
 
-        created, already, reason = stitch.apply_reflected_path_topology(
+        created, already, reason = stitch_reflect.apply_reflected_path_topology(
             bm,
             source,
             AXIS,
@@ -245,7 +245,7 @@ def check_decline_degree3_interior():
         source = collect_source_path_edges(bm)
         assert len(source) == 3, len(source)
 
-        assert not stitch.reflected_path_uses_only_target_boundaries(
+        assert not stitch_reflect.reflected_path_uses_only_target_boundaries(
             bm,
             source,
             AXIS,
@@ -253,7 +253,7 @@ def check_decline_degree3_interior():
             topology.mirror_face_ids,
         )
 
-        created, already, reason = stitch.apply_reflected_path_topology(
+        created, already, reason = stitch_reflect.apply_reflected_path_topology(
             bm,
             source,
             AXIS,
@@ -378,7 +378,7 @@ def check_decline_no_common_face():
         source = collect_source_path_edges(bm)
         assert len(source) == 3, len(source)
 
-        assert not stitch.reflected_path_uses_only_target_boundaries(
+        assert not stitch_reflect.reflected_path_uses_only_target_boundaries(
             bm,
             source,
             AXIS,
@@ -386,7 +386,7 @@ def check_decline_no_common_face():
             topology.mirror_face_ids,
         )
 
-        created, already, reason = stitch.apply_reflected_path_topology(
+        created, already, reason = stitch_reflect.apply_reflected_path_topology(
             bm,
             source,
             AXIS,
@@ -414,7 +414,7 @@ def check_curved_quad_single_candidate():
     single id-matching candidate must be accepted without re-testing
     containment."""
 
-    from ydd_symmetric_edit import stitch
+    from ydd_symmetric_edit import stitch_reflect
 
     quad = (
         (-0.21765238046646118, -0.5814824104309082, -0.17536157369613647),
@@ -449,7 +449,7 @@ def check_curved_quad_single_candidate():
         assert len(pentagon.verts) == 5, len(pentagon.verts)
         min_dist = min(
             (mg.closest_point_on_tri(interior, a, b, c) - interior).length
-            for a, b, c in stitch._face_surface_triangles(pentagon)
+            for a, b, c in stitch_reflect._face_surface_triangles(pentagon)
         )
         assert min_dist > TOLERANCE * 2.0, min_dist
         # The realization re-test would run on the target-side pentagon (the
@@ -477,14 +477,14 @@ def check_curved_quad_single_candidate():
         source = collect_source_path_edges(bm)
         assert len(source) == 2, len(source)
 
-        assert stitch.reflected_path_uses_only_target_boundaries(
+        assert stitch_reflect.reflected_path_uses_only_target_boundaries(
             bm,
             source,
             AXIS,
             TOLERANCE,
             topology.mirror_face_ids,
         )
-        created, already, reason = stitch.apply_reflected_path_topology(
+        created, already, reason = stitch_reflect.apply_reflected_path_topology(
             bm,
             source,
             AXIS,
@@ -540,14 +540,14 @@ def check_two_chains_same_face():
         source = collect_source_path_edges(bm)
         assert len(source) == 4, len(source)
 
-        assert stitch.reflected_path_uses_only_target_boundaries(
+        assert stitch_reflect.reflected_path_uses_only_target_boundaries(
             bm,
             source,
             AXIS,
             TOLERANCE,
             topology.mirror_face_ids,
         )
-        created, already, reason = stitch.apply_reflected_path_topology(
+        created, already, reason = stitch_reflect.apply_reflected_path_topology(
             bm,
             source,
             AXIS,

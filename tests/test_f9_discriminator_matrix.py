@@ -36,7 +36,15 @@ PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
 import ydd_symmetric_edit as addon  # noqa: E402
-from ydd_symmetric_edit import keymaps, layer_names, matching, operators, session_state, snapshot, stitch  # noqa: E402
+from ydd_symmetric_edit import (  # noqa: E402
+    keymaps,
+    layer_names,
+    matching,
+    operators,
+    session_state,
+    snapshot,
+    stitch_pathedges,
+)
 from ydd_symmetric_edit._types import HistoryRecord  # noqa: E402
 
 OBJECT_NAME = "YSE_F9MatrixObject"
@@ -297,7 +305,7 @@ def paint_absent(bm, tokens) -> None:
     for index, face in enumerate(faces, start=1):
         face[face_layer] = index
     _paint_tokens(faces, token_layer, tokens)
-    assert stitch.native_path_edge_state(bm) == "ABSENT", stitch.native_path_edge_state(bm)
+    assert stitch_pathedges.native_path_edge_state(bm) == "ABSENT", stitch_pathedges.native_path_edge_state(bm)
 
 
 def paint_present_marker_zero(bm, tokens) -> None:
@@ -311,7 +319,7 @@ def paint_present_marker_zero(bm, tokens) -> None:
     for index, face in enumerate(faces, start=1):
         face[face_layer] = index
     _paint_tokens(faces, token_layer, tokens)
-    assert stitch.native_path_edge_state(bm) == "PRESENT", stitch.native_path_edge_state(bm)
+    assert stitch_pathedges.native_path_edge_state(bm) == "PRESENT", stitch_pathedges.native_path_edge_state(bm)
 
 
 def paint_present_face_id_complement(bm, tokens) -> None:
@@ -331,7 +339,7 @@ def paint_present_face_id_complement(bm, tokens) -> None:
         face[face_layer] = shared_id
     _paint_tokens(faces, token_layer, tokens)
     assert all(edge[edge_layer] != 0 for edge in bm.edges)
-    assert stitch.native_path_edge_state(bm) == "PRESENT", stitch.native_path_edge_state(bm)
+    assert stitch_pathedges.native_path_edge_state(bm) == "PRESENT", stitch_pathedges.native_path_edge_state(bm)
 
 
 def paint_token_layer_only(bm, token: int) -> None:
@@ -340,7 +348,7 @@ def paint_token_layer_only(bm, token: int) -> None:
     token_layer = bm.faces.layers.int.new(layer_names.HISTORY_TOKEN_LAYER)
     for face in bm.faces:
         face[token_layer] = token
-    assert stitch.native_path_edge_state(bm) == "UNKNOWN", stitch.native_path_edge_state(bm)
+    assert stitch_pathedges.native_path_edge_state(bm) == "UNKNOWN", stitch_pathedges.native_path_edge_state(bm)
 
 
 def paint_edge_without_face_id(bm, token: int) -> None:
@@ -352,7 +360,7 @@ def paint_edge_without_face_id(bm, token: int) -> None:
         edge[edge_layer] = index
     for face in bm.faces:
         face[token_layer] = token
-    assert stitch.native_path_edge_state(bm) == "UNKNOWN", stitch.native_path_edge_state(bm)
+    assert stitch_pathedges.native_path_edge_state(bm) == "UNKNOWN", stitch_pathedges.native_path_edge_state(bm)
 
 
 def repair_queue_armed() -> bool:
@@ -546,7 +554,7 @@ def run_repair_cases() -> None:
         assert FOREIGN_TOKEN in operators._object_history_tokens(obj)
         assert FOREIGN_TOKEN not in operators._HISTORY_RECORDS
         assert operators._HISTORY_RECORDS[own].status == "COMMITTED"
-        assert stitch.native_path_edge_state(bmesh.from_edit_mesh(obj.data)) == "PRESENT"
+        assert stitch_pathedges.native_path_edge_state(bmesh.from_edit_mesh(obj.data)) == "PRESENT"
         assert not operators._SESSIONS
 
         verts_before = len(bmesh.from_edit_mesh(obj.data).verts)
@@ -646,7 +654,7 @@ def run_repair_cases() -> None:
                 live_bm = bmesh.from_edit_mesh(obj.data)
                 face_layer = live_bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
                 assert face_layer is not None
-                source_edges, _side, total_path_edges, _crossing_count = stitch.collect_source_path_edges(
+                source_edges, _side, total_path_edges, _crossing_count = stitch_pathedges.collect_source_path_edges(
                     live_bm,
                     live_session.axis_index,
                     live_session.tolerance,

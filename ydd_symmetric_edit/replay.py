@@ -16,7 +16,7 @@ import numpy  # type: ignore
 from bpy.props import EnumProperty, FloatProperty
 from mathutils import Vector
 
-from . import backup, layer_names, matching, selection, stitch
+from . import backup, layer_names, matching, selection, stitch_pathedges
 from . import snapshot as snapshot_module
 from ._types import MirrorOverlap
 from .snapshot import capture_selection_snapshot
@@ -458,7 +458,7 @@ def _extract_connect_effect_edges(bm: bmesh.types.BMesh) -> tuple[_ConnectEffect
     pre-existing edges keep a non-zero parent tag and are excluded.
     """
 
-    path_edges = stitch._discover_path_edges(bm, selected_only=False)
+    path_edges = stitch_pathedges._discover_path_edges(bm, selected_only=False)
     face_layer = bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
     records: list[_ConnectEffectEdge] = []
     for edge in path_edges:

@@ -43,7 +43,17 @@ PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
 import ydd_symmetric_edit as addon  # noqa: E402
-from ydd_symmetric_edit import face_mapping, layer_names, matching, operators, selection, snapshot, stitch  # noqa: E402
+from ydd_symmetric_edit import (  # noqa: E402
+    face_mapping,
+    layer_names,
+    matching,
+    operators,
+    selection,
+    snapshot,
+    stitch_common,
+    stitch_crossings,
+    stitch_pathedges,
+)
 
 MARKER_OK = "YSE_KNIFE_CROSS_MIRROR_STITCH_OK"
 MARKER_FAILED = "YSE_KNIFE_CROSS_MIRROR_STITCH_FAILED"
@@ -717,7 +727,7 @@ def simulate_case_k_cuts(obj) -> None:
 
 
 def _path_edge_lists(bm):
-    by_side, total = stitch.collect_knife_path_edges_by_side(bm, matching.AXIS_INDEX["X"], TOL)
+    by_side, total = stitch_pathedges.collect_knife_path_edges_by_side(bm, matching.AXIS_INDEX["X"], TOL)
     all_edges = (
         list(by_side.get("POSITIVE", ()))
         + list(by_side.get("NEGATIVE", ()))
@@ -741,7 +751,7 @@ def _plan_on_edit_object(obj, topology_or_session_frames, mirror_face_ids):
     )
     frames = topology_or_session_frames
     return (
-        stitch.plan_mirrored_path_crossings(
+        stitch_crossings.plan_mirrored_path_crossings(
             bm,
             by_side,
             matching.AXIS_INDEX["X"],
@@ -780,7 +790,7 @@ def case_a_proper_crossing(window, area, region) -> None:
     simulate_case_a_cuts(obj)
 
     bm = bmesh.from_edit_mesh(obj.data)
-    by_side, total = stitch.collect_knife_path_edges_by_side(bm, matching.AXIS_INDEX["X"], TOL)
+    by_side, total = stitch_pathedges.collect_knife_path_edges_by_side(bm, matching.AXIS_INDEX["X"], TOL)
     assert total >= 2, (total, {key: len(value) for key, value in by_side.items()})
     assert by_side["POSITIVE"] and by_side["NEGATIVE"], {key: len(value) for key, value in by_side.items()}
     assert not by_side["CROSSES"], {key: len(value) for key, value in by_side.items()}
@@ -823,7 +833,7 @@ def case_b_zigzag_double_crossing(window, area, region) -> None:
     simulate_case_b_cuts(obj)
 
     bm = bmesh.from_edit_mesh(obj.data)
-    by_side, total = stitch.collect_knife_path_edges_by_side(bm, matching.AXIS_INDEX["X"], TOL)
+    by_side, total = stitch_pathedges.collect_knife_path_edges_by_side(bm, matching.AXIS_INDEX["X"], TOL)
     assert total >= 3, (total, {key: len(value) for key, value in by_side.items()})
     assert by_side["POSITIVE"] and by_side["NEGATIVE"], {key: len(value) for key, value in by_side.items()}
 
@@ -852,7 +862,7 @@ def case_c_endpoint_interior(window, area, region) -> None:
 
     bm = bmesh.from_edit_mesh(obj.data)
     verts_before = len(bm.verts)
-    by_side, total = stitch.collect_knife_path_edges_by_side(bm, matching.AXIS_INDEX["X"], TOL)
+    by_side, total = stitch_pathedges.collect_knife_path_edges_by_side(bm, matching.AXIS_INDEX["X"], TOL)
     assert total >= 3, (total, {key: len(value) for key, value in by_side.items()})
 
     finished = run_finish(window, area, region)
@@ -927,7 +937,7 @@ def case_e_one_side_noop(window, area, region) -> None:
     simulate_case_e_cuts(obj)
 
     bm = bmesh.from_edit_mesh(obj.data)
-    by_side, total = stitch.collect_knife_path_edges_by_side(bm, matching.AXIS_INDEX["X"], TOL)
+    by_side, total = stitch_pathedges.collect_knife_path_edges_by_side(bm, matching.AXIS_INDEX["X"], TOL)
     assert total >= 1, total
     assert by_side["POSITIVE"] and not by_side["NEGATIVE"], {key: len(value) for key, value in by_side.items()}
 
@@ -952,10 +962,10 @@ def case_f_crosses_plus_crossing(window, area, region) -> None:
     simulate_case_f_cuts(obj)
 
     bm = bmesh.from_edit_mesh(obj.data)
-    by_side, total = stitch.collect_knife_path_edges_by_side(bm, matching.AXIS_INDEX["X"], TOL)
+    by_side, total = stitch_pathedges.collect_knife_path_edges_by_side(bm, matching.AXIS_INDEX["X"], TOL)
     assert total >= 3, (total, {key: len(value) for key, value in by_side.items()})
     assert by_side["CROSSES"], {key: len(value) for key, value in by_side.items()}
-    assert any(not stitch.is_self_mirrored_edge(edge, matching.AXIS_INDEX["X"], TOL) for edge in by_side["CROSSES"])
+    assert any(not stitch_common.is_self_mirrored_edge(edge, matching.AXIS_INDEX["X"], TOL) for edge in by_side["CROSSES"])
 
     from ydd_symmetric_edit import backup as backup_mod
 
@@ -1042,8 +1052,8 @@ def case_g_onplane_band(window, area, region) -> None:
     pos_edge = find_edge_between(bm, CASE_G_S0, CASE_G_S1)
     neg_edge = find_edge_between(bm, CASE_G_T0, CASE_G_T1)
 
-    original_carrier_ids = stitch._edge_carrier_ids
-    original_mirrored_ids = stitch._mirrored_carrier_ids
+    original_carrier_ids = stitch_crossings._edge_carrier_ids
+    original_mirrored_ids = stitch_crossings._mirrored_carrier_ids
 
     def _stub_carrier_ids(edge, _face_layer):
         del edge
@@ -1052,8 +1062,8 @@ def case_g_onplane_band(window, area, region) -> None:
     def _stub_mirrored_ids(carrier_ids, _mirror_face_ids):
         return set(carrier_ids)
 
-    stitch._edge_carrier_ids = _stub_carrier_ids  # type: ignore[assignment]
-    stitch._mirrored_carrier_ids = _stub_mirrored_ids  # type: ignore[assignment]
+    stitch_crossings._edge_carrier_ids = _stub_carrier_ids  # type: ignore[assignment]
+    stitch_crossings._mirrored_carrier_ids = _stub_mirrored_ids  # type: ignore[assignment]
     try:
         by_side = {
             "POSITIVE": [pos_edge],
@@ -1063,7 +1073,7 @@ def case_g_onplane_band(window, area, region) -> None:
         }
         mirror_face_ids = dict(topology.mirror_face_ids)
         mirror_face_ids[carrier_id] = carrier_id
-        plan, reason = stitch.plan_mirrored_path_crossings(
+        plan, reason = stitch_crossings.plan_mirrored_path_crossings(
             bm,
             by_side,
             matching.AXIS_INDEX["X"],
@@ -1085,12 +1095,12 @@ def case_g_onplane_band(window, area, region) -> None:
         # Combined occurrences on the positive (on-plane) side only.
         assert cluster.positive and not cluster.negative, (cluster.positive, cluster.negative)
 
-        stitched, apply_reason = stitch.apply_mirrored_path_crossings(bm, plan)
+        stitched, apply_reason = stitch_crossings.apply_mirrored_path_crossings(bm, plan)
         assert apply_reason == "", apply_reason
         assert stitched > 0, stitched
     finally:
-        stitch._edge_carrier_ids = original_carrier_ids  # type: ignore[assignment]
-        stitch._mirrored_carrier_ids = original_mirrored_ids  # type: ignore[assignment]
+        stitch_crossings._edge_carrier_ids = original_carrier_ids  # type: ignore[assignment]
+        stitch_crossings._mirrored_carrier_ids = original_mirrored_ids  # type: ignore[assignment]
 
     bm.verts.ensure_lookup_table()
     plane_q = [
@@ -1204,10 +1214,10 @@ def case_j_fixed_self_mirrored(window, area, region) -> None:
     bm.edges.ensure_lookup_table()
     fixed_edge = find_edge_between(bm, CASE_J_FIXED_L, CASE_J_FIXED_R)
     moving_edge = find_edge_between(bm, CASE_J_S0, CASE_J_S1)
-    assert stitch.is_self_mirrored_edge(fixed_edge, matching.AXIS_INDEX["X"], TOL)
+    assert stitch_common.is_self_mirrored_edge(fixed_edge, matching.AXIS_INDEX["X"], TOL)
 
-    original_carrier_ids = stitch._edge_carrier_ids
-    original_mirrored_ids = stitch._mirrored_carrier_ids
+    original_carrier_ids = stitch_crossings._edge_carrier_ids
+    original_mirrored_ids = stitch_crossings._mirrored_carrier_ids
 
     def _stub_carrier_ids(edge, _face_layer):
         del edge
@@ -1216,8 +1226,8 @@ def case_j_fixed_self_mirrored(window, area, region) -> None:
     def _stub_mirrored_ids(carrier_ids, _mirror_face_ids):
         return set(carrier_ids)
 
-    stitch._edge_carrier_ids = _stub_carrier_ids  # type: ignore[assignment]
-    stitch._mirrored_carrier_ids = _stub_mirrored_ids  # type: ignore[assignment]
+    stitch_crossings._edge_carrier_ids = _stub_carrier_ids  # type: ignore[assignment]
+    stitch_crossings._mirrored_carrier_ids = _stub_mirrored_ids  # type: ignore[assignment]
     try:
         by_side = {
             "POSITIVE": [moving_edge],
@@ -1228,7 +1238,7 @@ def case_j_fixed_self_mirrored(window, area, region) -> None:
         # Self-map the carrier so orbit selection succeeds.
         mirror_face_ids = dict(topology.mirror_face_ids)
         mirror_face_ids[carrier_id] = carrier_id
-        plan, reason = stitch.plan_mirrored_path_crossings(
+        plan, reason = stitch_crossings.plan_mirrored_path_crossings(
             bm,
             by_side,
             matching.AXIS_INDEX["X"],
@@ -1246,12 +1256,12 @@ def case_j_fixed_self_mirrored(window, area, region) -> None:
         assert fixed_ids & neg_edges, (plan, neg_edges)
         assert id(moving_edge) in pos_edges, pos_edges
 
-        stitched, apply_reason = stitch.apply_mirrored_path_crossings(bm, plan)
+        stitched, apply_reason = stitch_crossings.apply_mirrored_path_crossings(bm, plan)
         assert apply_reason == "", apply_reason
         assert stitched > 0, stitched
     finally:
-        stitch._edge_carrier_ids = original_carrier_ids  # type: ignore[assignment]
-        stitch._mirrored_carrier_ids = original_mirrored_ids  # type: ignore[assignment]
+        stitch_crossings._edge_carrier_ids = original_carrier_ids  # type: ignore[assignment]
+        stitch_crossings._mirrored_carrier_ids = original_mirrored_ids  # type: ignore[assignment]
 
     bm.verts.ensure_lookup_table()
     q_plus = verts_near(bm, CASE_J_Q_PLUS, tolerance=1.0e-3)
@@ -1354,7 +1364,7 @@ def case_l_nonplanar_guard(window, area, region) -> None:
         TOL,
         path_edges=all_edges,
     )
-    plan, reason = stitch.plan_mirrored_path_crossings(
+    plan, reason = stitch_crossings.plan_mirrored_path_crossings(
         bm,
         by_side,
         matching.AXIS_INDEX["X"],
@@ -1394,7 +1404,7 @@ def case_m_ambiguous_vertex(window, area, region) -> None:
         TOL,
         path_edges=all_edges,
     )
-    plan, reason = stitch.plan_mirrored_path_crossings(
+    plan, reason = stitch_crossings.plan_mirrored_path_crossings(
         bm,
         by_side,
         matching.AXIS_INDEX["X"],
@@ -1411,7 +1421,7 @@ def case_m_ambiguous_vertex(window, area, region) -> None:
     bm.verts.new((float(q_plus.x) - 1.0e-6, float(q_plus.y), float(q_plus.z)))
     bm.verts.ensure_lookup_table()
 
-    stitched, apply_reason = stitch.apply_mirrored_path_crossings(bm, plan)
+    stitched, apply_reason = stitch_crossings.apply_mirrored_path_crossings(bm, plan)
     assert stitched == 0, stitched
     assert apply_reason == "multiple existing vertices are ambiguous at a mirrored cut intersection", apply_reason
     # Path edges remain unsplit (decline before mutation of chords).

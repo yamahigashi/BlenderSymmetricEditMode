@@ -37,7 +37,10 @@ from ydd_symmetric_edit import (  # noqa: E402
     matching,
     operators,
     selection,
-    stitch,
+    stitch_common,
+    stitch_crossings,
+    stitch_pathedges,
+    stitch_reflect,
 )
 from ydd_symmetric_edit import replay as replay_module  # noqa: E402
 from ydd_symmetric_edit import rip as rip_module  # noqa: E402
@@ -2456,9 +2459,9 @@ def _check_finish_scope_warning_matrix():
     )
     for label, faces, path_face_index, expect_warning, expect_apply in cases:
         obj, mesh, window_pointer, session, resolution = _finish_scope_fixture(faces, path_face_index)
-        original_crossing_plan = stitch.plan_mirrored_path_crossings
-        original_boundary_check = stitch.reflected_path_uses_only_target_boundaries
-        original_apply = stitch.apply_reflected_path_topology
+        original_crossing_plan = stitch_crossings.plan_mirrored_path_crossings
+        original_boundary_check = stitch_reflect.reflected_path_uses_only_target_boundaries
+        original_apply = stitch_reflect.apply_reflected_path_topology
         original_backup_create = operators.backup.create_topology_backup
         original_backup_remove = operators.backup.remove_backup
         apply_calls = 0
@@ -2467,12 +2470,12 @@ def _check_finish_scope_warning_matrix():
             nonlocal apply_calls
             apply_calls += 1
             if _kwargs.get("return_summary"):
-                return len(source_edges), 0, "", stitch.SelectionMutationSummary()
+                return len(source_edges), 0, "", stitch_common.SelectionMutationSummary()
             return len(source_edges), 0, ""
 
-        setattr(stitch, "plan_mirrored_path_crossings", lambda *_args, **_kwargs: ([], ""))
-        setattr(stitch, "reflected_path_uses_only_target_boundaries", lambda *_args, **_kwargs: True)
-        setattr(stitch, "apply_reflected_path_topology", count_apply)
+        setattr(stitch_crossings, "plan_mirrored_path_crossings", lambda *_args, **_kwargs: ([], ""))
+        setattr(stitch_reflect, "reflected_path_uses_only_target_boundaries", lambda *_args, **_kwargs: True)
+        setattr(stitch_reflect, "apply_reflected_path_topology", count_apply)
         setattr(operators.backup, "create_topology_backup", lambda _bm: object())
         setattr(operators.backup, "remove_backup", lambda _value: None)
         operators._SESSIONS[window_pointer] = session
@@ -2494,9 +2497,9 @@ def _check_finish_scope_warning_matrix():
                 assert resolution.resolve_count == 0
                 assert resolution.partial_face_resolve_count >= 1
         finally:
-            setattr(stitch, "plan_mirrored_path_crossings", original_crossing_plan)
-            setattr(stitch, "reflected_path_uses_only_target_boundaries", original_boundary_check)
-            setattr(stitch, "apply_reflected_path_topology", original_apply)
+            setattr(stitch_crossings, "plan_mirrored_path_crossings", original_crossing_plan)
+            setattr(stitch_reflect, "reflected_path_uses_only_target_boundaries", original_boundary_check)
+            setattr(stitch_reflect, "apply_reflected_path_topology", original_apply)
             setattr(operators.backup, "create_topology_backup", original_backup_create)
             setattr(operators.backup, "remove_backup", original_backup_remove)
             operators._SESSIONS.pop(window_pointer, None)
@@ -2636,7 +2639,7 @@ def _check_hide_layer_omission_and_consumers():
         assert bm.verts.layers.int.get(layer_names.VERT_HIDDEN_LAYER) is None
         assert bm.edges.layers.int.get(layer_names.EDGE_HIDDEN_LAYER) is None
         assert bm.faces.layers.int.get(layer_names.FACE_HIDDEN_LAYER) is None
-        assert not stitch.path_ring_includes_pre_hidden_edges(bm)
+        assert not stitch_pathedges.path_ring_includes_pre_hidden_edges(bm)
         snapshot = _types.SelectionSnapshot(False, False, False, [])
         selection.restore_visibility_and_selection(bm, topology.hidden_by_face_id, snapshot)
     finally:

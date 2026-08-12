@@ -24,7 +24,7 @@ import bmesh
 PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
-from ydd_symmetric_edit import stitch  # noqa: E402
+from ydd_symmetric_edit import layer_names, stitch_pathedges  # noqa: E402
 
 MARKER = "YSE_COLLECT_PREDICATE_TEST_OK"
 
@@ -38,26 +38,26 @@ def _new_bm(*, with_face_layer=True):
     """Create a BMesh with marker layers already present (before geometry)."""
 
     bm = bmesh.new()
-    edge_layer = bm.edges.layers.int.new(stitch.EDGE_ORIGINAL_LAYER)
-    face_layer = bm.faces.layers.int.new(stitch.FACE_ID_LAYER) if with_face_layer else None
+    edge_layer = bm.edges.layers.int.new(layer_names.EDGE_ORIGINAL_LAYER)
+    face_layer = bm.faces.layers.int.new(layer_names.FACE_ID_LAYER) if with_face_layer else None
     return bm, edge_layer, face_layer
 
 
 def _oracle_full(bm, edge_layer, face_layer):
-    return {edge for edge in bm.edges if stitch._is_path_edge_by_markers(edge, edge_layer, face_layer)}
+    return {edge for edge in bm.edges if stitch_pathedges._is_path_edge_by_markers(edge, edge_layer, face_layer)}
 
 
 def _oracle_selected(bm, edge_layer, face_layer):
     return {
-        edge for edge in bm.edges if edge.select and stitch._is_path_edge_by_markers(edge, edge_layer, face_layer)
+        edge for edge in bm.edges if edge.select and stitch_pathedges._is_path_edge_by_markers(edge, edge_layer, face_layer)
     }
 
 
 def _assert_matches_oracle(bm, edge_layer, face_layer, label):
     expected_full = _oracle_full(bm, edge_layer, face_layer)
     expected_selected = _oracle_selected(bm, edge_layer, face_layer)
-    actual_full = set(stitch._discover_path_edges(bm, selected_only=False))
-    actual_selected = set(stitch._discover_path_edges(bm, selected_only=True))
+    actual_full = set(stitch_pathedges._discover_path_edges(bm, selected_only=False))
+    actual_selected = set(stitch_pathedges._discover_path_edges(bm, selected_only=True))
     assert actual_full == expected_full, (label, "full", actual_full, expected_full)
     assert actual_selected == expected_selected, (label, "selected_only", actual_selected, expected_selected)
 
@@ -91,7 +91,7 @@ def check_two_face_match():
         e.select = True
 
     _assert_matches_oracle(bm, edge_layer, face_layer, "two_face_match")
-    assert edge in stitch._discover_path_edges(bm, selected_only=False)
+    assert edge in stitch_pathedges._discover_path_edges(bm, selected_only=False)
     bm.free()
 
 
@@ -113,7 +113,7 @@ def check_two_face_mismatch():
         e.select = True
 
     _assert_matches_oracle(bm, edge_layer, face_layer, "two_face_mismatch")
-    assert edge not in stitch._discover_path_edges(bm, selected_only=False)
+    assert edge not in stitch_pathedges._discover_path_edges(bm, selected_only=False)
     bm.free()
 
 
@@ -138,7 +138,7 @@ def check_three_face_fan_match():
         e.select = True
 
     _assert_matches_oracle(bm, edge_layer, face_layer, "three_face_fan_match")
-    assert edge in stitch._discover_path_edges(bm, selected_only=False)
+    assert edge in stitch_pathedges._discover_path_edges(bm, selected_only=False)
     bm.free()
 
 
@@ -164,7 +164,7 @@ def check_three_face_fan_mismatch():
         e.select = True
 
     _assert_matches_oracle(bm, edge_layer, face_layer, "three_face_fan_mismatch")
-    assert edge not in stitch._discover_path_edges(bm, selected_only=False)
+    assert edge not in stitch_pathedges._discover_path_edges(bm, selected_only=False)
     bm.free()
 
 
@@ -191,7 +191,7 @@ def check_wire_edge():
         e.select = True
 
     _assert_matches_oracle(bm, edge_layer, face_layer, "wire_edge")
-    result = set(stitch._discover_path_edges(bm, selected_only=False))
+    result = set(stitch_pathedges._discover_path_edges(bm, selected_only=False))
     assert wire_edge not in result
     assert boundary_edge not in result
     bm.free()
@@ -225,7 +225,7 @@ def check_missing_face_layer():
         e.select = True
 
     _assert_matches_oracle(bm, edge_layer, face_layer, "missing_face_layer")
-    result = set(stitch._discover_path_edges(bm, selected_only=False))
+    result = set(stitch_pathedges._discover_path_edges(bm, selected_only=False))
     assert tag_zero_edge in result
     assert tag_nonzero_edge not in result
     bm.free()
@@ -273,7 +273,7 @@ def check_tag_zero_and_nonzero_mixed():
         e.select = True
 
     _assert_matches_oracle(bm, edge_layer, face_layer, "tag_zero_and_nonzero_mixed")
-    result = set(stitch._discover_path_edges(bm, selected_only=False))
+    result = set(stitch_pathedges._discover_path_edges(bm, selected_only=False))
     assert tag_zero_edge in result
     assert tag_match_edge in result
     assert tag_mismatch_edge not in result
@@ -307,8 +307,8 @@ def check_selected_only_excludes_unselected_tag_zero():
 
     _assert_matches_oracle(bm, edge_layer, face_layer, "selected_only_excludes_unselected_tag_zero")
 
-    full_result = set(stitch._discover_path_edges(bm, selected_only=False))
-    selected_result = set(stitch._discover_path_edges(bm, selected_only=True))
+    full_result = set(stitch_pathedges._discover_path_edges(bm, selected_only=False))
+    selected_result = set(stitch_pathedges._discover_path_edges(bm, selected_only=True))
     assert selected_tag_zero_edge in full_result
     assert unselected_tag_zero_edge in full_result
     assert selected_tag_zero_edge in selected_result
@@ -327,8 +327,8 @@ def check_missing_edge_layer_returns_empty():
     for e in bm.edges:
         e.select = True
 
-    assert stitch._discover_path_edges(bm, selected_only=False) == []
-    assert stitch._discover_path_edges(bm, selected_only=True) == []
+    assert stitch_pathedges._discover_path_edges(bm, selected_only=False) == []
+    assert stitch_pathedges._discover_path_edges(bm, selected_only=True) == []
     bm.free()
 
 

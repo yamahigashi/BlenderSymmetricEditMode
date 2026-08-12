@@ -18,7 +18,7 @@ PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
 import ydd_symmetric_edit as addon  # noqa: E402
-from ydd_symmetric_edit import layer_names, operators, stitch  # noqa: E402
+from ydd_symmetric_edit import layer_names, operators, stitch_pathedges, stitch_reflect  # noqa: E402
 
 
 def viewport_context():
@@ -211,14 +211,14 @@ def run_test():
         simulate_source_bent_knife(bent_obj)
         bent_bm = bmesh.from_edit_mesh(bent_obj.data)
         bent_session = next(iter(operators._SESSIONS.values()))
-        bent_source, _side, _total, _crossing = stitch.collect_source_path_edges(
+        bent_source, _side, _total, _crossing = stitch_pathedges.collect_source_path_edges(
             bent_bm,
             bent_session.axis_index,
             bent_session.tolerance,
             bent_session.source_side,
         )
         assert len(bent_source) == 2
-        assert not stitch.reflected_path_uses_only_target_boundaries(
+        assert not stitch_reflect.reflected_path_uses_only_target_boundaries(
             bent_bm,
             bent_source,
             bent_session.axis_index,

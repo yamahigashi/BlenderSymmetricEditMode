@@ -20,7 +20,7 @@ sys.path.insert(0, str(TESTS_DIR))
 
 import test_crossings_vertex_index as legacy_index_test  # noqa: E402
 
-from ydd_symmetric_edit import stitch  # noqa: E402
+from ydd_symmetric_edit import stitch_crossings  # noqa: E402
 
 TOLERANCE = 1.0e-5
 MARKER = "YSE_CROSSINGS_NUMPY_TEST_OK"
@@ -60,8 +60,8 @@ def _index_signature(index):
 def check_numpy_matches_python():
     bm, _plan = legacy_index_test._build_two_cluster_finite_plan()
     try:
-        expected, expected_fallback = stitch._build_crossings_vertex_bin_index_python(bm, TOLERANCE)
-        actual, actual_fallback = stitch._build_crossings_vertex_bin_index(bm, TOLERANCE)
+        expected, expected_fallback = stitch_crossings._build_crossings_vertex_bin_index_python(bm, TOLERANCE)
+        actual, actual_fallback = stitch_crossings._build_crossings_vertex_bin_index(bm, TOLERANCE)
         assert not expected_fallback and not actual_fallback
         assert _index_signature(actual) == _index_signature(expected)
         assert all(isinstance(key, tuple) and len(key) == 3 for key in actual)
@@ -73,44 +73,44 @@ def check_nonfinite_coordinate_returns_fallback():
     bm = _fixture()
     try:
         bm.verts.new((math.nan, 0.0, 0.0))
-        assert stitch._build_crossings_vertex_bin_index(bm, TOLERANCE) == (None, True)
+        assert stitch_crossings._build_crossings_vertex_bin_index(bm, TOLERANCE) == (None, True)
     finally:
         bm.free()
 
 
 def check_int64_guard_matches_python():
     bm = _fixture()
-    original_python = stitch._build_crossings_vertex_bin_index_python
+    original_python = stitch_crossings._build_crossings_vertex_bin_index_python
     calls = {"count": 0}
 
     def observed_python(*args, **kwargs):
         calls["count"] += 1
         return original_python(*args, **kwargs)
 
-    stitch._build_crossings_vertex_bin_index_python = observed_python
+    stitch_crossings._build_crossings_vertex_bin_index_python = observed_python
     try:
         bm.verts[0].co.x = 1.0e30
         expected = original_python(bm, 1.0e-6)
-        actual = stitch._build_crossings_vertex_bin_index(bm, 1.0e-6)
+        actual = stitch_crossings._build_crossings_vertex_bin_index(bm, 1.0e-6)
         assert _index_signature(actual[0]) == _index_signature(expected[0])
         assert actual[1] is False
         assert calls["count"] == 1
     finally:
-        stitch._build_crossings_vertex_bin_index_python = original_python
+        stitch_crossings._build_crossings_vertex_bin_index_python = original_python
         bm.free()
 
 
 def check_order_guard_detects_reordered_keys():
     bm = _fixture()
     original_floor = numpy.floor
-    original_python = stitch._build_crossings_vertex_bin_index_python
+    original_python = stitch_crossings._build_crossings_vertex_bin_index_python
     calls = {"count": 0}
 
     def observed_python(*args, **kwargs):
         calls["count"] += 1
         return original_python(*args, **kwargs)
 
-    stitch._build_crossings_vertex_bin_index_python = observed_python
+    stitch_crossings._build_crossings_vertex_bin_index_python = observed_python
     try:
         def swapped_floor(values, *args, **kwargs):
             result = original_floor(values, *args, **kwargs)
@@ -121,25 +121,25 @@ def check_order_guard_detects_reordered_keys():
 
         numpy.floor = swapped_floor
         expected = original_python(bm, TOLERANCE)
-        actual = stitch._build_crossings_vertex_bin_index(bm, TOLERANCE)
+        actual = stitch_crossings._build_crossings_vertex_bin_index(bm, TOLERANCE)
         assert _index_signature(actual[0]) == _index_signature(expected[0])
         assert actual[1] is False
         assert calls["count"] == 1
     finally:
-        stitch._build_crossings_vertex_bin_index_python = original_python
+        stitch_crossings._build_crossings_vertex_bin_index_python = original_python
         numpy.floor = original_floor
         bm.free()
 
 
 def check_count_mismatch_falls_back():
-    original = stitch._build_crossings_vertex_bin_index_python
+    original = stitch_crossings._build_crossings_vertex_bin_index_python
     calls = {"count": 0}
 
     def observed(*args, **kwargs):
         calls["count"] += 1
         return {}, False
 
-    stitch._build_crossings_vertex_bin_index_python = observed
+    stitch_crossings._build_crossings_vertex_bin_index_python = observed
     previous_bpy = sys.modules.get("bpy")
 
     class FakeBMesh:
@@ -161,11 +161,11 @@ def check_count_mismatch_falls_back():
     )
     sys.modules["bpy"] = fake_bpy
     try:
-        actual = stitch._build_crossings_vertex_bin_index(FakeBMesh(), TOLERANCE)
+        actual = stitch_crossings._build_crossings_vertex_bin_index(FakeBMesh(), TOLERANCE)
         assert actual == ({}, False)
         assert calls["count"] == 1
     finally:
-        stitch._build_crossings_vertex_bin_index_python = original
+        stitch_crossings._build_crossings_vertex_bin_index_python = original
         if previous_bpy is None:
             sys.modules.pop("bpy", None)
         else:
@@ -174,7 +174,7 @@ def check_count_mismatch_falls_back():
 
 def check_numpy_exception_falls_back():
     bm = _fixture()
-    original = stitch._build_crossings_vertex_bin_index_python
+    original = stitch_crossings._build_crossings_vertex_bin_index_python
     previous_bpy = sys.modules.get("bpy")
     calls = {"count": 0}
 
@@ -207,17 +207,17 @@ def check_numpy_exception_falls_back():
             )
         )
     )
-    stitch._build_crossings_vertex_bin_index_python = observed
+    stitch_crossings._build_crossings_vertex_bin_index_python = observed
     sys.modules["bpy"] = fake_bpy
     try:
         proxy = ProxyBMesh()
         expected = original(proxy, TOLERANCE)
-        actual = stitch._build_crossings_vertex_bin_index(proxy, TOLERANCE)
+        actual = stitch_crossings._build_crossings_vertex_bin_index(proxy, TOLERANCE)
         assert _index_signature(actual[0]) == _index_signature(expected[0])
         assert calls["count"] == 1
         assert removed["count"] == 1
     finally:
-        stitch._build_crossings_vertex_bin_index_python = original
+        stitch_crossings._build_crossings_vertex_bin_index_python = original
         if previous_bpy is None:
             sys.modules.pop("bpy", None)
         else:

@@ -16,7 +16,7 @@ import bmesh
 PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
-from ydd_symmetric_edit import layer_names, selection, stitch  # noqa: E402
+from ydd_symmetric_edit import layer_names, selection, stitch_common  # noqa: E402
 from ydd_symmetric_edit._types import (  # noqa: E402
     FaceId,
     FaceSelectionHistory,
@@ -111,7 +111,7 @@ def _mutate_selection(bm, *, mutation_case="p_stitch"):
 
 
 def _summary_for_all(bm):
-    return stitch.SelectionMutationSummary(
+    return stitch_common.SelectionMutationSummary(
         vertices=tuple(bm.verts),
         edges=tuple(bm.edges),
         faces=tuple(bm.faces),
@@ -276,7 +276,7 @@ def check_summary_omission_is_detected():
         _mutate_selection(old_bm)
         _mutate_selection(new_bm)
         selection.restore_visibility_and_selection(old_bm, old_hidden, old_snapshot)
-        complete = stitch.SelectionMutationSummary(
+        complete = stitch_common.SelectionMutationSummary(
             vertices=tuple(list(new_bm.verts)[1:]),
             edges=tuple(new_bm.edges),
             faces=(),
@@ -321,7 +321,7 @@ def check_tracker_closure_preserves_untracked_selection():
     add_edge must carry its full boundary, or clearing it flush-deselects an
     untracked independently-selected shared edge that is never restored."""
 
-    from ydd_symmetric_edit import stitch
+    from ydd_symmetric_edit import stitch_common
 
     bm = bmesh.new()
     vertex_selection = bm.verts.layers.int.new(layer_names.VERT_SELECTION_LAYER)
@@ -352,7 +352,7 @@ def check_tracker_closure_preserves_untracked_selection():
         for face in bm.faces:
             face[face_selection] = int(face.select)
 
-        tracker = stitch._SelectionMutationTracker()
+        tracker = stitch_common._SelectionMutationTracker()
         west = next(e for e in bm.edges if set(e.verts) == {v[0], v[3]})
         tracker.add_edge(west)
         summary = tracker.finish()

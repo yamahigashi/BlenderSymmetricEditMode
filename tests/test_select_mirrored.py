@@ -38,7 +38,7 @@ PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
 import ydd_symmetric_edit as addon  # noqa: E402
-from ydd_symmetric_edit import layer_names, matching, selection, snapshot, stitch  # noqa: E402
+from ydd_symmetric_edit import layer_names, matching, selection, snapshot, stitch_reflect  # noqa: E402
 
 MARKER_OK = "YSE_SELECT_MIRRORED_OK"
 MARKER_FAILED = "YSE_SELECT_MIRRORED_FAILED"
@@ -221,7 +221,7 @@ def check_loop_cut_on_off_selection() -> None:
             topology = snapshot.prepare_topology(bm, AXIS, TOLERANCE)
             path_edge = split_left_mid_loop(bm)
             assert path_edge is not None
-            created, already, reason = stitch.apply_reflected_path_topology(
+            created, already, reason = stitch_reflect.apply_reflected_path_topology(
                 bm,
                 [path_edge],
                 AXIS,
