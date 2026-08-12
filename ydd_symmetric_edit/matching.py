@@ -1050,7 +1050,7 @@ def _one_sided_candidate_arrays(
     coords64: NDArray[numpy.float64],
     axis_index: int,
     tolerance: float,
-) -> tuple[NDArray[numpy.int64], NDArray[numpy.int64], NDArray[numpy.float64]] | None:
+) -> tuple[NDArray[numpy.intp], NDArray[numpy.intp], NDArray[numpy.float64]] | None:
     """Build sorted mirror candidate arrays with one off-plane probe."""
 
     count = len(coords64)
@@ -1081,7 +1081,7 @@ def _one_sided_candidate_arrays(
 
     def probe(query_indices, query_points, side_mask):
         if len(query_indices) == 0:
-            empty_i = numpy.empty(0, dtype=numpy.int64)
+            empty_i = numpy.empty(0, dtype=numpy.intp)
             return empty_i, empty_i.copy(), numpy.empty(0, dtype=numpy.float64)
         query_bins = numpy.floor(query_points * inverse).astype(numpy.int64)
         shifted_xy = (query_bins[:, None, :2] + offsets[None, :, :]).reshape(-1, 2) - mins[:2]
@@ -1093,7 +1093,7 @@ def _one_sided_candidate_arrays(
             & (shifted_z <= span_z)
         )
         if len(valid) == 0:
-            empty_i = numpy.empty(0, dtype=numpy.int64)
+            empty_i = numpy.empty(0, dtype=numpy.intp)
             return empty_i, empty_i.copy(), numpy.empty(0, dtype=numpy.float64)
         low = numpy.clip(shifted_z[valid] - 1, 0, span_z - 1)
         high = numpy.clip(shifted_z[valid] + 1, 0, span_z - 1)
@@ -1103,7 +1103,7 @@ def _one_sided_candidate_arrays(
         counts = right - left
         total = int(counts.sum())
         if total == 0:
-            empty_i = numpy.empty(0, dtype=numpy.int64)
+            empty_i = numpy.empty(0, dtype=numpy.intp)
             return empty_i, empty_i.copy(), numpy.empty(0, dtype=numpy.float64)
         windows = numpy.repeat(numpy.arange(len(counts), dtype=numpy.int64), counts)
         starts = numpy.repeat(numpy.cumsum(counts) - counts, counts)
