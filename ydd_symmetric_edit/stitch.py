@@ -1148,6 +1148,147 @@ def plan_mirrored_path_crossings(
     return clusters, ""
 
 
+_VertexBinIndex = dict[QuantizedCoordinate, list[bmesh.types.BMVert]]
+
+
+def _coordinate_components_finite(co) -> bool:
+    return math.isfinite(float(co[0])) and math.isfinite(float(co[1])) and math.isfinite(float(co[2]))
+
+
+def _build_crossings_vertex_bin_index(
+    bm: bmesh.types.BMesh,
+    tolerance: float,
+) -> tuple[_VertexBinIndex | None, bool]:
+    """Build a primary-bin vertex index for crossings scans (§I-3a).
+
+    Returns ``(index, use_fallback)``. When any live vertex coordinate or the
+    tolerance is non-finite, returns ``(None, True)`` so callers fall back to
+    the pre-U6-3a full ``bm.verts`` scan.
+    """
+
+    if not math.isfinite(tolerance):
+        return None, True
+    index: _VertexBinIndex = {}
+    for vertex in bm.verts:
+        if not vertex.is_valid:
+            continue
+        if not _coordinate_components_finite(vertex.co):
+            return None, True
+        bin_key = _quantized_coordinate(vertex.co, tolerance)
+        index.setdefault(bin_key, []).append(vertex)
+    return index, False
+
+
+def _register_crossings_vertex(
+    index: _VertexBinIndex,
+    vertex: bmesh.types.BMVert,
+    tolerance: float,
+) -> bool:
+    """Register *vertex* under its primary bin. False when non-finite."""
+
+    if not math.isfinite(tolerance) or not _coordinate_components_finite(vertex.co):
+        return False
+    bin_key = _quantized_coordinate(vertex.co, tolerance)
+    index.setdefault(bin_key, []).append(vertex)
+    return True
+
+
+def _unregister_crossings_vertex(
+    index: _VertexBinIndex,
+    vertex: bmesh.types.BMVert,
+    coordinate,
+    tolerance: float,
+) -> bool:
+    """Remove *vertex* from the bin of *coordinate*. False when non-finite."""
+
+    if not math.isfinite(tolerance) or not _coordinate_components_finite(coordinate):
+        return False
+    bin_key = _quantized_coordinate(coordinate, tolerance)
+    bucket = index.get(bin_key)
+    if not bucket:
+        return True
+    for position, candidate in enumerate(bucket):
+        if candidate is vertex:
+            del bucket[position]
+            break
+    if not bucket:
+        del index[bin_key]
+    return True
+
+
+def _rebin_crossings_vertex(
+    index: _VertexBinIndex,
+    vertex: bmesh.types.BMVert,
+    old_coordinate,
+    new_coordinate,
+    tolerance: float,
+) -> bool:
+    """Move *vertex* from the bin of *old_coordinate* to *new_coordinate*."""
+
+    if not _unregister_crossings_vertex(index, vertex, old_coordinate, tolerance):
+        return False
+    if not math.isfinite(tolerance) or not _coordinate_components_finite(new_coordinate):
+        return False
+    bin_key = _quantized_coordinate(new_coordinate, tolerance)
+    index.setdefault(bin_key, []).append(vertex)
+    return True
+
+
+def _scan_crossings_vertices_full(
+    bm: bmesh.types.BMesh,
+    coordinate,
+    tolerance: float,
+    *,
+    exclude: set[bmesh.types.BMVert] | None = None,
+    exclude_vertex: bmesh.types.BMVert | None = None,
+) -> list[bmesh.types.BMVert]:
+    """Pre-U6-3a full-mesh listcomp path retained for non-finite fallback."""
+
+    if exclude is not None:
+        return [
+            vertex
+            for vertex in bm.verts
+            if vertex.is_valid and vertex not in exclude and coordinates_match(vertex.co, coordinate, tolerance)
+        ]
+    return [
+        vertex
+        for vertex in bm.verts
+        if vertex.is_valid and vertex != exclude_vertex and coordinates_match(vertex.co, coordinate, tolerance)
+    ]
+
+
+def _scan_crossings_vertices_indexed(
+    index: _VertexBinIndex,
+    coordinate,
+    tolerance: float,
+    *,
+    exclude: set[bmesh.types.BMVert] | None = None,
+    exclude_vertex: bmesh.types.BMVert | None = None,
+) -> list[bmesh.types.BMVert] | None:
+    """27-bin candidate generation + full predicate. None when non-finite."""
+
+    if not math.isfinite(tolerance) or not _coordinate_components_finite(coordinate):
+        return None
+    seen: set[int] = set()
+    matches: list[bmesh.types.BMVert] = []
+    for bin_key in _iter_quantized_neighborhood(coordinate, tolerance):
+        for vertex in index.get(bin_key, ()):
+            vertex_id = id(vertex)
+            if vertex_id in seen:
+                continue
+            seen.add(vertex_id)
+            if not vertex.is_valid:
+                continue
+            if exclude is not None:
+                if vertex in exclude:
+                    continue
+            elif exclude_vertex is not None and vertex == exclude_vertex:
+                continue
+            if coordinates_match(vertex.co, coordinate, tolerance):
+                matches.append(vertex)
+    return matches
+
+
 def apply_mirrored_path_crossings(
     bm: bmesh.types.BMesh,
     plan: Sequence[_MirroredPathCrossingCluster],
@@ -1190,15 +1331,99 @@ def apply_mirrored_path_crossings(
                 native_vertex_selection.setdefault(hash(endpoint), bool(endpoint.select))
         participant_endpoints.append(endpoints)
 
+    tolerance = _plan_tolerance(plan)
+    use_fallback = not math.isfinite(tolerance)
+    if not use_fallback:
+        for coordinate, _occurrences in applications:
+            if not _coordinate_components_finite(coordinate):
+                use_fallback = True
+                break
+    vertex_index: _VertexBinIndex | None = None
+    if not use_fallback:
+        vertex_index, use_fallback = _build_crossings_vertex_bin_index(bm, tolerance)
+
+    def _collect_extras(
+        application_index: int,
+        coordinate,
+    ) -> list[bmesh.types.BMVert]:
+        nonlocal use_fallback, vertex_index
+        exclude = participant_endpoints[application_index]
+        if not use_fallback and vertex_index is not None:
+            indexed = _scan_crossings_vertices_indexed(
+                vertex_index,
+                coordinate,
+                tolerance,
+                exclude=exclude,
+            )
+            if indexed is not None:
+                return indexed
+            use_fallback = True
+            vertex_index = None
+        return _scan_crossings_vertices_full(
+            bm,
+            coordinate,
+            tolerance,
+            exclude=exclude,
+        )
+
+    def _collect_ambiguous(
+        coordinate,
+        survivor: bmesh.types.BMVert,
+    ) -> list[bmesh.types.BMVert]:
+        nonlocal use_fallback, vertex_index
+        if not use_fallback and vertex_index is not None:
+            indexed = _scan_crossings_vertices_indexed(
+                vertex_index,
+                coordinate,
+                tolerance,
+                exclude_vertex=survivor,
+            )
+            if indexed is not None:
+                return indexed
+            use_fallback = True
+            vertex_index = None
+        return _scan_crossings_vertices_full(
+            bm,
+            coordinate,
+            tolerance,
+            exclude_vertex=survivor,
+        )
+
+    def _index_register(vertex: bmesh.types.BMVert) -> None:
+        nonlocal use_fallback, vertex_index
+        if use_fallback or vertex_index is None:
+            return
+        if not _register_crossings_vertex(vertex_index, vertex, tolerance):
+            use_fallback = True
+            vertex_index = None
+
+    def _index_unregister(vertex: bmesh.types.BMVert, coordinate) -> None:
+        nonlocal use_fallback, vertex_index
+        if use_fallback or vertex_index is None:
+            return
+        if not _unregister_crossings_vertex(vertex_index, vertex, coordinate, tolerance):
+            use_fallback = True
+            vertex_index = None
+
+    def _index_rebin(vertex: bmesh.types.BMVert, old_coordinate, new_coordinate) -> None:
+        nonlocal use_fallback, vertex_index
+        if use_fallback or vertex_index is None:
+            return
+        if not _rebin_crossings_vertex(
+            vertex_index,
+            vertex,
+            old_coordinate,
+            new_coordinate,
+            tolerance,
+        ):
+            use_fallback = True
+            vertex_index = None
+
+    # reusable_vertex (extras): resolve for every application before any
+    # topology mutation (§I-3a evaluation order).
     reusable_vertex: list[bmesh.types.BMVert | None] = []
     for application_index, (coordinate, _occurrences) in enumerate(applications):
-        extras = [
-            vertex
-            for vertex in bm.verts
-            if vertex.is_valid
-            and vertex not in participant_endpoints[application_index]
-            and coordinates_match(vertex.co, coordinate, _plan_tolerance(plan))
-        ]
+        extras = _collect_extras(application_index, coordinate)
         if len(extras) > 1:
             return 0, "multiple existing vertices are ambiguous at a mirrored cut intersection"
         reusable_vertex.append(extras[0] if extras else None)
@@ -1252,6 +1477,7 @@ def apply_mirrored_path_crossings(
             new_vertex[vertex_selection_layer] = int(selected)
             native_vertex_selection[hash(new_vertex)] = selected
             vertex_by_occurrence[id(occurrence)] = new_vertex
+            _index_register(new_vertex)
 
             descendants = [edge for edge in (descendant, new_edge) if original_end in edge.verts]
             if len(descendants) != 1:
@@ -1289,10 +1515,13 @@ def apply_mirrored_path_crossings(
         snapshot_selected = selected or any(
             bool(vertex[vertex_selection_layer]) for vertex in vertices if vertex.is_valid
         )
+        old_survivor_co = survivor.co.copy()
         survivor.co = coordinate.copy()
+        _index_rebin(survivor, old_survivor_co, coordinate)
         for vertex in list(vertices):
             if vertex == survivor:
                 continue
+            discard_co = vertex.co.copy() if vertex.is_valid else None
             try:
                 bmesh.ops.pointmerge(
                     bm,
@@ -1301,19 +1530,17 @@ def apply_mirrored_path_crossings(
                 )
             except (RuntimeError, ValueError) as exc:
                 return 0, f"could not unify mirrored crossing vertices: {exc}"
+            if discard_co is not None:
+                _index_unregister(vertex, discard_co)
             if not survivor.is_valid:
                 return 0, "the mirrored crossing survivor was lost during point merge"
+        old_survivor_co = survivor.co.copy()
         survivor.co = coordinate.copy()
+        _index_rebin(survivor, old_survivor_co, coordinate)
         survivor.select = selected
         survivor[vertex_selection_layer] = int(snapshot_selected)
 
-        ambiguous = [
-            vertex
-            for vertex in bm.verts
-            if vertex.is_valid
-            and vertex != survivor
-            and coordinates_match(vertex.co, coordinate, _plan_tolerance(plan))
-        ]
+        ambiguous = _collect_ambiguous(coordinate, survivor)
         if ambiguous:
             return 0, "a separate existing vertex remains within tolerance of a mirrored cut intersection"
 
@@ -1601,11 +1828,7 @@ def _interior_faces_for_point(
     tolerance: float,
 ) -> list[bmesh.types.BMFace]:
     return sorted(
-        (
-            face
-            for face in candidate_faces
-            if face.is_valid and _point_strictly_inside_face(point, face, tolerance)
-        ),
+        (face for face in candidate_faces if face.is_valid and _point_strictly_inside_face(point, face, tolerance)),
         key=lambda face: face.index,
     )
 
@@ -1887,9 +2110,7 @@ def _realize_interior_chain(
 
     end_a = target_vertex_by_source_key[chain.end_a]
     end_b = target_vertex_by_source_key[chain.end_b]
-    reflected_coords = [
-        mirror_coordinate(source_vertex_by_key[member].co, axis_index) for member in chain.members
-    ]
+    reflected_coords = [mirror_coordinate(source_vertex_by_key[member].co, axis_index) for member in chain.members]
     candidate_faces = sorted(
         (
             face
@@ -1942,9 +2163,7 @@ def _realize_interior_chain(
     end_hashes = {hash(end_a), hash(end_b)}
     target_vert_hashes = {hash(vertex) for vertex in target_face.verts}
     new_verts = [
-        vertex
-        for vertex in new_face.verts
-        if hash(vertex) in target_vert_hashes and hash(vertex) not in end_hashes
+        vertex for vertex in new_face.verts if hash(vertex) in target_vert_hashes and hash(vertex) not in end_hashes
     ]
     if len(new_verts) < len(chain.members):
         return 0, 0, "interior chain face_split created too few vertices", existing_edges
