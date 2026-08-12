@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import numpy
 from mathutils import Vector
@@ -15,6 +15,9 @@ from ._types import (
     OverlapClassification,
     QuantizedCoordinate,
 )
+
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
 
 AXIS_INDEX = {"X": 0, "Y": 1, "Z": 2}
 MESH_SYMMETRY_PROPERTIES = (
@@ -1043,7 +1046,11 @@ def _mutual_pairs_dict(vertex_ids: numpy.ndarray, assigned: numpy.ndarray) -> di
     return {int(source): int(target) for source, target in zip(sources.tolist(), targets.tolist(), strict=True)}
 
 
-def _one_sided_candidate_arrays(coords64: numpy.ndarray, axis_index: int, tolerance: float):
+def _one_sided_candidate_arrays(
+    coords64: NDArray[numpy.float64],
+    axis_index: int,
+    tolerance: float,
+) -> tuple[NDArray[numpy.int64], NDArray[numpy.int64], NDArray[numpy.float64]] | None:
     """Build sorted mirror candidate arrays with one off-plane probe."""
 
     count = len(coords64)
@@ -1125,7 +1132,11 @@ def _one_sided_candidate_arrays(coords64: numpy.ndarray, axis_index: int, tolera
     return queries, targets, distances
 
 
-def _one_sided_pair_table(coords64: numpy.ndarray, axis_index: int, tolerance: float):
+def _one_sided_pair_table(
+    coords64: NDArray[numpy.float64],
+    axis_index: int,
+    tolerance: float,
+) -> dict[int, int] | None:
     """Build mirror candidates with one off-plane probe and its transpose."""
 
     arrays = _one_sided_candidate_arrays(coords64, axis_index, tolerance)
@@ -1166,7 +1177,7 @@ def _vertex_pair_table_from_lookup(
 
 
 def build_vertex_pair_table(
-    coords: Sequence[Vector] | numpy.ndarray,
+    coords: Sequence[Vector] | NDArray[numpy.float64],
     axis_index: int,
     tolerance: float,
 ) -> dict[int, int]:

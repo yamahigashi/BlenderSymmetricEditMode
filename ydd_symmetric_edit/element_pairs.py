@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import bmesh
 import numpy
@@ -14,13 +15,16 @@ from . import matching
 from .matching import _one_sided_pair_table
 from .snapshot import capture_selection_snapshot
 
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
+
 
 class _DensePartnerMap(Mapping[int, int | None]):
     """Read-only mapping view over a dense ``-1``-for-unmatched pair column."""
 
     __slots__ = ("_partners",)
 
-    def __init__(self, partners: numpy.ndarray) -> None:
+    def __init__(self, partners: NDArray[numpy.int64]) -> None:
         self._partners = partners
 
     def __getitem__(self, key: int) -> int | None:
@@ -62,13 +66,13 @@ class ElementPairMaps:
     vert_pairs: dict[int, int]
     edge_pair_by_index: Mapping[int, int | None]
     face_pair_by_index: Mapping[int, int | None]
-    _vertex_partner_indices: numpy.ndarray | None = field(default=None, repr=False, compare=False)
-    _edge_partner_indices: numpy.ndarray | None = field(default=None, repr=False, compare=False)
-    _face_partner_indices: numpy.ndarray | None = field(default=None, repr=False, compare=False)
-    _edge_vertices: numpy.ndarray | None = field(default=None, repr=False, compare=False)
-    _loop_verts: numpy.ndarray | None = field(default=None, repr=False, compare=False)
-    _loop_starts: numpy.ndarray | None = field(default=None, repr=False, compare=False)
-    _loop_totals: numpy.ndarray | None = field(default=None, repr=False, compare=False)
+    _vertex_partner_indices: NDArray[numpy.int64] | None = field(default=None, repr=False, compare=False)
+    _edge_partner_indices: NDArray[numpy.int64] | None = field(default=None, repr=False, compare=False)
+    _face_partner_indices: NDArray[numpy.int64] | None = field(default=None, repr=False, compare=False)
+    _edge_vertices: NDArray[numpy.int64] | None = field(default=None, repr=False, compare=False)
+    _loop_verts: NDArray[numpy.int64] | None = field(default=None, repr=False, compare=False)
+    _loop_starts: NDArray[numpy.int64] | None = field(default=None, repr=False, compare=False)
+    _loop_totals: NDArray[numpy.int64] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -86,10 +90,10 @@ class ExpansionPlan:
 
 
 def _vertex_pair_arrays(
-    coords: numpy.ndarray,
+    coords: NDArray[numpy.float64],
     axis_index: int,
     tolerance: float,
-) -> tuple[dict[int, int], numpy.ndarray]:
+) -> tuple[dict[int, int], NDArray[numpy.int64]]:
     """Resolve all vertex pairs once and retain a dense partner column."""
 
     count = len(coords)
@@ -104,7 +108,7 @@ def _vertex_pair_arrays(
     return pairs, dense
 
 
-def _edge_vertex_rows(bm: bmesh.types.BMesh, mesh_object) -> numpy.ndarray:
+def _edge_vertex_rows(bm: bmesh.types.BMesh, mesh_object) -> NDArray[numpy.int64]:
     """Capture edge endpoints through Mesh bulk when its index order is safe."""
 
     count = len(bm.edges)
@@ -138,10 +142,10 @@ def _edge_vertex_rows(bm: bmesh.types.BMesh, mesh_object) -> numpy.ndarray:
 
 
 def _unique_row_partner_indices(
-    rows: numpy.ndarray,
-    mapped_rows: numpy.ndarray,
-    mapped_valid: numpy.ndarray,
-) -> numpy.ndarray:
+    rows: NDArray[numpy.int64],
+    mapped_rows: NDArray[numpy.int64],
+    mapped_valid: NDArray[numpy.bool_],
+) -> NDArray[numpy.int64]:
     """Match unordered fixed-width rows, rejecting source/destination collisions."""
 
     count, width = rows.shape
@@ -149,7 +153,7 @@ def _unique_row_partner_indices(
     if count == 0 or width == 0:
         return partners
 
-    canonical = numpy.sort(rows, axis=1)
+    canonical: numpy.ndarray = numpy.sort(rows, axis=1)
     bits_per_value = max(1, int(canonical.max(initial=0)).bit_length())
     use_packed = width * bits_per_value <= 64
     if not use_packed:
@@ -184,11 +188,11 @@ def _unique_row_partner_indices(
 
 
 def _face_partner_indices(
-    loop_verts: numpy.ndarray,
-    loop_starts: numpy.ndarray,
-    loop_totals: numpy.ndarray,
-    vertex_partners: numpy.ndarray,
-) -> numpy.ndarray:
+    loop_verts: NDArray[numpy.int64],
+    loop_starts: NDArray[numpy.int64],
+    loop_totals: NDArray[numpy.int64],
+    vertex_partners: NDArray[numpy.int64],
+) -> NDArray[numpy.int64]:
     """Build face partners in degree groups using canonical row keys."""
 
     partners = numpy.full(len(loop_starts), -1, dtype=numpy.int64)
