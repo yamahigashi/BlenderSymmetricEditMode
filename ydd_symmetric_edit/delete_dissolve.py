@@ -17,8 +17,8 @@ import numpy  # type: ignore
 from bpy.props import BoolProperty, EnumProperty, FloatProperty
 
 from . import backup, core
+from .gc_gate import gc_disabled_during_execute
 from .matching import _one_sided_pair_table
-from .operators import gc_disabled_during_execute
 from .replay import _symmetry_parameters
 from .snapshot import capture_selection_snapshot
 

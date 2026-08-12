@@ -75,6 +75,20 @@ class _ExactGeometryBatch:
         self.targets = targets
 
 
+def _face_key(
+    face: bmesh.types.BMFace,
+    axis_index: int,
+    tolerance: float,
+    *,
+    mirrored: bool,
+) -> FaceKey:
+    coordinates: list[QuantizedCoordinate] = []
+    for vertex in face.verts:
+        co = mirror_coordinate(vertex.co, axis_index) if mirrored else vertex.co
+        coordinates.append(_quantized_coordinate(co, tolerance))
+    return FaceKey(vertex_count=len(coordinates), coordinates=tuple(sorted(coordinates)))
+
+
 class FaceRegistry:
     """Resolution-free face topology and geometry indices."""
 
@@ -820,20 +834,6 @@ def _snapshot_face_map(
             if final_target_counts[counterpart] == 1
         }
     return mirror_face_ids
-
-
-def _face_key(
-    face: bmesh.types.BMFace,
-    axis_index: int,
-    tolerance: float,
-    *,
-    mirrored: bool,
-) -> FaceKey:
-    coordinates: list[QuantizedCoordinate] = []
-    for vertex in face.verts:
-        co = mirror_coordinate(vertex.co, axis_index) if mirrored else vertex.co
-        coordinates.append(_quantized_coordinate(co, tolerance))
-    return FaceKey(vertex_count=len(coordinates), coordinates=tuple(sorted(coordinates)))
 
 
 def _region_allows_orphan_self_map(

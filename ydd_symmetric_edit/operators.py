@@ -1,8 +1,6 @@
 # ruff: noqa: F401
 from __future__ import annotations
 
-import functools
-import gc
 import traceback
 from typing import TYPE_CHECKING, cast
 
@@ -28,6 +26,7 @@ from ._types import (
     ViewState,
     WindowContext,
 )
+from .gc_gate import gc_disabled_during_execute
 from .history import (
     _cleanup_object_temporary_layers,
     _history_marker_objects,
@@ -103,27 +102,6 @@ def __getattr__(name: str):
 
 def __dir__():
     return sorted(set(globals()) | _SESSION_STATE_EXPORTS)
-
-
-def gc_disabled_during_execute(execute):
-    """Disable cyclic GC for the wrapped ``execute`` body.
-
-    Saves entry state and restores only if it was enabled, so nested/
-    re-entrant calls stay idempotent. Wraps every return path, including
-    exceptions.
-    """
-
-    @functools.wraps(execute)
-    def wrapper(self, context, *args, **kwargs):
-        prior = gc.isenabled()
-        gc.disable()
-        try:
-            return execute(self, context, *args, **kwargs)
-        finally:
-            if prior:
-                gc.enable()
-
-    return wrapper
 
 
 @persistent
