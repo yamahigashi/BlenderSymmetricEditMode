@@ -9,6 +9,7 @@ from typing import Literal
 
 import bmesh
 import mathutils.geometry
+import numpy  # type: ignore
 from mathutils import Vector
 from mathutils.kdtree import KDTree
 
@@ -1342,18 +1343,43 @@ def plan_mirrored_path_crossings(
     return clusters, ""
 
 
-_VertexBinIndex = dict[QuantizedCoordinate, list[bmesh.types.BMVert]]
+_VertexBinKey = tuple[int, int, int]
+_VertexBinIndex = dict[_VertexBinKey, list[bmesh.types.BMVert]]
 
 
 def _coordinate_components_finite(co) -> bool:
     return math.isfinite(float(co[0])) and math.isfinite(float(co[1])) and math.isfinite(float(co[2]))
 
 
-def _build_crossings_vertex_bin_index(
+def _crossings_quantized_coordinate(co, tolerance: float) -> _VertexBinKey:
+    """Return the tuple bin key used exclusively by the crossings index."""
+
+    inverse = 1.0 / max(tolerance, 1.0e-12)
+    return (
+        math.floor(co[0] * inverse),
+        math.floor(co[1] * inverse),
+        math.floor(co[2] * inverse),
+    )
+
+
+def _iter_crossings_quantized_neighborhood(
+    co,
+    tolerance: float,
+) -> Iterable[_VertexBinKey]:
+    """Yield the 27 tuple bins around a crossings query coordinate."""
+
+    primary = _crossings_quantized_coordinate(co, tolerance)
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for dz in (-1, 0, 1):
+                yield (primary[0] + dx, primary[1] + dy, primary[2] + dz)
+
+
+def _build_crossings_vertex_bin_index_python(
     bm: bmesh.types.BMesh,
     tolerance: float,
 ) -> tuple[_VertexBinIndex | None, bool]:
-    """Build a primary-bin vertex index for crossings scans (§I-3a).
+    """Build a crossings vertex index with the scalar Python loop.
 
     Returns ``(index, use_fallback)``. When any live vertex coordinate or the
     tolerance is non-finite, returns ``(None, True)`` so callers fall back to
@@ -1368,9 +1394,70 @@ def _build_crossings_vertex_bin_index(
             continue
         if not _coordinate_components_finite(vertex.co):
             return None, True
-        bin_key = _quantized_coordinate(vertex.co, tolerance)
+        bin_key = _crossings_quantized_coordinate(vertex.co, tolerance)
         index.setdefault(bin_key, []).append(vertex)
     return index, False
+
+
+def _build_crossings_vertex_bin_index(
+    bm: bmesh.types.BMesh,
+    tolerance: float,
+) -> tuple[_VertexBinIndex | None, bool]:
+    """Build a crossings vertex index using a NumPy bulk coordinate read."""
+
+    if not math.isfinite(tolerance):
+        return None, True
+
+    try:
+        import bpy
+
+        tmp = bpy.data.meshes.new(".yse_tmp_index")
+        try:
+            bm.to_mesh(tmp)
+            vertex_count = len(tmp.vertices)
+            if vertex_count != len(bm.verts):
+                _LOGGER.warning("crossings vertex numpy index fallback: vertex count mismatch")
+                return _build_crossings_vertex_bin_index_python(bm, tolerance)
+
+            buf = numpy.empty(vertex_count * 3, dtype=numpy.float32)
+            tmp.vertices.foreach_get("co", buf)
+            coords = buf.reshape(vertex_count, 3).astype(numpy.float64)
+            if not numpy.isfinite(coords).all():
+                return None, True
+
+            inverse = 1.0 / max(tolerance, 1.0e-12)
+            scaled = coords * inverse
+            if numpy.abs(scaled).max() >= 2**62:
+                _LOGGER.warning("crossings vertex numpy index fallback: int64 safety range")
+                return _build_crossings_vertex_bin_index_python(bm, tolerance)
+            bins = numpy.floor(scaled).astype(numpy.int64)
+            keys = bins.tolist()
+
+            bm.verts.ensure_lookup_table()
+            if vertex_count < 8:
+                sample_indices = range(vertex_count)
+            else:
+                sample_indices = {
+                    0,
+                    vertex_count - 1,
+                    *(int(round(step * (vertex_count - 1) / 7)) for step in range(1, 7)),
+                }
+            for sample_index in sample_indices:
+                coordinate = bm.verts[sample_index].co
+                key = keys[sample_index]
+                if any(math.floor(coordinate[axis] * inverse) != key[axis] for axis in range(3)):
+                    _LOGGER.warning("crossings vertex numpy index fallback: vertex order mismatch")
+                    return _build_crossings_vertex_bin_index_python(bm, tolerance)
+
+            index: _VertexBinIndex = {}
+            for vertex, key in zip(bm.verts, keys, strict=True):
+                index.setdefault((key[0], key[1], key[2]), []).append(vertex)
+            return index, False
+        finally:
+            bpy.data.meshes.remove(tmp)
+    except Exception as exc:
+        _LOGGER.warning("crossings vertex numpy index fallback: %s", exc)
+        return _build_crossings_vertex_bin_index_python(bm, tolerance)
 
 
 def _register_crossings_vertex(
@@ -1382,7 +1469,7 @@ def _register_crossings_vertex(
 
     if not math.isfinite(tolerance) or not _coordinate_components_finite(vertex.co):
         return False
-    bin_key = _quantized_coordinate(vertex.co, tolerance)
+    bin_key = _crossings_quantized_coordinate(vertex.co, tolerance)
     index.setdefault(bin_key, []).append(vertex)
     return True
 
@@ -1397,7 +1484,7 @@ def _unregister_crossings_vertex(
 
     if not math.isfinite(tolerance) or not _coordinate_components_finite(coordinate):
         return False
-    bin_key = _quantized_coordinate(coordinate, tolerance)
+    bin_key = _crossings_quantized_coordinate(coordinate, tolerance)
     bucket = index.get(bin_key)
     if not bucket:
         return True
@@ -1423,7 +1510,7 @@ def _rebin_crossings_vertex(
         return False
     if not math.isfinite(tolerance) or not _coordinate_components_finite(new_coordinate):
         return False
-    bin_key = _quantized_coordinate(new_coordinate, tolerance)
+    bin_key = _crossings_quantized_coordinate(new_coordinate, tolerance)
     index.setdefault(bin_key, []).append(vertex)
     return True
 
@@ -1465,7 +1552,7 @@ def _scan_crossings_vertices_indexed(
         return None
     seen: set[int] = set()
     matches: list[bmesh.types.BMVert] = []
-    for bin_key in _iter_quantized_neighborhood(coordinate, tolerance):
+    for bin_key in _iter_crossings_quantized_neighborhood(coordinate, tolerance):
         for vertex in index.get(bin_key, ()):
             vertex_id = id(vertex)
             if vertex_id in seen:
