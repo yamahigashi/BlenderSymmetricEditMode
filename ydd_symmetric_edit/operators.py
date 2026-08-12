@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, cast
 import bmesh
 import bpy
 from bpy.app.handlers import persistent
-from bpy.props import StringProperty
+from bpy.props import BoolProperty, StringProperty
 
 from . import backup, core, rip, session_state
 from ._types import (
@@ -304,6 +304,11 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
     bl_idname = "mesh.ydd_symmetric_edit_finish"
     bl_label = "Apply Mirrored ydd Symmetric Edit Cut"
     bl_options = {"INTERNAL"}
+
+    if TYPE_CHECKING:
+        preserve_history_layers: bool
+    else:
+        preserve_history_layers: BoolProperty(options={"HIDDEN", "SKIP_SAVE"})
 
     @classmethod
     def poll(cls, context):
@@ -948,9 +953,11 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                             for face in bm.faces:
                                 face_id = FaceId(int(face[face_layer]))
                                 face.hide = bool(session.hidden_by_face_id.get(face_id, False))
-                    core.remove_temporary_layers(bm)
-                    # Select Mirrored runs after selection restore + layer cleanup
-                    # so it sees the final native selection and permanent topology.
+                    if not self.preserve_history_layers:
+                        core.remove_temporary_layers(bm)
+                    # Select Mirrored normally runs after layer cleanup so it sees
+                    # permanent topology. History's first F9 repair stage retains
+                    # the layers for its immediately following adjusted stage.
                     # Early returns still execute this finally (Python semantics).
                     if mirror_failure is None:
                         try:
@@ -973,7 +980,10 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
             except Exception:
                 traceback.print_exc()
             try:
-                cleanup_session(window_pointer, keep_history_record=True)
+                if self.preserve_history_layers:
+                    session_state._SESSIONS.pop(window_pointer, None)
+                else:
+                    cleanup_session(window_pointer, keep_history_record=True)
             except Exception:
                 traceback.print_exc()
 
@@ -1013,8 +1023,10 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
         return result
 
 
-def _invoke_finish_operator() -> set[str]:
+def _invoke_finish_operator(*, preserve_history_layers: bool = False) -> set[str]:
     finish_operator = getattr(bpy.ops.mesh, "ydd_symmetric_edit_finish")
+    if preserve_history_layers:
+        return cast(set[str], finish_operator("EXEC_DEFAULT", preserve_history_layers=True))
     return cast(set[str], finish_operator("EXEC_DEFAULT"))
 
 

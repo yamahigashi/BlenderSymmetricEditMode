@@ -195,6 +195,242 @@ def _history_marker_objects():
     return result
 
 
+def _edge_coordinate_signature(edge) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    coordinates = sorted((float(vertex.co[0]), float(vertex.co[1]), float(vertex.co[2])) for vertex in edge.verts)
+    return coordinates[0], coordinates[1]
+
+
+def _select_path_signatures(obj, signatures, tolerance: float, *, mark_as_path: bool = False) -> bool:
+    """Replace the edit selection with the edges matching *signatures*."""
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    matches = []
+    for signature in signatures:
+        candidates = [
+            edge
+            for edge in bm.edges
+            if all(
+                max(abs(a - b) for a, b in zip(actual, expected, strict=True)) <= tolerance
+                for actual, expected in zip(_edge_coordinate_signature(edge), signature, strict=True)
+            )
+        ]
+        if len(candidates) != 1 or candidates[0] in matches:
+            return False
+        matches.append(candidates[0])
+
+    for vertex in bm.verts:
+        vertex.select = False
+    for edge in bm.edges:
+        edge.select = False
+    for face in bm.faces:
+        face.select = False
+    for edge in matches:
+        edge.select = True
+        for vertex in edge.verts:
+            vertex.select = True
+    if mark_as_path:
+        marker_layer = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+        if marker_layer is None:
+            return False
+        for edge in matches:
+            edge[marker_layer] = 0
+    bm.select_flush_mode()
+    bm.select_history.clear()
+    for edge in matches:
+        if edge.is_valid and edge.select:
+            bm.select_history.add(edge)
+    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+    return True
+
+
+def _adjust_last_operation_repair_plan(obj, prior_record: HistoryRecord):
+    """Describe an F9 repeat that swallowed a prior selected-path repair."""
+
+    selected_path_tools = {"LOOP_CUT", "OFFSET_LOOP_CUT"}
+    if prior_record.session.tool_kind not in selected_path_tools:
+        return None
+
+    active_operator = bpy.context.active_operator
+    if active_operator is None:
+        return None
+    try:
+        active_pointer = int(active_operator.as_pointer())
+    except (AttributeError, ReferenceError, RuntimeError):
+        return None
+    active_tool_kind = _WM_OPERATOR_TO_TOOL.get(getattr(active_operator, "bl_idname", "").upper())
+    if active_tool_kind not in selected_path_tools:
+        return None
+    window_pointer = _window_key(bpy.context)
+    if prior_record.session.window_pointer != window_pointer:
+        return None
+    adjusted_records = [
+        record
+        for record in session_state._HISTORY_RECORDS.values()
+        if record is not prior_record
+        and record.status == "COMMITTED"
+        and record.sequence > prior_record.sequence
+        and record.session.tool_kind == active_tool_kind
+        and record.session.window_pointer == window_pointer
+        and record.session.object_name == obj.name
+        and record.session.mesh_name == obj.data.name
+        and record.session.native_operator_pointer == active_pointer
+    ]
+    if not adjusted_records:
+        return None
+    adjusted_record = max(adjusted_records, key=lambda record: record.sequence)
+
+    try:
+        bm = bmesh.from_edit_mesh(obj.data)
+        marker_layer = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+        if marker_layer is None:
+            return None
+        prior_edges = [edge for edge in bm.edges if int(edge[marker_layer]) == 0 and not edge.select]
+        adjusted_edges, _side, total_path_edges, _crossing_count = core.collect_source_path_edges(
+            bm,
+            adjusted_record.session.axis_index,
+            adjusted_record.session.tolerance,
+            adjusted_record.session.source_side,
+            selected_only=True,
+        )
+    except (AttributeError, ReferenceError, RuntimeError):
+        return None
+    if not prior_edges or not adjusted_edges or total_path_edges == 0:
+        return None
+    return (
+        adjusted_record,
+        tuple(_edge_coordinate_signature(edge) for edge in prior_edges),
+        tuple(_edge_coordinate_signature(edge) for edge in adjusted_edges),
+    )
+
+
+def _live_adjusted_path_face_map(bm, session: KnifeSession):
+    """Map the adjusted source carriers onto stage 1's current target faces."""
+
+    face_layer = bm.faces.layers.int.get(core.FACE_ID_LAYER)
+    if face_layer is None:
+        return None
+    source_edges, _side, total_path_edges, _crossing_count = core.collect_source_path_edges(
+        bm,
+        session.axis_index,
+        session.tolerance,
+        session.source_side,
+        selected_only=True,
+    )
+    if not source_edges or total_path_edges == 0:
+        return None
+
+    candidate_faces = {face for face in bm.faces if face.is_valid}
+    mirror_face_ids: MirrorFaceMap = {}
+    for source_edge in source_edges:
+        endpoint_face_sets = []
+        for vertex in source_edge.verts:
+            expected = core.mirror_coordinate(vertex.co, session.axis_index)
+            kind, exact_vertex, boundary_edge, _factor, _reason = core._resolve_reflected_vertex_on_target(
+                expected,
+                candidate_faces,
+                session.tolerance,
+            )
+            if kind == "exact" and exact_vertex is not None:
+                endpoint_faces = {face for face in exact_vertex.link_faces if face.is_valid}
+            elif kind == "boundary" and boundary_edge is not None:
+                endpoint_faces = {face for face in boundary_edge.link_faces if face.is_valid}
+            else:
+                return None
+            endpoint_face_sets.append(endpoint_faces)
+
+        target_faces = endpoint_face_sets[0].intersection(*endpoint_face_sets[1:])
+        if len(target_faces) != 1:
+            return None
+        target_face = next(iter(target_faces))
+        target_id = FaceId(int(target_face[face_layer]))
+        if target_id <= 0:
+            return None
+        for source_face in source_edge.link_faces:
+            if not source_face.is_valid:
+                continue
+            source_id = FaceId(int(source_face[face_layer]))
+            if source_id <= 0:
+                return None
+            # Native cuts split one prepared carrier into several descendants;
+            # all of those source IDs intentionally share its unsplit target.
+            previous = mirror_face_ids.setdefault(source_id, target_id)
+            if previous != target_id:
+                return None
+    return mirror_face_ids or None
+
+
+def _prepare_adjusted_session_face_maps(session: KnifeSession, obj, path_signatures) -> bool:
+    """Build stage 2's carrier IDs from the mesh produced by stage 1."""
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    topology = core.prepare_topology(
+        bm,
+        session.axis_index,
+        session.tolerance,
+        session.history_token,
+        mesh_object=obj,
+    )
+    # The adjusted native path makes this snapshot asymmetric, so its resolver
+    # cannot supply the mirror map. Keep only the freshly stamped ID/marker
+    # domain and derive the selected carriers geometrically below.
+    session.topology_resolution = None
+    session.mirror_face_ids = {}
+    session.carrier_frames = {}
+    session.hidden_by_face_id = topology.hidden_by_face_id
+    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+    if not _select_path_signatures(
+        obj,
+        path_signatures,
+        session.tolerance,
+        mark_as_path=True,
+    ):
+        return False
+    bm = bmesh.from_edit_mesh(obj.data)
+    live_map = _live_adjusted_path_face_map(bm, session)
+    if live_map is None:
+        return False
+    session.mirror_face_ids = live_map
+    return True
+
+
+def _restore_history_record_session(obj, record: HistoryRecord, *, adjusted_path_signatures=None):
+    try:
+        session = copy.deepcopy(record.session)
+        session.object_name = obj.name
+        session.mesh_name = obj.data.name
+        profile = TOOL_PROFILES.get(session.tool_kind)
+        if profile is not None and profile.supports_nested_offset:
+            current_symmetry = SymmetryAxes(
+                x=bool(obj.use_mesh_mirror_x),
+                y=bool(obj.use_mesh_mirror_y),
+                z=bool(obj.use_mesh_mirror_z),
+            )
+            # A raw Offset undo snapshot can contain the deliberately suspended
+            # flags. Treat that state like the tail of the original modal operation
+            # so finish restores the exact native setting captured by the session.
+            session.symmetry_suspended = current_symmetry != session.symmetry_flags
+        restored = (
+            _restore_session_face_maps(session, obj)
+            if adjusted_path_signatures is None
+            else _prepare_adjusted_session_face_maps(session, obj, adjusted_path_signatures)
+        )
+    except Exception:
+        traceback.print_exc()
+        record.status = "FAILED"
+        _cleanup_object_temporary_layers(obj)
+        return None
+    if not restored:
+        record.status = "FAILED"
+        _cleanup_repair_session(session)
+        return None
+    window, area, region = _find_saved_view(session)
+    if window is None or area is None or region is None:
+        record.status = "FAILED"
+        _cleanup_repair_session(session)
+        return None
+    return session, window, area, region
+
+
 def _repair_history_state():
     from .operators import _invoke_finish_operator
 
@@ -243,36 +479,11 @@ def _repair_history_state():
         _cleanup_object_temporary_layers(obj)
         return None
 
-    try:
-        session = copy.deepcopy(record.session)
-        session.object_name = obj.name
-        session.mesh_name = obj.data.name
-        profile = TOOL_PROFILES.get(session.tool_kind)
-        if profile is not None and profile.supports_nested_offset:
-            current_symmetry = SymmetryAxes(
-                x=bool(obj.use_mesh_mirror_x),
-                y=bool(obj.use_mesh_mirror_y),
-                z=bool(obj.use_mesh_mirror_z),
-            )
-            # A raw Offset undo snapshot can contain the deliberately suspended
-            # flags. Treat that state like the tail of the original modal operation
-            # so finish restores the exact native setting captured by the session.
-            session.symmetry_suspended = current_symmetry != session.symmetry_flags
-        restored = _restore_session_face_maps(session, obj)
-    except Exception:
-        traceback.print_exc()
-        record.status = "FAILED"
-        _cleanup_object_temporary_layers(obj)
+    repeat_plan = _adjust_last_operation_repair_plan(obj, record)
+    restored_record = _restore_history_record_session(obj, record)
+    if restored_record is None:
         return None
-    if not restored:
-        record.status = "FAILED"
-        _cleanup_repair_session(session)
-        return None
-    window, area, region = _find_saved_view(session)
-    if window is None or area is None or region is None:
-        record.status = "FAILED"
-        _cleanup_repair_session(session)
-        return None
+    session, window, area, region = restored_record
 
     # A live session may have started in this window between the undo_post
     # queueing and this timer tick.  Storing the repair session would silently
@@ -283,20 +494,68 @@ def _repair_history_state():
         return None
 
     session_state._HISTORY_REPAIR_BUSY = True  # type: ignore
+    failed_record = record
+    cleanup_snapshot = session
     try:
+        if repeat_plan is not None:
+            adjusted_record, prior_signatures, adjusted_signatures = repeat_plan
+            if not _select_path_signatures(obj, prior_signatures, session.tolerance):
+                raise RuntimeError("The prior raw cut path changed before history repair")
         session_state._SESSIONS[session.window_pointer] = session
         with bpy.context.temp_override(window=window, area=area, region=region):
-            result = _invoke_finish_operator()
+            # F9 has already moved the selection to the adjusted native path.
+            # Repair the unselected prior path under its own session first, but
+            # retain its marker maps long enough to interpret the adjusted path.
+            result = _invoke_finish_operator(preserve_history_layers=repeat_plan is not None)
         if "FINISHED" not in result:
             record.status = "FAILED"
             _cleanup_repair_session(session)
+        elif repeat_plan is not None:
+            restored_adjusted = _restore_history_record_session(
+                obj,
+                adjusted_record,
+                adjusted_path_signatures=adjusted_signatures,
+            )
+            if restored_adjusted is None:
+                # Stage 1 committed; the adjusted operation stays unmirrored and
+                # unrepairable because its layers were wiped with the failure.
+                print(
+                    "ydd Symmetric Edit: F9 repair stage 2 failed; "
+                    "the adjusted operation was left unmirrored"
+                )
+                session_state._HISTORY_RECORDS.move_to_end(token)
+                return None
+            adjusted_session, adjusted_window, adjusted_area, adjusted_region = restored_adjusted
+            failed_record = adjusted_record
+            cleanup_snapshot = adjusted_session
+            if adjusted_session.window_pointer in session_state._SESSIONS:
+                # A live session appeared during stage 1.  The mesh keeps the
+                # adjusted token layers, so the next repair tick can retry this
+                # record as an ordinary single-token candidate.
+                session_state._HISTORY_RECORDS.move_to_end(token)
+                return None
+            session_state._SESSIONS[adjusted_session.window_pointer] = adjusted_session
+            with bpy.context.temp_override(
+                window=adjusted_window,
+                area=adjusted_area,
+                region=adjusted_region,
+            ):
+                # Normal finish performs the final layer cleanup.  Moving the
+                # adjusted record last preserves chronological bookkeeping.
+                adjusted_result = _invoke_finish_operator()
+            if "FINISHED" not in adjusted_result:
+                adjusted_record.status = "FAILED"
+                _cleanup_repair_session(adjusted_session)
+            session_state._HISTORY_RECORDS.move_to_end(token)
+            session_state._HISTORY_RECORDS.move_to_end(adjusted_session.history_token)
     except Exception:
         traceback.print_exc()
-        record.status = "FAILED"
-        _cleanup_repair_session(session)
+        failed_record.status = "FAILED"
+        _cleanup_repair_session(cleanup_snapshot)
     finally:
         session_state._HISTORY_REPAIR_BUSY = False
-    session_state._HISTORY_RECORDS.move_to_end(token)
+    if repeat_plan is None:
+        session_state._HISTORY_RECORDS.move_to_end(token)
     return None
 
 

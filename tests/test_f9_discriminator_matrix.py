@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""GUI acceptance: F9 discriminator state matrix (§C-1) and multi-token repair (§C-2).
+"""GUI acceptance: F9 discriminator, multi-token, and prior-raw two-stage repair.
 
 Run::
 
     cmd.exe /c run_gui_test.bat 52 test_f9_discriminator_matrix.py
     cmd.exe /c run_gui_test.bat 42 test_f9_discriminator_matrix.py
 
-Contract: .agents/doc/f9_discriminator_fix_plan_2026-08-09.md §A / §C-1 / §C-2.
+Contracts: .agents/doc/f9_discriminator_fix_plan_2026-08-09.md §A / §C-1 / §C-2
+and .agents/doc/fix_contract_f9_prior_mirror_2026-08-12.md R1-R5.
 Pattern: paint mesh state → call operators._prepare_adjust_last_operation_repeat()
 (or _repair_history_state) → assert return / sessions / repair queue.
 """
@@ -419,7 +420,7 @@ def reset_to_dual_quads(obj) -> None:
     bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=True)
 
 
-def source_cut_left_vertical(obj) -> None:
+def source_cut_left_vertical(obj, *, extend_selection: bool = False) -> None:
     """Split the left-side face with a vertical path (asymmetric raw cut).
 
     LOOP_CUT finish discovers path edges with selected_only=True, so the new
@@ -447,12 +448,13 @@ def source_cut_left_vertical(obj) -> None:
     face = next(face for face in bm.faces if a in face.verts and b in face.verts)
     bmesh.utils.face_split(face, a, b)
     path_edge = bm.edges.get((a, b))
-    for edge in bm.edges:
-        edge.select = False
-    for vertex in bm.verts:
-        vertex.select = False
-    for face_item in bm.faces:
-        face_item.select = False
+    if not extend_selection:
+        for edge in bm.edges:
+            edge.select = False
+        for vertex in bm.verts:
+            vertex.select = False
+        for face_item in bm.faces:
+            face_item.select = False
     if path_edge is not None:
         path_edge.select = True
         for vertex in path_edge.verts:
@@ -494,6 +496,19 @@ def temporary_layers_present(obj) -> bool:
             (bm.faces.layers.int, core.HISTORY_TOKEN_LAYER),
         )
     )
+
+
+def vertical_path_x_counts(obj) -> dict[float, int]:
+    bm = bmesh.from_edit_mesh(obj.data)
+    counts: dict[float, int] = {}
+    for edge in bm.edges:
+        x_values = [round(float(vertex.co.x), 6) for vertex in edge.verts]
+        y_values = sorted(round(float(vertex.co.y), 6) for vertex in edge.verts)
+        if x_values[0] != x_values[1] or y_values != [-1.0, 1.0]:
+            continue
+        x = x_values[0]
+        counts[x] = counts.get(x, 0) + 1
+    return counts
 
 
 def run_repair_cases() -> None:
@@ -557,6 +572,143 @@ def run_repair_cases() -> None:
         record_case("repair_own_raw_plus_foreign", False)
         raise
     finally:
+        cleanup_after_case(keep_history_record=True)
+
+    # --- Case: F9 native repeat swallowed the prior raw repair ---
+    STATE["phase"] = "repair:f9_prior_raw_then_adjusted"
+    cleanup_after_case(keep_history_record=True)
+    adjusted_token = None
+    original_invoke_finish = operators._invoke_finish_operator
+    original_prior_pointer = record.session.native_operator_pointer
+    original_history_sequence = session_state._HISTORY_SEQUENCE
+    try:
+        active_operator = bpy.context.active_operator
+        assert active_operator is not None
+        adjusted_pointer = int(active_operator.as_pointer())
+        prior_pointer = adjusted_pointer + 1
+        record.session.native_operator_pointer = prior_pointer
+        assert adjusted_pointer != prior_pointer
+        adjusted_token = operators._new_history_token()
+
+        # Capture the adjusted record from the original timeline: op1 is fully
+        # mirrored before op2 prepares its own unique face-ID domain.
+        reset_to_dual_quads(obj)
+        bm = bmesh.from_edit_mesh(obj.data)
+        prior_topology = core.prepare_topology(bm, 0, 1.0e-5, own)
+        assert prior_topology.matched_faces > 0
+        bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+        source_cut_left_vertical(obj)
+        operators._repair_history_state()
+        cancel_repair_queue()
+        assert mesh_is_symmetric(obj)
+        bm = bmesh.from_edit_mesh(obj.data)
+        adjusted_topology = core.prepare_topology(bm, 0, 1.0e-5, adjusted_token)
+        assert adjusted_topology.matched_faces > 0
+        bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+
+        adjusted_session = copy.deepcopy(record.session)
+        adjusted_session.history_token = adjusted_token
+        adjusted_session.native_operator_pointer = adjusted_pointer
+        adjusted_session.topology_resolution = adjusted_topology.topology_resolution
+        adjusted_session.hidden_by_face_id = adjusted_topology.hidden_by_face_id
+        adjusted_session.mirror_face_ids = {}
+        adjusted_session.carrier_frames = {}
+        adjusted_sequence = original_history_sequence + 1
+        session_state._HISTORY_SEQUENCE = adjusted_sequence
+        operators._HISTORY_RECORDS[adjusted_token] = HistoryRecord(
+            session=adjusted_session,
+            status="COMMITTED",
+            sequence=adjusted_sequence,
+        )
+
+        reset_to_dual_quads(obj)
+        bm = bmesh.from_edit_mesh(obj.data)
+        topology_prep = core.prepare_topology(bm, 0, 1.0e-5, own)
+        assert topology_prep.matched_faces > 0
+        bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+        source_cut_left_vertical(obj)  # prior raw path at x=-1.5
+        source_cut_left_vertical(obj)  # adjusted native repeat path at x=-1.75
+        source_cut_left_vertical(obj, extend_selection=True)  # second adjusted path at x=-1.875
+
+        bm = bmesh.from_edit_mesh(obj.data)
+        marker_layer = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+        assert marker_layer is not None
+        assert any(int(edge[marker_layer]) == 0 and not edge.select for edge in bm.edges)
+        assert any(int(edge[marker_layer]) == 0 and edge.select for edge in bm.edges)
+
+        finish_calls = []
+        adjusted_live_maps = []
+
+        def traced_invoke_finish(*, preserve_history_layers=False):
+            live_session = operators._SESSIONS[STATE["window"].as_pointer()]
+            finish_calls.append((live_session.history_token, preserve_history_layers))
+            if live_session.history_token == adjusted_token:
+                live_bm = bmesh.from_edit_mesh(obj.data)
+                face_layer = live_bm.faces.layers.int.get(core.FACE_ID_LAYER)
+                assert face_layer is not None
+                source_edges, _side, total_path_edges, _crossing_count = core.collect_source_path_edges(
+                    live_bm,
+                    live_session.axis_index,
+                    live_session.tolerance,
+                    live_session.source_side,
+                    selected_only=True,
+                )
+                source_ids = {
+                    int(face[face_layer])
+                    for edge in source_edges
+                    for face in edge.link_faces
+                    if face.is_valid
+                }
+                live_ids = {int(face[face_layer]) for face in live_bm.faces}
+                target_ids = {int(live_session.mirror_face_ids[source_id]) for source_id in source_ids}
+                assert total_path_edges > 0 and source_ids
+                assert live_session.topology_resolution is None
+                assert source_ids.issubset(live_session.mirror_face_ids)
+                assert target_ids.issubset(live_ids)
+                assert len(source_ids) == 3 and len(target_ids) == 1
+                adjusted_live_maps.append((source_ids, target_ids))
+            return original_invoke_finish(preserve_history_layers=preserve_history_layers)
+
+        operators._invoke_finish_operator = traced_invoke_finish
+        operators._repair_history_state()
+        cancel_repair_queue()
+
+        assert finish_calls == [(own, True), (adjusted_token, False)], finish_calls
+        assert len(adjusted_live_maps) == 1, adjusted_live_maps
+        counts = vertical_path_x_counts(obj)
+        assert counts.get(-1.5) == 1 and counts.get(1.5) == 1, counts
+        assert counts.get(-1.75) == 1 and counts.get(1.75) == 1, counts
+        assert counts.get(-1.875) == 1 and counts.get(1.875) == 1, counts
+        assert operators._HISTORY_RECORDS[own].status == "COMMITTED"
+        assert operators._HISTORY_RECORDS[adjusted_token].status == "COMMITTED"
+        assert operators._HISTORY_RECORDS[own].session.history_token == own
+        assert operators._HISTORY_RECORDS[adjusted_token].session.history_token == adjusted_token
+        assert operators._HISTORY_RECORDS[own].session.native_operator_pointer == prior_pointer
+        assert operators._HISTORY_RECORDS[adjusted_token].session.native_operator_pointer == adjusted_pointer
+        assert operators._HISTORY_RECORDS[adjusted_token].session.topology_resolution is not None
+        assert operators._HISTORY_RECORDS[own].sequence < operators._HISTORY_RECORDS[adjusted_token].sequence
+        assert operators._HISTORY_RECORDS[adjusted_token].sequence == session_state._HISTORY_SEQUENCE
+        assert list(operators._HISTORY_RECORDS)[-2:] == [own, adjusted_token]
+        latest_active_record = next(
+            candidate
+            for candidate in reversed(tuple(operators._HISTORY_RECORDS.values()))
+            if candidate.status == "COMMITTED"
+            and candidate.session.native_operator_pointer == adjusted_pointer
+        )
+        assert latest_active_record is operators._HISTORY_RECORDS[adjusted_token]
+        assert not operators._object_history_tokens(obj)
+        assert not temporary_layers_present(obj)
+        assert not operators._SESSIONS
+        record_case("repair_f9_prior_raw_then_adjusted", True)
+    except Exception:
+        record_case("repair_f9_prior_raw_then_adjusted", False)
+        raise
+    finally:
+        operators._invoke_finish_operator = original_invoke_finish
+        record.session.native_operator_pointer = original_prior_pointer
+        session_state._HISTORY_SEQUENCE = original_history_sequence
+        if adjusted_token is not None:
+            operators._HISTORY_RECORDS.pop(adjusted_token, None)
         cleanup_after_case(keep_history_record=True)
 
     # --- Case: two COMMITTED tokens mixed → cleanup-only ---
