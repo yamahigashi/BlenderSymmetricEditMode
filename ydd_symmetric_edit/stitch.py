@@ -148,9 +148,27 @@ def _discover_path_edges(
         return []
 
     face_layer = bm.faces.layers.int.get(FACE_ID_LAYER)
-    if selected_only:
-        return [edge for edge in bm.edges if edge.select and _is_path_edge_by_markers(edge, edge_layer, face_layer)]
-    return [edge for edge in bm.edges if _is_path_edge_by_markers(edge, edge_layer, face_layer)]
+    result: list[bmesh.types.BMEdge] = []
+    for edge in bm.edges:
+        if selected_only and not edge.select:
+            continue
+        if edge[edge_layer] == 0:
+            result.append(edge)
+            continue
+        if face_layer is None:
+            continue
+        faces = edge.link_faces
+        count = len(faces)
+        if count < 2:
+            continue
+        first = faces[0][face_layer]
+        if count == 2:
+            if faces[1][face_layer] == first:
+                result.append(edge)
+            continue
+        if all(face[face_layer] == first for face in faces):
+            result.append(edge)
+    return result
 
 
 def path_ring_includes_pre_hidden_edges(bm: bmesh.types.BMesh) -> bool:
