@@ -243,7 +243,9 @@ def restore_selection_for_route(
 ) -> bool:
     """Apply the production restore gate and return whether it was scoped."""
 
-    hidden_state = selection_snapshot.saved_hidden_state_present
+    # getattr, not direct access: instances built by the pre-field class can
+    # survive an addon reload and lack the attribute entirely.
+    hidden_state = getattr(selection_snapshot, "saved_hidden_state_present", None)
     if hidden_state is None:
         # Compatibility for snapshots made before C7-4's additive bit.
         hidden_state = saved_hidden_state_present(bm)
