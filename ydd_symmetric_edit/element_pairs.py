@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 import bmesh
-import numpy  # type: ignore
+import numpy
 
 from . import matching
 from .matching import _one_sided_pair_table
@@ -151,13 +151,20 @@ def _unique_row_partner_indices(
 
     canonical = numpy.sort(rows, axis=1)
     bits_per_value = max(1, int(canonical.max(initial=0)).bit_length())
-    if width * bits_per_value <= 64:
-        keys = numpy.zeros(count, dtype=numpy.uint64)
-        for column in canonical.T:
-            keys = (keys << bits_per_value) | column.astype(numpy.uint64)
-    else:
+    use_packed = width * bits_per_value <= 64
+    if not use_packed:
         row_dtype = numpy.dtype((numpy.void, canonical.dtype.itemsize * width))
-        keys = numpy.ascontiguousarray(canonical).view(row_dtype).reshape(-1)
+
+    def _row_keys(rows_sorted: numpy.ndarray, *, clamp: bool) -> numpy.ndarray:
+        if use_packed:
+            keys = numpy.zeros(count, dtype=numpy.uint64)
+            for column in rows_sorted.T:
+                values = numpy.maximum(column, 0) if clamp else column
+                keys = (keys << bits_per_value) | values.astype(numpy.uint64)
+            return keys
+        return numpy.ascontiguousarray(rows_sorted).view(row_dtype).reshape(-1)
+
+    keys = _row_keys(canonical, clamp=False)
     unique_keys, first_rows, inverse, counts = numpy.unique(
         keys,
         return_index=True,
@@ -166,12 +173,7 @@ def _unique_row_partner_indices(
     )
 
     mapped = numpy.sort(mapped_rows, axis=1)
-    if width * bits_per_value <= 64:
-        mapped_keys = numpy.zeros(count, dtype=numpy.uint64)
-        for column in mapped.T:
-            mapped_keys = (mapped_keys << bits_per_value) | numpy.maximum(column, 0).astype(numpy.uint64)
-    else:
-        mapped_keys = numpy.ascontiguousarray(mapped).view(row_dtype).reshape(-1)
+    mapped_keys = _row_keys(mapped, clamp=True)
     destinations = numpy.searchsorted(unique_keys, mapped_keys)
     clipped = numpy.minimum(destinations, max(len(unique_keys) - 1, 0))
     found = (destinations < len(unique_keys)) & (unique_keys[clipped] == mapped_keys)

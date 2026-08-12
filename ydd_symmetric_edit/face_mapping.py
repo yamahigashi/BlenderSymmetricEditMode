@@ -5,7 +5,7 @@ from collections.abc import Mapping, Sequence
 from typing import cast
 
 import bmesh
-import numpy  # type: ignore
+import numpy
 from mathutils import Vector
 
 from ._types import (
@@ -445,7 +445,7 @@ class FaceRegistry:
         self._ensure_geometry_index()
         if self._coordinates is None:
             self._coordinates = tuple((float(row[0]), float(row[1]), float(row[2])) for row in self.coords64.tolist())
-        coordinates = cast(tuple[tuple[float, float, float], ...], self._coordinates)
+        coordinates = self._coordinates
         values = tuple(coordinates[vertex_id] for vertex_id in self.vertices(face_id))
         if not mirrored:
             return values
@@ -974,7 +974,8 @@ def _canonical_carrier_frames(
     by_orbit: dict[tuple[int, int], list[tuple[FaceId, CarrierFrameSnapshot]]] = defaultdict(list)
     for face_id in carrier_ids:
         mirrored = mirror_face_ids.get(face_id, face_id)
-        orbit = tuple(sorted((int(face_id), int(mirrored))))
+        first, second = int(face_id), int(mirrored)
+        orbit = (first, second) if first <= second else (second, first)
         frame = carrier_frames.get(face_id)
         if frame is None:
             return [], "a mirrored cut carrier has no pre-native canonical frame"
@@ -993,5 +994,5 @@ def _canonical_carrier_frames(
         if frame.normal is None or frame.basis_u is None:
             return [], "a mirrored cut carrier has a degenerate canonical frame"
         selected.append(frame)
-    selected.sort(key=lambda frame: (frame.origin.as_tuple(), frame.normal.as_tuple()))
+    selected.sort(key=lambda frame: (frame.origin.as_tuple(), cast(Coordinate3D, frame.normal).as_tuple()))
     return selected, ""

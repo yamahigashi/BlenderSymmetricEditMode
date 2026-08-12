@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import cast
 
 import bmesh
-import numpy  # type: ignore
+import numpy
 from mathutils import Vector
 
 from ._types import (

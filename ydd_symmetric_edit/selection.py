@@ -4,7 +4,7 @@ from collections.abc import Iterable
 from typing import cast
 
 import bmesh
-import numpy  # type: ignore
+import numpy
 from mathutils import Vector
 
 from ._types import (
@@ -115,10 +115,8 @@ def add_selection_layers(bm: bmesh.types.BMesh) -> SelectionSnapshot:
         path_edges_selected=path_edges_selected,
         path_faces_selected=path_faces_selected,
         history=history,
+        saved_hidden_state_present=saved_hidden_state_present,
     )
-    # SelectionSnapshot is intentionally not slotted for compatibility with
-    # older callers; retain the hidden-state bit as an additive attribute.
-    snapshot.saved_hidden_state_present = saved_hidden_state_present
     return snapshot
 
 
@@ -245,7 +243,7 @@ def restore_selection_for_route(
 ) -> bool:
     """Apply the production restore gate and return whether it was scoped."""
 
-    hidden_state = getattr(selection_snapshot, "saved_hidden_state_present", None)
+    hidden_state = selection_snapshot.saved_hidden_state_present
     if hidden_state is None:
         # Compatibility for snapshots made before C7-4's additive bit.
         hidden_state = saved_hidden_state_present(bm)

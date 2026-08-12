@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, overload
 
 import bmesh
 import mathutils.geometry
@@ -668,6 +668,26 @@ def reflected_path_uses_only_target_boundaries(
     return not chain_reason
 
 
+@overload
+def apply_reflected_path_topology(
+    bm: bmesh.types.BMesh,
+    source_edges: Iterable[bmesh.types.BMEdge],
+    axis_index: int,
+    tolerance: float,
+    mirror_face_ids: MirrorFaceMap,
+    *,
+    return_summary: Literal[False] = ...,
+) -> tuple[int, int, str]: ...
+@overload
+def apply_reflected_path_topology(
+    bm: bmesh.types.BMesh,
+    source_edges: Iterable[bmesh.types.BMEdge],
+    axis_index: int,
+    tolerance: float,
+    mirror_face_ids: MirrorFaceMap,
+    *,
+    return_summary: Literal[True],
+) -> tuple[int, int, str, stitch_common.SelectionMutationSummary]: ...
 def apply_reflected_path_topology(
     bm: bmesh.types.BMesh,
     source_edges: Iterable[bmesh.types.BMEdge],

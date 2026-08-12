@@ -5,10 +5,10 @@ import math
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, overload
 
 import bmesh
-import numpy  # type: ignore
+import numpy
 from mathutils import Vector
 
 from . import stitch_common
@@ -803,6 +803,22 @@ class CrossingMutationSummary:
     selection_mutations: stitch_common.SelectionMutationSummary = field(default_factory=stitch_common.SelectionMutationSummary)
 
 
+@overload
+def apply_mirrored_path_crossings(
+    bm: bmesh.types.BMesh,
+    plan: Sequence[_MirroredPathCrossingCluster],
+    *,
+    cache_positions: Mapping[int, int] | None = ...,
+    return_summary: Literal[False] = ...,
+) -> tuple[int, str]: ...
+@overload
+def apply_mirrored_path_crossings(
+    bm: bmesh.types.BMesh,
+    plan: Sequence[_MirroredPathCrossingCluster],
+    *,
+    cache_positions: Mapping[int, int] | None = ...,
+    return_summary: Literal[True],
+) -> tuple[int, str, CrossingMutationSummary]: ...
 def apply_mirrored_path_crossings(
     bm: bmesh.types.BMesh,
     plan: Sequence[_MirroredPathCrossingCluster],

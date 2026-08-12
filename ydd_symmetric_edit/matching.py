@@ -5,7 +5,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from typing import Literal
 
-import numpy  # type: ignore
+import numpy
 from mathutils import Vector
 from mathutils.kdtree import KDTree
 
@@ -185,7 +185,7 @@ class VertexMirrorLookup:
 
         return abs(co[self._axis_index]) <= self._tolerance
 
-    def find_all_mirrored(self, coords: Sequence[Vector]) -> tuple[int | None, ...]:
+    def find_all_mirrored(self, coords: Sequence[Vector] | numpy.ndarray) -> tuple[int | None, ...]:
         """Injective assignment of registered vertices to each coord's mirror image.
 
         Unlike per-query :meth:`find`, no two queries can resolve to the same
@@ -247,7 +247,7 @@ class VertexMirrorLookup:
                 results[query_index] = target
         return tuple(results)
 
-    def find_all_direct(self, coords: Sequence[Vector]) -> tuple[int | None, ...]:
+    def find_all_direct(self, coords: Sequence[Vector] | numpy.ndarray) -> tuple[int | None, ...]:
         """Injective assignment of registered vertices to each coordinate itself.
 
         No reflection is applied; this replaces the historical
@@ -258,7 +258,7 @@ class VertexMirrorLookup:
         return tuple(self._resolve_injective(query if query is not None else list(coords)))
 
     @staticmethod
-    def _query_matrix(coords: Sequence) -> numpy.ndarray | None:
+    def _query_matrix(coords: Sequence | numpy.ndarray) -> numpy.ndarray | None:
         """Vectorized float64 image of *coords*, or ``None`` when unconvertible."""
 
         if len(coords) == 0:
@@ -299,7 +299,7 @@ class VertexMirrorLookup:
 
     def _resolve_injective(
         self,
-        positions: Sequence,
+        positions: Sequence | numpy.ndarray,
         plane_side: bool | None = None,
     ) -> list[int | None]:
         """Solve an injective nearest assignment for a list of query positions.
@@ -436,7 +436,7 @@ class VertexMirrorLookup:
         self._batch_index = cached
         return cached
 
-    def _batch_candidate_arrays(self, positions: Sequence, plane_side: bool | None):
+    def _batch_candidate_arrays(self, positions: Sequence | numpy.ndarray, plane_side: bool | None):
         """Sorted (query, registered, distance) candidate arrays, or ``None``."""
 
         if isinstance(positions, numpy.ndarray) and positions.dtype == numpy.float64:
@@ -1137,7 +1137,7 @@ def _one_sided_pair_table(coords64: numpy.ndarray, axis_index: int, tolerance: f
 
 
 def build_vertex_mirror_lookup(
-    coords: Sequence[Vector],
+    coords: Sequence[Vector] | numpy.ndarray,
     axis_index: int,
     tolerance: float,
 ) -> VertexMirrorLookup:
@@ -1153,7 +1153,7 @@ def build_vertex_mirror_lookup(
 
 def _vertex_pair_table_from_lookup(
     lookup: VertexMirrorLookup,
-    coords: Sequence[Vector],
+    coords: Sequence[Vector] | numpy.ndarray,
 ) -> dict[int, int]:
     assigned = lookup.find_all_mirrored(coords)
     pairs: dict[int, int] = {}
@@ -1166,7 +1166,7 @@ def _vertex_pair_table_from_lookup(
 
 
 def build_vertex_pair_table(
-    coords: Sequence[Vector],
+    coords: Sequence[Vector] | numpy.ndarray,
     axis_index: int,
     tolerance: float,
 ) -> dict[int, int]:
@@ -1182,7 +1182,7 @@ def build_vertex_pair_table(
 
 
 def classify_selection_overlap(
-    coords: Sequence[Vector],
+    coords: Sequence[Vector] | numpy.ndarray,
     selected_indices: Iterable[int],
     *,
     axis_index: int,

@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from mathutils import Quaternion, Vector
 
     from .matching import VertexMirrorLookup
-    from .snapshot import LazyTopologyResolution
+    from .snapshot import LazyCarrierFrameMap, LazyTopologyResolution
 
 
 FaceId = NewType("FaceId", int)
@@ -73,7 +73,7 @@ class CarrierFrameSnapshot:
     deviation: float
 
 
-CarrierFrameMap: TypeAlias = Mapping[FaceId, CarrierFrameSnapshot]
+CarrierFrameMap: TypeAlias = "Mapping[FaceId, CarrierFrameSnapshot] | LazyCarrierFrameMap"
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -360,6 +360,7 @@ class SelectionSnapshot:
     path_edges_selected: bool
     path_faces_selected: bool
     history: SelectionHistory
+    saved_hidden_state_present: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)

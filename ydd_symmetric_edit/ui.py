@@ -109,8 +109,9 @@ class VIEW3D_PT_ydd_symmetric_edit(bpy.types.Panel):
 
     def draw_header(self, context):
         preferences = get_addon_preferences(context)
-        if preferences is not None:
-            self.layout.prop(preferences, "enabled", text="")
+        layout = self.layout
+        if preferences is not None and layout is not None:
+            layout.prop(preferences, "enabled", text="")
 
     def draw(self, context):
         layout = self.layout

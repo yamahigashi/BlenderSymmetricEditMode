@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, cast
 
 import bmesh
 import bpy
-import numpy  # type: ignore
+import numpy
 from bpy.props import EnumProperty, FloatProperty
 from mathutils import Vector
 

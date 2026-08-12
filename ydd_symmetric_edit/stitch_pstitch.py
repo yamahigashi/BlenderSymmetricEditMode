@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from typing import Literal, overload
 
 import bmesh
 from mathutils import Vector
@@ -35,6 +36,24 @@ def plane_intersection_of_edge(
     return point, factor
 
 
+@overload
+def apply_crosses_p_stitch(
+    bm: bmesh.types.BMesh,
+    crosses_edges: Iterable[bmesh.types.BMEdge],
+    axis_index: int,
+    tolerance: float,
+    *,
+    return_summary: Literal[False] = ...,
+) -> tuple[int, str]: ...
+@overload
+def apply_crosses_p_stitch(
+    bm: bmesh.types.BMesh,
+    crosses_edges: Iterable[bmesh.types.BMEdge],
+    axis_index: int,
+    tolerance: float,
+    *,
+    return_summary: Literal[True],
+) -> tuple[int, str, stitch_common.SelectionMutationSummary]: ...
 def apply_crosses_p_stitch(
     bm: bmesh.types.BMesh,
     crosses_edges: Iterable[bmesh.types.BMEdge],

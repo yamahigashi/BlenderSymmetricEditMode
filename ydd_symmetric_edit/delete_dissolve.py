@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Literal, cast
 
 import bmesh
 import bpy
-import numpy  # type: ignore
+import numpy
 from bpy.props import BoolProperty, EnumProperty, FloatProperty
 
 from . import backup, element_pairs, layer_names, snapshot
