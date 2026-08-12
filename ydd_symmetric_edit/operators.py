@@ -1,6 +1,8 @@
 # ruff: noqa: F401
 from __future__ import annotations
 
+import functools
+import gc
 import traceback
 from typing import TYPE_CHECKING, cast
 
@@ -101,6 +103,27 @@ def __getattr__(name: str):
 
 def __dir__():
     return sorted(set(globals()) | _SESSION_STATE_EXPORTS)
+
+
+def gc_disabled_during_execute(execute):
+    """Disable cyclic GC for the wrapped ``execute`` body.
+
+    Saves entry state and restores only if it was enabled, so nested/
+    re-entrant calls stay idempotent. Wraps every return path, including
+    exceptions.
+    """
+
+    @functools.wraps(execute)
+    def wrapper(self, context, *args, **kwargs):
+        prior = gc.isenabled()
+        gc.disable()
+        try:
+            return execute(self, context, *args, **kwargs)
+        finally:
+            if prior:
+                gc.enable()
+
+    return wrapper
 
 
 @persistent
@@ -314,6 +337,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
     def poll(cls, context):
         return _single_edit_mesh_poll(context)
 
+    @gc_disabled_during_execute
     def execute(self, context):
         session_state._FINISH_REPORTS.clear()
         window_pointer = _window_key(context)

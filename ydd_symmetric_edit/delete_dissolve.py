@@ -18,6 +18,7 @@ from bpy.props import BoolProperty, EnumProperty, FloatProperty
 
 from . import backup, core
 from .matching import _one_sided_pair_table
+from .operators import gc_disabled_during_execute
 from .replay import _symmetry_parameters
 from .snapshot import capture_selection_snapshot
 
@@ -850,6 +851,7 @@ class MESH_OT_ydd_symmetric_edit_delete(bpy.types.Operator):
         delete_type = cast(_DeleteType, self.type)
         return cast(set[str], bpy.ops.mesh.delete(type=delete_type))
 
+    @gc_disabled_during_execute
     def execute(self, context):
         _DELETE_REPORTS.clear()
 
@@ -1030,6 +1032,7 @@ class MESH_OT_ydd_symmetric_edit_dissolve(bpy.types.Operator):
     def _native(self) -> set[str]:
         return _native_dissolve_call(cast(_DissolveMode, self.mode), self._options())
 
+    @gc_disabled_during_execute
     def execute(self, context):
         _DELETE_REPORTS.clear()
 
@@ -1162,6 +1165,7 @@ class MESH_OT_ydd_symmetric_edit_edge_collapse(bpy.types.Operator):
     def _native(self) -> set[str]:
         return _native_edge_collapse_call()
 
+    @gc_disabled_during_execute
     def execute(self, context):
         _DELETE_REPORTS.clear()
 
@@ -1291,6 +1295,7 @@ class MESH_OT_ydd_symmetric_edit_delete_edgeloop(bpy.types.Operator):
     def _native(self) -> set[str]:
         return _native_delete_edgeloop_call(self._options())
 
+    @gc_disabled_during_execute
     def execute(self, context):
         _DELETE_REPORTS.clear()
 
@@ -1444,6 +1449,7 @@ class MESH_OT_ydd_symmetric_edit_dissolve_mode(bpy.types.Operator):
         if _native_dissolve_mode_has("use_preserve_quads"):
             layout.prop(self, "use_preserve_quads")
 
+    @gc_disabled_during_execute
     def execute(self, context):
         mode = _dissolve_mode_from_select_mode(context.tool_settings.mesh_select_mode)
         kwargs: dict = {"mode": mode}
