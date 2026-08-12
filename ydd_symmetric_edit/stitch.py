@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 import bmesh
+import mathutils.geometry
 from mathutils import Vector
 from mathutils.kdtree import KDTree
 
@@ -1532,6 +1533,440 @@ def _resolve_reflected_vertex_on_target(
     return "boundary", None, target_edge, factor, ""
 
 
+def _face_surface_triangles(face: bmesh.types.BMFace):
+    """Valid tessellation triangles covering the (possibly curved) face.
+
+    Only tris and quads are covered.  A quad diagonal is valid only when its
+    two triangles wind consistently — on a concave or folded quad the other
+    diagonal spans area outside the real surface and must not be offered.
+    N-gons are not covered at all: their interior-chain acceptance is declined
+    so those strokes keep using the projection fallback.
+    """
+
+    vertices = face.verts
+    count = len(vertices)
+    if count == 3:
+        yield vertices[0].co, vertices[1].co, vertices[2].co
+        return
+    if count == 4:
+        for a, b, c, d in ((0, 1, 2, 3), (1, 2, 3, 0)):
+            first = (vertices[b].co - vertices[a].co).cross(vertices[c].co - vertices[a].co)
+            second = (vertices[c].co - vertices[a].co).cross(vertices[d].co - vertices[a].co)
+            if first.dot(second) <= 0.0:
+                continue
+            yield vertices[a].co, vertices[b].co, vertices[c].co
+            yield vertices[a].co, vertices[c].co, vertices[d].co
+        return
+    # Boundary splits routinely turn carrier quads into n-gons.  Ear clipping
+    # respects concavity, so no triangle spans area outside the real polygon.
+    coordinates = [vertex.co for vertex in vertices]
+    for tri_a, tri_b, tri_c in mathutils.geometry.tessellate_polygon([coordinates]):
+        yield coordinates[tri_a], coordinates[tri_b], coordinates[tri_c]
+
+
+def _point_strictly_inside_face(
+    point: Vector,
+    face: bmesh.types.BMFace,
+    tolerance: float,
+) -> bool:
+    """True when *point* lies on the face surface, away from its boundary.
+
+    Curved-surface faces are not planar, so containment is measured as the
+    distance to the face's tessellation triangles instead of a single median
+    plane with a normal-projected polygon test.
+    """
+
+    if not face.is_valid:
+        return False
+    surface_limit = max(tolerance * 2.0, 1.0e-9)
+    if any(coordinates_match(vertex.co, point, tolerance) for vertex in face.verts):
+        return False
+    edge_limit = max(tolerance * 2.0, 1.0e-9)
+    for edge in face.edges:
+        if not edge.is_valid:
+            continue
+        distance, factor = _point_segment_distance_and_factor(point, edge)
+        if distance <= edge_limit and _is_interior_edge_factor(factor, edge.calc_length(), tolerance):
+            return False
+    for corner_a, corner_b, corner_c in _face_surface_triangles(face):
+        closest = mathutils.geometry.closest_point_on_tri(point, corner_a, corner_b, corner_c)
+        if (closest - point).length <= surface_limit:
+            return True
+    return False
+
+
+def _interior_faces_for_point(
+    point: Vector,
+    candidate_faces: set[bmesh.types.BMFace],
+    tolerance: float,
+) -> list[bmesh.types.BMFace]:
+    return sorted(
+        (
+            face
+            for face in candidate_faces
+            if face.is_valid and _point_strictly_inside_face(point, face, tolerance)
+        ),
+        key=lambda face: face.index,
+    )
+
+
+def _path_adjacency(edge_records: list[tuple[int, int, set[FaceId]]]) -> dict[int, set[int]]:
+    adjacency: dict[int, set[int]] = defaultdict(set)
+    for source_a, source_b, _target_ids in edge_records:
+        adjacency[source_a].add(source_b)
+        adjacency[source_b].add(source_a)
+    return adjacency
+
+
+@dataclass(frozen=True, slots=True)
+class _InteriorChain:
+    """A maximal interior terminal chain accepted by the direct topology path."""
+
+    members: tuple[int, ...]
+    end_a: int
+    end_b: int
+    target_face_id: FaceId
+
+
+def _faces_supporting_resolution(
+    kind: str,
+    exact_vertex: bmesh.types.BMVert | None,
+    target_edge: bmesh.types.BMEdge | None,
+    interior_face: bmesh.types.BMFace | None,
+    candidate_faces: set[bmesh.types.BMFace],
+) -> set[bmesh.types.BMFace]:
+    if kind == "exact":
+        assert exact_vertex is not None
+        return {face for face in exact_vertex.link_faces if face.is_valid and face in candidate_faces}
+    if kind == "boundary":
+        assert target_edge is not None
+        return {face for face in target_edge.link_faces if face.is_valid and face in candidate_faces}
+    if kind == "interior":
+        assert interior_face is not None
+        return {interior_face}
+    return set()
+
+
+def _classify_reflected_vertices(
+    source_vertex_by_key: dict[int, bmesh.types.BMVert],
+    target_ids_by_vertex: dict[int, set[FaceId]],
+    target_faces_by_id: dict[FaceId, list[bmesh.types.BMFace]],
+    axis_index: int,
+    tolerance: float,
+) -> tuple[
+    dict[int, tuple[str, bmesh.types.BMVert | None, bmesh.types.BMEdge | None, float, bmesh.types.BMFace | None, str]],
+    str,
+]:
+    """Classify each source vertex for the direct path (exact/boundary/interior).
+
+    Returns ``(classification, failure_reason)``. On failure classification may
+    be incomplete; *failure_reason* is non-empty.
+    """
+
+    classification: dict[
+        int,
+        tuple[str, bmesh.types.BMVert | None, bmesh.types.BMEdge | None, float, bmesh.types.BMFace | None, str],
+    ] = {}
+    for source_key, source_vertex in source_vertex_by_key.items():
+        expected = mirror_coordinate(source_vertex.co, axis_index)
+        candidate_faces = {
+            face
+            for target_id in target_ids_by_vertex[source_key]
+            for face in target_faces_by_id.get(target_id, ())
+            if face.is_valid
+        }
+        kind, exact_vertex, target_edge, factor, reason = _resolve_reflected_vertex_on_target(
+            expected,
+            candidate_faces,
+            tolerance,
+        )
+        if kind in {"exact", "boundary"}:
+            classification[source_key] = (kind, exact_vertex, target_edge, factor, None, reason)
+            continue
+        if kind == "ambiguous":
+            return classification, reason
+        interior_faces = _interior_faces_for_point(expected, candidate_faces, tolerance)
+        if len(interior_faces) == 1:
+            classification[source_key] = ("interior", None, None, 0.0, interior_faces[0], "")
+            continue
+        if len(interior_faces) > 1:
+            return (
+                classification,
+                "ambiguous mirrored target faces for interior point",
+            )
+        return classification, reason
+    return classification, ""
+
+
+def _find_interior_chains(
+    classification: dict[
+        int,
+        tuple[str, bmesh.types.BMVert | None, bmesh.types.BMEdge | None, float, bmesh.types.BMFace | None, str],
+    ],
+    adjacency: dict[int, set[int]],
+    source_vertex_by_key: dict[int, bmesh.types.BMVert],
+    target_ids_by_vertex: dict[int, set[FaceId]],
+    target_faces_by_id: dict[FaceId, list[bmesh.types.BMFace]],
+    face_layer,
+    axis_index: int,
+    tolerance: float,
+) -> tuple[list[_InteriorChain], str]:
+    """Return accepted interior chains, or a non-empty reason on decline."""
+
+    interior_keys = {key for key, (kind, *_rest) in classification.items() if kind == "interior"}
+    if not interior_keys:
+        return [], ""
+
+    for key in interior_keys:
+        if len(adjacency.get(key, ())) != 2:
+            # Degree-1 tip or branch (degree >= 3): not a simple chain.
+            return [], "a reflected cut vertex is not on a target boundary edge"
+
+    visited: set[int] = set()
+    chains: list[_InteriorChain] = []
+
+    def _ordered_component(start: int) -> list[int] | None:
+        """Return a path-ordered list of a connected interior component, or None."""
+
+        stack = [start]
+        component: list[int] = []
+        seen: set[int] = set()
+        while stack:
+            node = stack.pop()
+            if node in seen:
+                continue
+            seen.add(node)
+            component.append(node)
+            for neighbour in adjacency[node]:
+                if neighbour in interior_keys and neighbour not in seen:
+                    stack.append(neighbour)
+        # Component must be a path: exactly two endpoints with one interior neighbour,
+        # or a single vertex.
+        if len(component) == 1:
+            return component
+        endpoint_count = 0
+        endpoints: list[int] = []
+        for node in component:
+            interior_degree = sum(1 for neighbour in adjacency[node] if neighbour in interior_keys)
+            if interior_degree == 1:
+                endpoint_count += 1
+                endpoints.append(node)
+            elif interior_degree != 2:
+                return None
+        if endpoint_count != 2:
+            return None  # cycle or branch among interiors
+        # Walk from one endpoint along interior edges.
+        ordered = [endpoints[0]]
+        previous = None
+        while len(ordered) < len(component):
+            current = ordered[-1]
+            nxt = None
+            for neighbour in adjacency[current]:
+                if neighbour in interior_keys and neighbour != previous:
+                    nxt = neighbour
+                    break
+            if nxt is None:
+                return None
+            ordered.append(nxt)
+            previous = current
+        return ordered
+
+    for start in sorted(interior_keys, key=lambda key: source_vertex_by_key[key].index):
+        if start in visited:
+            continue
+        ordered = _ordered_component(start)
+        if ordered is None:
+            return [], "a reflected cut vertex is not on a target boundary edge"
+        visited.update(ordered)
+
+        # Chain ends: the non-interior neighbours of the path endpoints.
+        def _chain_end(member: int, other_member: int | None) -> int | None:
+            exteriors = [
+                neighbour
+                for neighbour in adjacency[member]
+                if neighbour not in interior_keys and neighbour != other_member
+            ]
+            if len(exteriors) != 1:
+                return None
+            return exteriors[0]
+
+        if len(ordered) == 1:
+            ends = [neighbour for neighbour in adjacency[ordered[0]] if neighbour not in interior_keys]
+            if len(ends) != 2:
+                return [], "a reflected cut vertex is not on a target boundary edge"
+            end_a, end_b = ends[0], ends[1]
+            # Stable order by source vertex index.
+            if source_vertex_by_key[end_a].index > source_vertex_by_key[end_b].index:
+                end_a, end_b = end_b, end_a
+        else:
+            end_a = _chain_end(ordered[0], ordered[1])
+            end_b = _chain_end(ordered[-1], ordered[-2])
+            if end_a is None or end_b is None:
+                return [], "a reflected cut vertex is not on a target boundary edge"
+
+        if end_a == end_b:
+            # A closed loop anchored on one non-interior vertex would need
+            # face_split(face, A, A), which BMesh rejects; decline instead.
+            return [], "a reflected cut vertex is not on a target boundary edge"
+
+        if classification[end_a][0] == "interior" or classification[end_b][0] == "interior":
+            return [], "a reflected cut vertex is not on a target boundary edge"
+        if classification[end_a][0] in {"missing", "ambiguous"}:
+            return [], classification[end_a][5] or "a reflected cut vertex is not on a target boundary edge"
+        if classification[end_b][0] in {"missing", "ambiguous"}:
+            return [], classification[end_b][5] or "a reflected cut vertex is not on a target boundary edge"
+
+        # Common target face among chain members and both ends.
+        common_faces: set[bmesh.types.BMFace] | None = None
+        for key in (*ordered, end_a, end_b):
+            kind, exact_vertex, target_edge, _factor, interior_face, _reason = classification[key]
+            candidate_faces = {
+                face
+                for target_id in target_ids_by_vertex[key]
+                for face in target_faces_by_id.get(target_id, ())
+                if face.is_valid
+            }
+            supported = _faces_supporting_resolution(
+                kind,
+                exact_vertex,
+                target_edge,
+                interior_face,
+                candidate_faces,
+            )
+            if common_faces is None:
+                common_faces = set(supported)
+            else:
+                common_faces &= supported
+        if not common_faces or len(common_faces) != 1:
+            return [], "a reflected cut vertex is not on a target boundary edge"
+
+        common_face = next(iter(common_faces))
+        target_face_id = FaceId(int(common_face[face_layer]))
+        # Every interior member must actually use this same face instance.
+        for key in ordered:
+            interior_face = classification[key][4]
+            if interior_face is None or interior_face != common_face:
+                return [], "a reflected cut vertex is not on a target boundary edge"
+
+        chains.append(
+            _InteriorChain(
+                members=tuple(ordered),
+                end_a=end_a,
+                end_b=end_b,
+                target_face_id=target_face_id,
+            )
+        )
+
+    if len(visited) != len(interior_keys):
+        return [], "a reflected cut vertex is not on a target boundary edge"
+    return chains, ""
+
+
+def _chain_source_edge_keys(chains: list[_InteriorChain]) -> set[frozenset[int]]:
+    keys: set[frozenset[int]] = set()
+    for chain in chains:
+        sequence = (chain.end_a, *chain.members, chain.end_b)
+        for left, right in zip(sequence, sequence[1:]):
+            keys.add(frozenset((left, right)))
+    return keys
+
+
+def _realize_interior_chain(
+    bm: bmesh.types.BMesh,
+    chain: _InteriorChain,
+    source_vertex_by_key: dict[int, bmesh.types.BMVert],
+    target_vertex_by_source_key: dict[int, bmesh.types.BMVert],
+    axis_index: int,
+    tolerance: float,
+    face_layer,
+    marker_layer,
+    existing_edges: dict | None,
+) -> tuple[int, int, str, dict | None]:
+    """face_split one accepted interior chain. Returns created/already_present delta."""
+
+    end_a = target_vertex_by_source_key[chain.end_a]
+    end_b = target_vertex_by_source_key[chain.end_b]
+    reflected_coords = [
+        mirror_coordinate(source_vertex_by_key[member].co, axis_index) for member in chain.members
+    ]
+    candidate_faces = sorted(
+        (
+            face
+            for face in set(end_a.link_faces).intersection(end_b.link_faces)
+            if face.is_valid and FaceId(int(face[face_layer])) == chain.target_face_id
+        ),
+        key=lambda face: face.index,
+    )
+    # Descendants of prior splits inherit the parent face id, so several
+    # candidates can share the chain's target id.  Only the face that strictly
+    # contains every reflected interior coordinate is the correct host.
+    containing_faces = [
+        face
+        for face in candidate_faces
+        if all(_point_strictly_inside_face(coordinate, face, tolerance) for coordinate in reflected_coords)
+    ]
+    if len(containing_faces) != 1:
+        return 0, 0, "could not place mirrored interior chain on a target face", existing_edges
+    target_face = containing_faces[0]
+
+    before_vert_keys = {hash(vertex) for vertex in bm.verts if vertex.is_valid}
+    before_edge_keys = {
+        frozenset((hash(edge.verts[0]), hash(edge.verts[1])))
+        for edge in bm.edges
+        if edge.is_valid
+    }
+    try:
+        bmesh.utils.face_split(
+            target_face,
+            end_a,
+            end_b,
+            coords=[tuple(coordinate) for coordinate in reflected_coords],
+        )
+    except (RuntimeError, ValueError) as exc:
+        return 0, 0, f"could not split a target face for interior chain: {exc}", existing_edges
+
+    new_verts = [vertex for vertex in bm.verts if vertex.is_valid and hash(vertex) not in before_vert_keys]
+    if len(new_verts) < len(chain.members):
+        return 0, 0, "interior chain face_split created too few vertices", existing_edges
+
+    remaining = list(new_verts)
+    for member, expected in zip(chain.members, reflected_coords):
+        remaining.sort(key=lambda vertex: (vertex.co - expected).length)
+        chosen = remaining.pop(0)
+        chosen.co = expected.copy()
+        chosen.select = False
+        target_vertex_by_source_key[member] = chosen
+
+    # Count and mark every chain segment end_a–v1–…–vn–end_b.
+    created = 0
+    already = 0
+    sequence_keys = (chain.end_a, *chain.members, chain.end_b)
+    for left_key, right_key in zip(sequence_keys, sequence_keys[1:]):
+        left = target_vertex_by_source_key[left_key]
+        right = target_vertex_by_source_key[right_key]
+        edge = bm.edges.get([left, right])
+        if edge is None:
+            return created, already, "interior chain face_split missed a chain edge", existing_edges
+        edge_key = frozenset((hash(left), hash(right)))
+        if edge_key in before_edge_keys:
+            already += 1
+        else:
+            edge[marker_layer] = 0
+            edge.select = False
+            for face in edge.link_faces:
+                face.select = False
+            created += 1
+        if existing_edges is not None:
+            _register_edge_endpoint_pair(
+                existing_edges,
+                left.co,
+                right.co,
+                tolerance,
+                face_ids={FaceId(int(face[face_layer])) for face in edge.link_faces},
+            )
+    return created, already, "", existing_edges
+
+
 def reflected_path_uses_only_target_boundaries(
     bm: bmesh.types.BMesh,
     source_edges: Iterable[bmesh.types.BMEdge],
@@ -1542,10 +1977,10 @@ def reflected_path_uses_only_target_boundaries(
     """Return whether the direct path builder supports every reflected vertex.
 
     A committed straight Knife segment and the loop-based tools terminate on
-    existing face boundaries. Multi-click Knife strokes may also contain an
-    intentional bend or intersection inside a face. Those interior networks
-    still use the legacy Knife Project path for now; this preflight keeps that
-    fallback available without partially editing the target first.
+    existing face boundaries. Multi-click Knife strokes may also place an
+    intentional face-interior terminal chain (degree-2 interior vertices whose
+    ends resolve on one common target face). Those chains are accepted here;
+    interior networks with branches still use the Knife Project fallback.
     """
 
     source_edges = list(source_edges)
@@ -1556,7 +1991,7 @@ def reflected_path_uses_only_target_boundaries(
     (
         source_vertex_by_key,
         target_ids_by_vertex,
-        _edge_records,
+        edge_records,
         unmatched_face_ids,
         _status,
     ) = _collect_reflected_path_context(
@@ -1570,24 +2005,28 @@ def reflected_path_uses_only_target_boundaries(
 
     needed_target_ids = {target_id for target_ids in target_ids_by_vertex.values() for target_id in target_ids}
     target_faces_by_id = _target_faces_by_id(bm, face_layer, needed_target_ids)
+    classification, reason = _classify_reflected_vertices(
+        source_vertex_by_key,
+        target_ids_by_vertex,
+        target_faces_by_id,
+        axis_index,
+        tolerance,
+    )
+    if reason:
+        return False
 
-    for source_key, source_vertex in source_vertex_by_key.items():
-        expected = mirror_coordinate(source_vertex.co, axis_index)
-        candidate_faces = {
-            face
-            for target_id in target_ids_by_vertex[source_key]
-            for face in target_faces_by_id.get(target_id, ())
-            if face.is_valid
-        }
-        kind, _vertex, _edge, _factor, _reason = _resolve_reflected_vertex_on_target(
-            expected,
-            candidate_faces,
-            tolerance,
-        )
-        if kind in {"missing", "ambiguous"}:
-            return False
-
-    return True
+    adjacency = _path_adjacency(edge_records)
+    _chains, chain_reason = _find_interior_chains(
+        classification,
+        adjacency,
+        source_vertex_by_key,
+        target_ids_by_vertex,
+        target_faces_by_id,
+        face_layer,
+        axis_index,
+        tolerance,
+    )
+    return not chain_reason
 
 
 def apply_reflected_path_topology(
@@ -1604,6 +2043,10 @@ def apply_reflected_path_topology(
     The native source path supplies exact endpoint coordinates and inherited
     original-face IDs. Target boundary edges are split at the reflected points,
     then the corresponding target faces are split between those vertices.
+
+    Face-interior terminal chains (degree-2 interior vertices between two
+    normally-resolved ends on one common target face) are realized with a
+    single ``bmesh.utils.face_split(..., coords=...)`` per chain.
 
     Existing segments are detected by BMVert identity *and* by endpoint
     coordinate tolerance (same store as :func:`build_reflected_cutter`) so a
@@ -1655,9 +2098,40 @@ def apply_reflected_path_topology(
 
     needed_target_ids = {target_id for target_ids in target_ids_by_vertex.values() for target_id in target_ids}
     target_faces_by_id = _target_faces_by_id(bm, face_layer, needed_target_ids)
+    classification, classify_reason = _classify_reflected_vertices(
+        source_vertex_by_key,
+        target_ids_by_vertex,
+        target_faces_by_id,
+        axis_index,
+        tolerance,
+    )
+    if classify_reason:
+        return 0, 0, classify_reason
 
+    adjacency = _path_adjacency(edge_records)
+    chains, chain_reason = _find_interior_chains(
+        classification,
+        adjacency,
+        source_vertex_by_key,
+        target_ids_by_vertex,
+        target_faces_by_id,
+        face_layer,
+        axis_index,
+        tolerance,
+    )
+    if chain_reason:
+        return 0, 0, chain_reason
+
+    chain_edge_keys = _chain_source_edge_keys(chains)
     target_vertex_by_source_key: dict[int, bmesh.types.BMVert] = {}
+
+    # Resolve non-interior vertices first so chain ends exist before face_split.
+    # Resolution must happen per vertex against the CURRENT topology: an
+    # earlier split can place a second reflected vertex on one of the new
+    # halves, so the up-front classification's edge/factor would be stale.
     for source_key, source_vertex in source_vertex_by_key.items():
+        if classification[source_key][0] == "interior":
+            continue
         expected = mirror_coordinate(source_vertex.co, axis_index)
         candidate_faces = {
             face
@@ -1690,6 +2164,27 @@ def apply_reflected_path_topology(
         target_vertex.select = False
         target_vertex_by_source_key[source_key] = target_vertex
 
+    existing_edges: _EdgeEndpointStore | None = None
+    created_edges = 0
+    already_present = 0
+
+    for chain in chains:
+        created_delta, already_delta, fail_reason, existing_edges = _realize_interior_chain(
+            bm,
+            chain,
+            source_vertex_by_key,
+            target_vertex_by_source_key,
+            axis_index,
+            tolerance,
+            face_layer,
+            marker_layer,
+            existing_edges,
+        )
+        if fail_reason:
+            return created_edges, already_present, fail_reason
+        created_edges += created_delta
+        already_present += already_delta
+
     # Endpoint-tol store matches build_reflected_cutter so geometric duplicates
     # (different BMVert pairs within tol) count as already_present.  Keep it
     # lazy: the common native-topology case resolves every segment by BMEdge
@@ -1697,10 +2192,11 @@ def apply_reflected_path_topology(
     # vertices have been resolved, the edge loop does not mutate topology
     # before its first identity miss, so constructing the store at that
     # boundary observes the same mesh as the eager path.
-    existing_edges: _EdgeEndpointStore | None = None
-    created_edges = 0
-    already_present = 0
-    pending = edge_records
+    pending = [
+        record
+        for record in edge_records
+        if frozenset((record[0], record[1])) not in chain_edge_keys
+    ]
     while pending:
         deferred = []
         progress = False
@@ -1798,6 +2294,7 @@ def apply_reflected_path_topology(
 
     bm.normal_update()
     return created_edges, already_present, ""
+
 
 
 apply_reflected_loop_topology = apply_reflected_path_topology

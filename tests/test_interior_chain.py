@@ -1,0 +1,428 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+"""Headless checks for face-interior terminal chains on the direct topology path.
+
+Contract: .agents/doc/fix_contract_knife_microedge_2026-08-12.md (revision 2)
+Oracle item #4: n=1 / n=2 accept; degree-3 and no-common-face decline.
+"""
+
+from __future__ import annotations
+
+import sys
+import traceback
+from pathlib import Path
+
+import bmesh
+from mathutils import Vector
+
+PACKAGE_PARENT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PACKAGE_PARENT))
+
+from ydd_symmetric_edit import core  # noqa: E402
+
+TOLERANCE = 1.0e-5
+AXIS = core.AXIS_INDEX["X"]
+
+
+def build_two_symmetric_quads():
+    """Left face x∈[-2,-1], right face x∈[1,2], both y∈[-1,1], z=0."""
+
+    bm = bmesh.new()
+    left = [
+        bm.verts.new(co)
+        for co in (
+            (-2.0, -1.0, 0.0),
+            (-1.0, -1.0, 0.0),
+            (-1.0, 1.0, 0.0),
+            (-2.0, 1.0, 0.0),
+        )
+    ]
+    right = [
+        bm.verts.new(co)
+        for co in (
+            (1.0, -1.0, 0.0),
+            (2.0, -1.0, 0.0),
+            (2.0, 1.0, 0.0),
+            (1.0, 1.0, 0.0),
+        )
+    ]
+    bm.faces.new(left)
+    bm.faces.new(right)
+    bm.normal_update()
+    return bm
+
+
+def _bottom_edge(bm, *, negative: bool):
+    sign = -1.0 if negative else 1.0
+    return next(
+        edge
+        for edge in bm.edges
+        if all(vertex.co.x * sign > 0.0 for vertex in edge.verts)
+        and all(abs(vertex.co.y + 1.0) < 1.0e-8 for vertex in edge.verts)
+    )
+
+
+def _top_edge(bm, *, negative: bool):
+    sign = -1.0 if negative else 1.0
+    return next(
+        edge
+        for edge in bm.edges
+        if all(vertex.co.x * sign > 0.0 for vertex in edge.verts)
+        and all(abs(vertex.co.y - 1.0) < 1.0e-8 for vertex in edge.verts)
+    )
+
+
+def _split_at_x(edge, x: float):
+    a = edge.verts[0].co.x
+    b = edge.verts[1].co.x
+    factor = (x - a) / (b - a)
+    _new_edge, vertex = bmesh.utils.edge_split(edge, edge.verts[0], factor)
+    return vertex
+
+
+def has_exact_edge(bm, a, b, tolerance=1.0e-7):
+    def close(co, expected):
+        return all(abs(co[index] - expected[index]) <= tolerance for index in range(3))
+
+    return any(
+        (close(edge.verts[0].co, a) and close(edge.verts[1].co, b))
+        or (close(edge.verts[0].co, b) and close(edge.verts[1].co, a))
+        for edge in bm.edges
+        if edge.is_valid
+    )
+
+
+def find_vertex(bm, expected, tolerance=1.0e-7):
+    for vertex in bm.verts:
+        if all(abs(vertex.co[i] - expected[i]) <= tolerance for i in range(3)):
+            return vertex
+    return None
+
+
+def collect_source_path_edges(bm):
+    source, side, total, crossing = core.collect_source_path_edges(bm, AXIS, TOLERANCE, "AUTO")
+    assert side == "NEGATIVE", (side, total, crossing)
+    assert crossing == 0
+    return source
+
+
+def check_interior_chain_n1():
+    """(a) Interior chain length n=1: gate accepts; apply mirrors exactly."""
+
+    bm = build_two_symmetric_quads()
+    try:
+        topology = core.prepare_topology(bm, AXIS, TOLERANCE)
+        bottom = _split_at_x(_bottom_edge(bm, negative=True), -1.5)
+        top = _split_at_x(_top_edge(bm, negative=True), -1.5)
+        host = next(face for face in bm.faces if bottom in face.verts and top in face.verts)
+        # Path: bottom -- interior -- top  (degree-2 interior chain n=1)
+        bmesh.utils.face_split(host, bottom, top, coords=[(-1.2, 0.0, 0.0)])
+        source = collect_source_path_edges(bm)
+        assert len(source) == 2, len(source)
+
+        assert core.reflected_path_uses_only_target_boundaries(
+            bm,
+            source,
+            AXIS,
+            TOLERANCE,
+            topology.mirror_face_ids,
+        )
+
+        created, already, reason = core.apply_reflected_path_topology(
+            bm,
+            source,
+            AXIS,
+            TOLERANCE,
+            topology.mirror_face_ids,
+        )
+        assert reason == "", reason
+        assert created == 2, (created, already, reason)
+        assert already == 0, already
+
+        assert has_exact_edge(bm, (1.5, -1.0, 0.0), (1.2, 0.0, 0.0))
+        assert has_exact_edge(bm, (1.2, 0.0, 0.0), (1.5, 1.0, 0.0))
+        mirrored = find_vertex(bm, (1.2, 0.0, 0.0))
+        assert mirrored is not None
+        assert mirrored.select is False
+        # Exact reflected coordinate (bitwise mirror of the float32 source
+        # vertex, not a face_split approximation).
+        source_vertex = find_vertex(bm, (-1.2, 0.0, 0.0))
+        assert source_vertex is not None
+        assert tuple(mirrored.co) == (
+            -float(source_vertex.co.x),
+            float(source_vertex.co.y),
+            float(source_vertex.co.z),
+        )
+    finally:
+        bm.free()
+
+
+def check_interior_chain_n2():
+    """(b) Interior chain length n=2: two consecutive degree-2 interiors."""
+
+    bm = build_two_symmetric_quads()
+    try:
+        topology = core.prepare_topology(bm, AXIS, TOLERANCE)
+        bottom = _split_at_x(_bottom_edge(bm, negative=True), -1.5)
+        top = _split_at_x(_top_edge(bm, negative=True), -1.5)
+        host = next(face for face in bm.faces if bottom in face.verts and top in face.verts)
+        # Path: bottom -- v1 -- v2 -- top
+        bmesh.utils.face_split(
+            host,
+            bottom,
+            top,
+            coords=[(-1.4, -0.25, 0.0), (-1.2, 0.25, 0.0)],
+        )
+        source = collect_source_path_edges(bm)
+        assert len(source) == 3, len(source)
+
+        assert core.reflected_path_uses_only_target_boundaries(
+            bm,
+            source,
+            AXIS,
+            TOLERANCE,
+            topology.mirror_face_ids,
+        )
+
+        created, already, reason = core.apply_reflected_path_topology(
+            bm,
+            source,
+            AXIS,
+            TOLERANCE,
+            topology.mirror_face_ids,
+        )
+        assert reason == "", reason
+        assert created == 3, (created, already, reason)
+        assert already == 0, already
+
+        assert has_exact_edge(bm, (1.5, -1.0, 0.0), (1.4, -0.25, 0.0))
+        assert has_exact_edge(bm, (1.4, -0.25, 0.0), (1.2, 0.25, 0.0))
+        assert has_exact_edge(bm, (1.2, 0.25, 0.0), (1.5, 1.0, 0.0))
+        for expected in ((1.4, -0.25, 0.0), (1.2, 0.25, 0.0)):
+            vertex = find_vertex(bm, expected)
+            assert vertex is not None, expected
+            assert vertex.select is False
+            source_vertex = find_vertex(bm, (-expected[0], expected[1], expected[2]))
+            assert source_vertex is not None, expected
+            assert tuple(vertex.co) == (
+                -float(source_vertex.co.x),
+                float(source_vertex.co.y),
+                float(source_vertex.co.z),
+            ), expected
+    finally:
+        bm.free()
+
+
+def check_decline_degree3_interior():
+    """(c) Degree-3 interior vertex is not a simple chain → gate False / apply fails."""
+
+    bm = build_two_symmetric_quads()
+    try:
+        topology = core.prepare_topology(bm, AXIS, TOLERANCE)
+        # Place three boundary anchors on the left face.
+        bottom = _split_at_x(_bottom_edge(bm, negative=True), -1.5)
+        top = _split_at_x(_top_edge(bm, negative=True), -1.5)
+        left_mid_edge = next(
+            edge
+            for edge in bm.edges
+            if all(abs(vertex.co.x + 2.0) < 1.0e-8 for vertex in edge.verts)
+            and min(vertex.co.y for vertex in edge.verts) < 0.0 < max(vertex.co.y for vertex in edge.verts)
+        )
+        _e, left_mid = bmesh.utils.edge_split(left_mid_edge, left_mid_edge.verts[0], 0.5)
+        left_mid.co = (-2.0, 0.0, 0.0)
+
+        host = next(
+            face
+            for face in bm.faces
+            if bottom in face.verts and top in face.verts and left_mid in face.verts
+        )
+        # First create bottom--hub--top, then connect left_mid--hub so hub is degree 3.
+        bmesh.utils.face_split(host, bottom, top, coords=[(-1.3, 0.0, 0.0)])
+        hub = find_vertex(bm, (-1.3, 0.0, 0.0))
+        assert hub is not None
+        host2 = next(face for face in bm.faces if left_mid in face.verts and hub in face.verts)
+        bmesh.utils.face_split(host2, left_mid, hub)
+
+        source = collect_source_path_edges(bm)
+        assert len(source) == 3, len(source)
+
+        assert not core.reflected_path_uses_only_target_boundaries(
+            bm,
+            source,
+            AXIS,
+            TOLERANCE,
+            topology.mirror_face_ids,
+        )
+
+        created, already, reason = core.apply_reflected_path_topology(
+            bm,
+            source,
+            AXIS,
+            TOLERANCE,
+            topology.mirror_face_ids,
+        )
+        assert created == 0 and already == 0
+        assert reason == "a reflected cut vertex is not on a target boundary edge", reason
+    finally:
+        bm.free()
+
+
+def check_decline_no_common_face():
+    """(d) Degree-2 interior chain whose members+ends lack one common target face."""
+
+    # Two Y-stacked symmetric pairs. Build bottom--v_lower--v_upper--top where
+    # each interior reflects into a different target face, so the chain has no
+    # single common target face (still degree-2 throughout).
+    bm = bmesh.new()
+    try:
+        lower_left = [
+            bm.verts.new(co)
+            for co in (
+                (-2.0, -2.0, 0.0),
+                (-1.0, -2.0, 0.0),
+                (-1.0, -0.1, 0.0),
+                (-2.0, -0.1, 0.0),
+            )
+        ]
+        lower_right = [
+            bm.verts.new(co)
+            for co in (
+                (1.0, -2.0, 0.0),
+                (2.0, -2.0, 0.0),
+                (2.0, -0.1, 0.0),
+                (1.0, -0.1, 0.0),
+            )
+        ]
+        upper_left = [
+            bm.verts.new(co)
+            for co in (
+                (-2.0, 0.1, 0.0),
+                (-1.0, 0.1, 0.0),
+                (-1.0, 2.0, 0.0),
+                (-2.0, 2.0, 0.0),
+            )
+        ]
+        upper_right = [
+            bm.verts.new(co)
+            for co in (
+                (1.0, 0.1, 0.0),
+                (2.0, 0.1, 0.0),
+                (2.0, 2.0, 0.0),
+                (1.0, 2.0, 0.0),
+            )
+        ]
+        bm.faces.new(lower_left)
+        bm.faces.new(lower_right)
+        bm.faces.new(upper_left)
+        bm.faces.new(upper_right)
+        bm.normal_update()
+
+        topology = core.prepare_topology(bm, AXIS, TOLERANCE)
+        marker = bm.edges.layers.int.get(core.EDGE_ORIGINAL_LAYER)
+        assert marker is not None
+
+        bottom_edge = next(
+            edge
+            for edge in bm.edges
+            if all(vertex.co.x < 0.0 for vertex in edge.verts)
+            and all(abs(vertex.co.y + 2.0) < 1.0e-8 for vertex in edge.verts)
+        )
+        top_edge = next(
+            edge
+            for edge in bm.edges
+            if all(vertex.co.x < 0.0 for vertex in edge.verts)
+            and all(abs(vertex.co.y - 2.0) < 1.0e-8 for vertex in edge.verts)
+        )
+        _e, bottom = bmesh.utils.edge_split(bottom_edge, bottom_edge.verts[0], 0.5)
+        bottom.co = (-1.5, -2.0, 0.0)
+        _e, top = bmesh.utils.edge_split(top_edge, top_edge.verts[0], 0.5)
+        top.co = (-1.5, 2.0, 0.0)
+
+        lower_top_edge = next(
+            edge
+            for edge in bm.edges
+            if all(vertex.co.x < 0.0 for vertex in edge.verts)
+            and all(abs(vertex.co.y + 0.1) < 1.0e-8 for vertex in edge.verts)
+        )
+        upper_bottom_edge = next(
+            edge
+            for edge in bm.edges
+            if all(vertex.co.x < 0.0 for vertex in edge.verts)
+            and all(abs(vertex.co.y - 0.1) < 1.0e-8 for vertex in edge.verts)
+        )
+        _e, lower_anchor = bmesh.utils.edge_split(lower_top_edge, lower_top_edge.verts[0], 0.5)
+        lower_anchor.co = (-1.5, -0.1, 0.0)
+        _e, upper_anchor = bmesh.utils.edge_split(upper_bottom_edge, upper_bottom_edge.verts[0], 0.5)
+        upper_anchor.co = (-1.5, 0.1, 0.0)
+
+        lower_host = next(face for face in bm.faces if bottom in face.verts and lower_anchor in face.verts)
+        upper_host = next(face for face in bm.faces if top in face.verts and upper_anchor in face.verts)
+        bmesh.utils.face_split(lower_host, bottom, lower_anchor, coords=[(-1.4, -1.0, 0.0)])
+        bmesh.utils.face_split(upper_host, upper_anchor, top, coords=[(-1.4, 1.0, 0.0)])
+        v_lower = find_vertex(bm, (-1.4, -1.0, 0.0))
+        v_upper = find_vertex(bm, (-1.4, 1.0, 0.0))
+        assert v_lower is not None and v_upper is not None
+
+        # Drop the face-local second legs and bridge the interiors so the path
+        # graph is bottom--v_lower--v_upper--top (all interiors degree 2) while
+        # the two interiors resolve onto different mirrored target faces.
+        drop = []
+        for edge in list(bm.edges):
+            verts = set(edge.verts)
+            if verts == {v_lower, lower_anchor} or verts == {v_upper, upper_anchor}:
+                drop.append(edge)
+        assert len(drop) == 2, len(drop)
+        bmesh.ops.delete(bm, geom=drop, context="EDGES")
+        bridge = bm.edges.new((v_lower, v_upper))
+        bridge[marker] = 0
+
+        source = collect_source_path_edges(bm)
+        assert len(source) == 3, len(source)
+
+        assert not core.reflected_path_uses_only_target_boundaries(
+            bm,
+            source,
+            AXIS,
+            TOLERANCE,
+            topology.mirror_face_ids,
+        )
+
+        created, already, reason = core.apply_reflected_path_topology(
+            bm,
+            source,
+            AXIS,
+            TOLERANCE,
+            topology.mirror_face_ids,
+        )
+        assert created == 0 and already == 0
+        # The wire bridge has no linked face, so apply declines at the
+        # no-target-face guard before reaching _find_interior_chains; the
+        # common-face intersection itself is exercised through the gate call
+        # above (gate and apply share the same chain-detection functions).
+        assert reason in {
+            "a reflected cut vertex is not on a target boundary edge",
+            "a source cut edge has no mirrored target face",
+        }, reason
+    finally:
+        bm.free()
+
+
+
+def run():
+    check_interior_chain_n1()
+    print("PASS check_interior_chain_n1", flush=True)
+    check_interior_chain_n2()
+    print("PASS check_interior_chain_n2", flush=True)
+    check_decline_degree3_interior()
+    print("PASS check_decline_degree3_interior", flush=True)
+    check_decline_no_common_face()
+    print("PASS check_decline_no_common_face", flush=True)
+    print("YSE_INTERIOR_CHAIN_OK", flush=True)
+
+
+if __name__ == "__main__":
+    try:
+        run()
+    except Exception:
+        traceback.print_exc()
+        sys.exit(1)
