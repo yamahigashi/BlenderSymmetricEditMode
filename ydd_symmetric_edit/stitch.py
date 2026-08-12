@@ -1881,6 +1881,7 @@ def _realize_interior_chain(
     face_layer,
     marker_layer,
     existing_edges: dict | None,
+    realized_face_ids: set[FaceId],
 ) -> tuple[int, int, str, dict | None]:
     """face_split one accepted interior chain. Returns created/already_present delta."""
 
@@ -1900,23 +1901,29 @@ def _realize_interior_chain(
     # Descendants of prior splits inherit the parent face id, so several
     # candidates can share the chain's target id.  Only the face that strictly
     # contains every reflected interior coordinate is the correct host.
-    containing_faces = [
-        face
-        for face in candidate_faces
-        if all(_point_strictly_inside_face(coordinate, face, tolerance) for coordinate in reflected_coords)
-    ]
-    if len(containing_faces) != 1:
-        return 0, 0, "could not place mirrored interior chain on a target face", existing_edges
-    target_face = containing_faces[0]
+    #
+    # The strict re-test cannot be applied to the untouched single-candidate
+    # case: the boundary end splits have already turned the host quad into an
+    # n-gon whose ear-clip triangulation deviates from the evaluated quad
+    # surface by more than the tolerance-scale limit on curved meshes, so it
+    # would falsely decline (classification accepted these coordinates on the
+    # pre-split ancestor during this same apply call).  Once an earlier chain
+    # has face_split this target id, a lone shared candidate may be the wrong
+    # descendant, so only then is the strict containment test decisive.
+    if len(candidate_faces) == 1 and chain.target_face_id not in realized_face_ids:
+        target_face = candidate_faces[0]
+    else:
+        containing_faces = [
+            face
+            for face in candidate_faces
+            if all(_point_strictly_inside_face(coordinate, face, tolerance) for coordinate in reflected_coords)
+        ]
+        if len(containing_faces) != 1:
+            return 0, 0, "could not place mirrored interior chain on a target face", existing_edges
+        target_face = containing_faces[0]
 
-    before_vert_keys = {hash(vertex) for vertex in bm.verts if vertex.is_valid}
-    before_edge_keys = {
-        frozenset((hash(edge.verts[0]), hash(edge.verts[1])))
-        for edge in bm.edges
-        if edge.is_valid
-    }
     try:
-        bmesh.utils.face_split(
+        new_face, _new_loop = bmesh.utils.face_split(
             target_face,
             end_a,
             end_b,
@@ -1924,8 +1931,21 @@ def _realize_interior_chain(
         )
     except (RuntimeError, ValueError) as exc:
         return 0, 0, f"could not split a target face for interior chain: {exc}", existing_edges
+    if new_face is None or not new_face.is_valid or not target_face.is_valid:
+        return 0, 0, "could not split a target face for interior chain", existing_edges
+    realized_face_ids.add(chain.target_face_id)
 
-    new_verts = [vertex for vertex in bm.verts if vertex.is_valid and hash(vertex) not in before_vert_keys]
+    # The coords vertices lie exactly on the cut path both descendants share,
+    # so they are the shared vertices minus the chain ends.  This stays local
+    # to the two faces; snapshotting bm.verts/bm.edges around the split costs
+    # seconds of proxy iteration on dense meshes.
+    end_hashes = {hash(end_a), hash(end_b)}
+    target_vert_hashes = {hash(vertex) for vertex in target_face.verts}
+    new_verts = [
+        vertex
+        for vertex in new_face.verts
+        if hash(vertex) in target_vert_hashes and hash(vertex) not in end_hashes
+    ]
     if len(new_verts) < len(chain.members):
         return 0, 0, "interior chain face_split created too few vertices", existing_edges
 
@@ -1937,7 +1957,9 @@ def _realize_interior_chain(
         chosen.select = False
         target_vertex_by_source_key[member] = chosen
 
-    # Count and mark every chain segment end_a–v1–…–vn–end_b.
+    # Count and mark every chain segment end_a–v1–…–vn–end_b.  Every segment
+    # touches at least one vertex the face_split just created, so none can
+    # predate this call: they all count as created.
     created = 0
     already = 0
     sequence_keys = (chain.end_a, *chain.members, chain.end_b)
@@ -1947,15 +1969,11 @@ def _realize_interior_chain(
         edge = bm.edges.get([left, right])
         if edge is None:
             return created, already, "interior chain face_split missed a chain edge", existing_edges
-        edge_key = frozenset((hash(left), hash(right)))
-        if edge_key in before_edge_keys:
-            already += 1
-        else:
-            edge[marker_layer] = 0
-            edge.select = False
-            for face in edge.link_faces:
-                face.select = False
-            created += 1
+        edge[marker_layer] = 0
+        edge.select = False
+        for face in edge.link_faces:
+            face.select = False
+        created += 1
         if existing_edges is not None:
             _register_edge_endpoint_pair(
                 existing_edges,
@@ -2168,6 +2186,7 @@ def apply_reflected_path_topology(
     created_edges = 0
     already_present = 0
 
+    realized_face_ids: set[FaceId] = set()
     for chain in chains:
         created_delta, already_delta, fail_reason, existing_edges = _realize_interior_chain(
             bm,
@@ -2179,6 +2198,7 @@ def apply_reflected_path_topology(
             face_layer,
             marker_layer,
             existing_edges,
+            realized_face_ids,
         )
         if fail_reason:
             return created_edges, already_present, fail_reason

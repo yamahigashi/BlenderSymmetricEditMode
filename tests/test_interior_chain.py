@@ -408,6 +408,168 @@ def check_decline_no_common_face():
 
 
 
+def check_curved_quad_single_candidate():
+    """(e) Curved quad (suzanne10 face 75): the boundary end split turns the
+    host into a pentagon whose ear-clip triangulation deviates from the
+    evaluated quad surface by more than the tolerance-scale limit, so the
+    single id-matching candidate must be accepted without re-testing
+    containment."""
+
+    from ydd_symmetric_edit import stitch
+
+    quad = (
+        (-0.21765238046646118, -0.5814824104309082, -0.17536157369613647),
+        (-0.2244318425655365, -0.5596591234207153, -0.18323862552642822),
+        (-0.203125, -0.5625, -0.1875),
+        (-0.19602273404598236, -0.5852272510528564, -0.1796875),
+    )
+    bm = bmesh.new()
+    try:
+        left = [bm.verts.new(co) for co in quad]
+        right = [bm.verts.new((-x, y, z)) for (x, y, z) in reversed(quad)]
+        bm.faces.new(left)
+        bm.faces.new(right)
+        bm.normal_update()
+
+        topology = core.prepare_topology(bm, AXIS, TOLERANCE)
+        host = next(face for face in bm.faces if all(v.co.x < 0.0 for v in face.verts))
+        verts = list(host.verts)
+        edge = next(e for e in host.edges if verts[0] in e.verts and verts[1] in e.verts)
+        _e, vb = bmesh.utils.edge_split(edge, edge.verts[0], 0.43)
+        interior = verts[0].co * 0.4 + verts[1].co * 0.35 + verts[2].co * 0.25
+        corners = [v for v in verts if v not in edge.verts]
+        vc = max(corners, key=lambda v: (v.co - vb.co).length)
+
+        # Regression premise: the interior point lies on the evaluated quad
+        # surface but farther than 2*tol from the post-split pentagon's
+        # ear-clip triangulation (measured on the source side; the target
+        # pentagon is its bitwise mirror).
+        import mathutils.geometry as mg
+
+        pentagon = next(f for f in bm.faces if vb in f.verts and vc in f.verts)
+        assert len(pentagon.verts) == 5, len(pentagon.verts)
+        min_dist = min(
+            (mg.closest_point_on_tri(interior, a, b, c) - interior).length
+            for a, b, c in stitch._face_surface_triangles(pentagon)
+        )
+        assert min_dist > TOLERANCE * 2.0, min_dist
+        # The realization re-test would run on the target-side pentagon (the
+        # mirrored loop, reversed winding), whose ear-clip need not match the
+        # source one; pin the old failure condition on that side as well.
+        mirrored_loop = [
+            Vector((-v.co.x, v.co.y, v.co.z)) for v in reversed(list(pentagon.verts))
+        ]
+        mirrored_interior = Vector((-interior.x, interior.y, interior.z))
+        target_min_dist = min(
+            (
+                mg.closest_point_on_tri(
+                    mirrored_interior,
+                    mirrored_loop[a],
+                    mirrored_loop[b],
+                    mirrored_loop[c],
+                )
+                - mirrored_interior
+            ).length
+            for a, b, c in mg.tessellate_polygon([mirrored_loop])
+        )
+        assert target_min_dist > TOLERANCE * 2.0, target_min_dist
+
+        bmesh.utils.face_split(pentagon, vb, vc, coords=[tuple(interior)])
+        source = collect_source_path_edges(bm)
+        assert len(source) == 2, len(source)
+
+        assert core.reflected_path_uses_only_target_boundaries(
+            bm,
+            source,
+            AXIS,
+            TOLERANCE,
+            topology.mirror_face_ids,
+        )
+        created, already, reason = core.apply_reflected_path_topology(
+            bm,
+            source,
+            AXIS,
+            TOLERANCE,
+            topology.mirror_face_ids,
+        )
+        assert reason == "", reason
+        assert created == 2, (created, already)
+
+        source_interior = find_vertex(bm, tuple(interior))
+        assert source_interior is not None
+        mirrored = find_vertex(
+            bm,
+            (-float(source_interior.co.x), float(source_interior.co.y), float(source_interior.co.z)),
+        )
+        assert mirrored is not None
+        assert mirrored.select is False
+    finally:
+        bm.free()
+
+
+def check_two_chains_same_face():
+    """(f) Two independent interior chains sharing one ancestor face.
+
+    The first chain may take the single-candidate fast path; the second one
+    must fall back to strict containment because the target id has already
+    been face_split during this apply call (a lone shared candidate could be
+    the wrong descendant)."""
+
+    bm = build_two_symmetric_quads()
+    try:
+        topology = core.prepare_topology(bm, AXIS, TOLERANCE)
+        vb1 = _split_at_x(_bottom_edge(bm, negative=True), -1.8)
+        bottom_rest = next(
+            edge
+            for edge in vb1.link_edges
+            if all(abs(vertex.co.y + 1.0) < 1.0e-8 for vertex in edge.verts)
+            and max(vertex.co.x for vertex in edge.verts) > -1.5
+        )
+        _e, vb2 = bmesh.utils.edge_split(bottom_rest, vb1, (-1.2 - vb1.co.x) / (bottom_rest.other_vert(vb1).co.x - vb1.co.x))
+        vb2.co = (-1.2, -1.0, 0.0)
+        corner_tl = find_vertex(bm, (-2.0, 1.0, 0.0))
+        corner_tr = find_vertex(bm, (-1.0, 1.0, 0.0))
+        assert corner_tl is not None and corner_tr is not None
+
+        host_a = next(face for face in bm.faces if vb1 in face.verts and corner_tl in face.verts)
+        bmesh.utils.face_split(host_a, vb1, corner_tl, coords=[(-1.85, 0.0, 0.0)])
+        host_b = next(
+            face for face in bm.faces if face.is_valid and vb2 in face.verts and corner_tr in face.verts
+        )
+        bmesh.utils.face_split(host_b, vb2, corner_tr, coords=[(-1.15, 0.0, 0.0)])
+
+        source = collect_source_path_edges(bm)
+        assert len(source) == 4, len(source)
+
+        assert core.reflected_path_uses_only_target_boundaries(
+            bm,
+            source,
+            AXIS,
+            TOLERANCE,
+            topology.mirror_face_ids,
+        )
+        created, already, reason = core.apply_reflected_path_topology(
+            bm,
+            source,
+            AXIS,
+            TOLERANCE,
+            topology.mirror_face_ids,
+        )
+        assert reason == "", reason
+        assert created == 4, (created, already)
+
+        assert has_exact_edge(bm, (1.8, -1.0, 0.0), (1.85, 0.0, 0.0))
+        assert has_exact_edge(bm, (1.85, 0.0, 0.0), (2.0, 1.0, 0.0))
+        assert has_exact_edge(bm, (1.2, -1.0, 0.0), (1.15, 0.0, 0.0))
+        assert has_exact_edge(bm, (1.15, 0.0, 0.0), (1.0, 1.0, 0.0))
+        for expected in ((1.85, 0.0, 0.0), (1.15, 0.0, 0.0)):
+            mirrored = find_vertex(bm, expected)
+            assert mirrored is not None, expected
+            assert mirrored.select is False
+    finally:
+        bm.free()
+
+
 def run():
     check_interior_chain_n1()
     print("PASS check_interior_chain_n1", flush=True)
@@ -417,6 +579,10 @@ def run():
     print("PASS check_decline_degree3_interior", flush=True)
     check_decline_no_common_face()
     print("PASS check_decline_no_common_face", flush=True)
+    check_curved_quad_single_candidate()
+    print("PASS check_curved_quad_single_candidate", flush=True)
+    check_two_chains_same_face()
+    print("PASS check_two_chains_same_face", flush=True)
     print("YSE_INTERIOR_CHAIN_OK", flush=True)
 
 
