@@ -47,8 +47,15 @@ def _frozen_eager_apply_reflected_path_topology(
     axis_index,
     tolerance,
     mirror_face_ids,
+    carrier_frames=None,
 ):
-    """Pre-U6-2 apply implementation with the eager-full store frozen here."""
+    """Pre-U6-2 apply implementation with the eager-full store frozen here.
+
+    Interior-vertex classification/realization delegate to the live R-H1/R-H2
+    helpers so this oracle tracks their current signature. It does not
+    reimplement R-N1 network planning, so it only agrees with the candidate
+    on inputs whose interior component has no branching (degree < 3) vertex.
+    """
 
     source_edges = list(source_edges)
     if not source_edges:
@@ -83,12 +90,17 @@ def _frozen_eager_apply_reflected_path_topology(
 
     needed_target_ids = {target_id for target_ids in target_ids_by_vertex.values() for target_id in target_ids}
     target_faces_by_id = stitch_reflect._target_faces_by_id(bm, face_layer, needed_target_ids)
+    source_face_ids_by_vertex = stitch_reflect._source_face_ids_by_vertex(source_edges, face_layer)
+    lineage_by_face = {face: object() for faces in target_faces_by_id.values() for face in faces if face.is_valid}
     classification, classify_reason = stitch_reflect._classify_reflected_vertices(
         source_vertex_by_key,
         target_ids_by_vertex,
         target_faces_by_id,
         axis_index,
         tolerance,
+        edge_records=edge_records,
+        source_face_ids_by_vertex=source_face_ids_by_vertex,
+        carrier_frames=carrier_frames,
     )
     if classify_reason:
         return 0, 0, classify_reason
@@ -103,6 +115,8 @@ def _frozen_eager_apply_reflected_path_topology(
         face_layer,
         axis_index,
         tolerance,
+        edge_records=edge_records,
+        source_face_ids_by_vertex=source_face_ids_by_vertex,
     )
     if chain_reason:
         return 0, 0, chain_reason
@@ -148,6 +162,7 @@ def _frozen_eager_apply_reflected_path_topology(
     existing_edges = None
     created_edges = 0
     already_present = 0
+    registered_entries = {}
 
     realized_face_ids = set()
     for chain in chains:
@@ -162,6 +177,11 @@ def _frozen_eager_apply_reflected_path_topology(
             marker_layer,
             existing_edges,
             realized_face_ids,
+            target_faces_by_id=target_faces_by_id,
+            lineage_by_face=lineage_by_face,
+            classification=classification,
+            carrier_frames=carrier_frames,
+            registered_entries=registered_entries,
         )
         if fail_reason:
             return created_edges, already_present, fail_reason
@@ -396,9 +416,9 @@ def _mesh_state(bm):
     )
 
 
-def _run_apply(function, bm, source_edges, mirror_face_ids):
+def _run_apply(function, bm, source_edges, mirror_face_ids, carrier_frames=None):
     try:
-        result = ("return", function(bm, source_edges, AXIS, TOLERANCE, mirror_face_ids))
+        result = ("return", function(bm, source_edges, AXIS, TOLERANCE, mirror_face_ids, carrier_frames))
     except Exception as exc:  # The frozen oracle intentionally observes build-time failures.
         result = ("exception", type(exc).__module__, type(exc).__qualname__, tuple(map(str, exc.args)))
     return result, _mesh_state(bm)
@@ -691,6 +711,10 @@ def _split_at_x(edge, x):
 
 def _build_two_chain_fixture():
     bm, mirror_face_ids = _build_two_symmetric_quads()
+    # Carrier frames are the session-start (pre-cut) face polygons; capture
+    # them here, before any split, so later interior-host reads see the
+    # frozen ancestor geometry instead of a re-numbered FaceId scheme.
+    carrier_frames = snapshot.prepare_topology(bm, AXIS, TOLERANCE).carrier_frames
     bottom = _horizontal_edge(bm, -1.0, negative=True)
     vb1 = _split_at_x(bottom, -1.8)
     bottom_rest = next(
@@ -718,12 +742,14 @@ def _build_two_chain_fixture():
 
     # This loose record is injected into the same original FaceId. Its
     # reflected endpoints are the non-adjacent target corners (1, 1) and
-    # (2, -1), so identity lookup misses deterministically.
+    # (2, -1), so identity lookup misses deterministically.  It is kept out
+    # of apply()'s source-edge list (R-W1 would otherwise claim it as a wire
+    # edge); the C1 hooks inject its record directly into collect() instead.
     pending = _add_loose_edge(bm, (-1.0, 1.0, 0.0), (-2.0, -1.0, 0.0))
-    return bm, mirror_face_ids, [*chain_edges, pending]
+    return bm, mirror_face_ids, carrier_frames, chain_edges, pending
 
 
-def _c1_hooks():
+def _c1_hooks(pending_edge):
     state = {
         "realized": 0,
         "pre_chain_match": None,
@@ -732,9 +758,8 @@ def _c1_hooks():
 
     def collect(source_edges, face_layer, mirror_face_ids, *, require_all_mirrored):
         assert not require_all_mirrored
-        chain_edges = [edge for edge in source_edges if edge.link_faces]
-        loose_edges = [edge for edge in source_edges if not edge.link_faces]
-        assert len(chain_edges) == 4 and len(loose_edges) == 1
+        chain_edges = list(source_edges)
+        assert len(chain_edges) == 4
         source_vertex_by_key, target_ids_by_vertex, records, unmatched, status = _ORIGINAL_COLLECT_CONTEXT(
             chain_edges,
             face_layer,
@@ -744,9 +769,8 @@ def _c1_hooks():
         target_ids = set().union(*(record[2] for record in records))
         assert len(target_ids) == 1
         target_id = next(iter(target_ids))
-        loose = loose_edges[0]
-        loose_keys = tuple(hash(vertex) for vertex in loose.verts)
-        for key, vertex in zip(loose_keys, loose.verts, strict=True):
+        loose_keys = tuple(hash(vertex) for vertex in pending_edge.verts)
+        for key, vertex in zip(loose_keys, pending_edge.verts, strict=True):
             source_vertex_by_key[key] = vertex
             target_ids_by_vertex[key] = {target_id}
         records.append((loose_keys[0], loose_keys[1], {target_id}))
@@ -849,8 +873,10 @@ def check_vi_live_descendant_face_closure():
     bm = None
     eager_bm = None
     try:
-        bm, mirror_face_ids, source_edges = _build_two_chain_fixture()
-        eager_bm, eager_mirror_face_ids, eager_source_edges = _build_two_chain_fixture()
+        bm, mirror_face_ids, carrier_frames, chain_edges, pending = _build_two_chain_fixture()
+        eager_bm, eager_mirror_face_ids, eager_carrier_frames, eager_chain_edges, eager_pending = (
+            _build_two_chain_fixture()
+        )
         _update_indices(bm)
         _update_indices(eager_bm)
         assert mirror_face_ids == eager_mirror_face_ids
@@ -872,8 +898,9 @@ def check_vi_live_descendant_face_closure():
                 for edge in edges
             )
 
-        assert source_signature(source_edges) == source_signature(eager_source_edges)
-        collect, realize, state = _c1_hooks()
+        assert source_signature(chain_edges) == source_signature(eager_chain_edges)
+        assert source_signature([pending]) == source_signature([eager_pending])
+        collect, realize, state = _c1_hooks(pending)
         with (
             _replace(stitch_reflect, "_collect_reflected_path_context", collect),
             _replace(stitch_reflect, "_realize_interior_chain", realize),
@@ -881,11 +908,12 @@ def check_vi_live_descendant_face_closure():
             candidate = _run_apply(
                 stitch_reflect.apply_reflected_path_topology,
                 bm,
-                source_edges,
+                chain_edges,
                 mirror_face_ids,
+                carrier_frames,
             )
 
-        eager_collect, eager_realize, eager_state = _c1_hooks()
+        eager_collect, eager_realize, eager_state = _c1_hooks(eager_pending)
         with (
             _replace(stitch_reflect, "_collect_reflected_path_context", eager_collect),
             _replace(stitch_reflect, "_realize_interior_chain", eager_realize),
@@ -893,8 +921,9 @@ def check_vi_live_descendant_face_closure():
             eager = _run_apply(
                 _frozen_eager_apply_reflected_path_topology,
                 eager_bm,
-                eager_source_edges,
+                eager_chain_edges,
                 eager_mirror_face_ids,
+                eager_carrier_frames,
             )
         assert candidate == eager, (candidate, eager)
         assert candidate[0] == ("return", (4, 1, "")), candidate[0]

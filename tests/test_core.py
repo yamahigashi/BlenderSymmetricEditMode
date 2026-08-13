@@ -784,6 +784,7 @@ def run():
         matching.AXIS_INDEX["X"],
         1.0e-5,
         bend_topology.mirror_face_ids,
+        bend_topology.carrier_frames,
     )
     bend_created, bend_already, bend_reason = stitch_reflect.apply_reflected_path_topology(
         bend_bm,
@@ -791,6 +792,7 @@ def run():
         matching.AXIS_INDEX["X"],
         1.0e-5,
         bend_topology.mirror_face_ids,
+        bend_topology.carrier_frames,
     )
     assert bend_reason == "", bend_reason
     assert bend_created == 2, (bend_created, bend_already)
