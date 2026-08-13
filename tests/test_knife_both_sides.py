@@ -1003,6 +1003,173 @@ def case_q_wire_strokes_direct(window, area, region) -> None:
     print("YSE_KNIFE_BOTH_SIDES_CASE_Q=OK", flush=True)
 
 
+def case_r_network_direct(window, area, region) -> None:
+    """O15(f): Y/X network mirrors use the direct topology operator path."""
+
+    print("YSE_KNIFE_BOTH_SIDES_CASE=r_network_direct", flush=True)
+    original_cutter = stitch_projection.build_reflected_cutter
+    projection_calls = []
+
+    def _counting_cutter(*args, **kwargs):
+        projection_calls.append((args, kwargs))
+        return original_cutter(*args, **kwargs)
+
+    stitch_projection.build_reflected_cutter = _counting_cutter
+    try:
+        for kind, degree in (("Y", 3), ("X", 4)):
+            clear_scene()
+            obj = make_two_quads()
+            with bpy.context.temp_override(window=window, area=area, region=region):
+                bpy.ops.object.mode_set(mode="EDIT")
+                bpy.context.tool_settings.mesh_select_mode = (True, False, False)
+                prepare_knife_session(bpy.context)
+                _simulate_network_native(obj, kind)
+                finished = bpy.ops.mesh.ydd_symmetric_edit_finish("EXEC_DEFAULT")
+                assert finished == {"FINISHED"}, (kind, finished)
+            bm = bmesh.from_edit_mesh(obj.data)
+            hub = next(
+                vertex
+                for vertex in bm.verts
+                if abs(float(vertex.co.x) - 1.3) < 1.0e-5 and abs(float(vertex.co.y)) < 1.0e-5
+            )
+            assert len(hub.link_edges) == degree, (kind, len(hub.link_edges))
+            assert_no_duplicate_edges(bm)
+            assert_x_symmetric(bm)
+            assert not error_messages(), operators._FINISH_REPORTS
+            assert not operators._SESSIONS
+    finally:
+        stitch_projection.build_reflected_cutter = original_cutter
+    assert not projection_calls
+    print("YSE_KNIFE_BOTH_SIDES_CASE_R=OK", flush=True)
+
+
+def case_s_network_partial_failure_retry(window, area, region) -> None:
+    """O15(f): a late direct failure is observable for R-R1 retry coverage."""
+
+    print("YSE_KNIFE_BOTH_SIDES_CASE=s_network_retry", flush=True)
+    original_split = stitch_reflect._face_split_mutation
+    original_cutter = stitch_projection.build_reflected_cutter
+    split_calls = []
+    projection_calls = []
+
+    def _forced_split(*args, **kwargs):
+        split_calls.append(True)
+        if len(split_calls) >= 2:
+            return None, "forced network realization failure"
+        return original_split(*args, **kwargs)
+
+    def _counting_cutter(bm, source_edges, axis_index, tolerance):
+        projection_calls.append(True)
+
+        def is_retry_hub(vertex):
+            return (
+                abs(float(vertex.co.x) - 1.3) <= 1.0e-5
+                and abs(float(vertex.co.y)) <= 1.0e-5
+                and abs(float(vertex.co.z)) <= 1.0e-5
+            )
+
+        assert not any(is_retry_hub(vertex) for vertex in bm.verts), (
+            "direct_retry_backup was not restored before projection",
+            [tuple(vertex.co) for vertex in bm.verts if is_retry_hub(vertex)],
+        )
+        assert not any(is_retry_hub(vertex) for edge in bm.edges for vertex in edge.verts), (
+            "direct_retry_backup retained a hub-derived edge",
+        )
+        return original_cutter(bm, source_edges, axis_index, tolerance)
+
+    clear_scene()
+    obj = make_two_quads()
+    stitch_reflect._face_split_mutation = _forced_split
+    stitch_projection.build_reflected_cutter = _counting_cutter
+    try:
+        with bpy.context.temp_override(window=window, area=area, region=region):
+            bpy.ops.object.mode_set(mode="EDIT")
+            bpy.context.tool_settings.mesh_select_mode = (True, False, False)
+            prepare_knife_session(bpy.context)
+            _simulate_network_native(obj, "Y")
+            finished = bpy.ops.mesh.ydd_symmetric_edit_finish("EXEC_DEFAULT")
+        assert finished == {"FINISHED"}, finished
+        assert len(split_calls) >= 2, split_calls
+        assert projection_calls, projection_calls
+        assert not any(kind == "ERROR" for kind, _message in operators._FINISH_REPORTS)
+        assert any("direct mirror declined" in message for _kind, message in operators._FINISH_REPORTS)
+    finally:
+        stitch_reflect._face_split_mutation = original_split
+        stitch_projection.build_reflected_cutter = original_cutter
+    bm = bmesh.from_edit_mesh(obj.data)
+    assert_no_duplicate_edges(bm)
+    assert bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER) is None
+    assert not operators._SESSIONS
+    print("YSE_KNIFE_BOTH_SIDES_CASE_S=OK", flush=True)
+
+
+def _simulate_network_native(obj, kind: str) -> None:
+    """Build a native Y/X cut in an edit mesh for operator-level O15 checks."""
+
+    bm = bmesh.from_edit_mesh(obj.data)
+
+    def split_edge(predicate, coordinate):
+        edge = next(edge for edge in bm.edges if predicate(edge))
+        start = edge.verts[0]
+        delta = (
+            coordinate[0] - float(start.co.x)
+            if abs(coordinate[0] - float(start.co.x)) > 1.0e-8
+            else coordinate[1] - float(start.co.y)
+        )
+        span = (
+            float(edge.verts[1].co.x) - float(start.co.x)
+            if abs(edge.verts[1].co.x - start.co.x) > 1.0e-8
+            else float(edge.verts[1].co.y) - float(start.co.y)
+        )
+        _new_edge, vertex = bmesh.utils.edge_split(edge, start, delta / span)
+        vertex.co = coordinate
+        return vertex
+
+    bottom = split_edge(
+        lambda edge: (
+            all(abs(float(vertex.co.y) + 1.0) < 1.0e-8 for vertex in edge.verts)
+            and all(vertex.co.x < 0.0 for vertex in edge.verts)
+            and min(vertex.co.x for vertex in edge.verts) < -1.5 < max(vertex.co.x for vertex in edge.verts)
+        ),
+        (-1.5, -1.0, 0.0),
+    )
+    top = split_edge(
+        lambda edge: (
+            all(abs(float(vertex.co.y) - 1.0) < 1.0e-8 for vertex in edge.verts)
+            and all(vertex.co.x < 0.0 for vertex in edge.verts)
+            and min(vertex.co.x for vertex in edge.verts) < -1.5 < max(vertex.co.x for vertex in edge.verts)
+        ),
+        (-1.5, 1.0, 0.0),
+    )
+    left = split_edge(
+        lambda edge: (
+            all(abs(float(vertex.co.x) + 2.0) < 1.0e-8 for vertex in edge.verts)
+            and min(vertex.co.y for vertex in edge.verts) < 0.0 < max(vertex.co.y for vertex in edge.verts)
+        ),
+        (-2.0, 0.0, 0.0),
+    )
+    bmesh.utils.face_split(
+        next(face for face in bm.faces if bottom in face.verts and top in face.verts),
+        bottom,
+        top,
+        coords=[(-1.3, 0.0, 0.0)],
+    )
+    hub = next(
+        vertex for vertex in bm.verts if abs(float(vertex.co.x) + 1.3) < 1.0e-5 and abs(float(vertex.co.y)) < 1.0e-5
+    )
+    bmesh.utils.face_split(next(face for face in bm.faces if left in face.verts and hub in face.verts), left, hub)
+    if kind == "X":
+        right = split_edge(
+            lambda edge: (
+                all(abs(float(vertex.co.x) + 1.0) < 1.0e-8 for vertex in edge.verts)
+                and min(vertex.co.y for vertex in edge.verts) < 0.25 < max(vertex.co.y for vertex in edge.verts)
+            ),
+            (-1.0, 0.25, 0.0),
+        )
+        bmesh.utils.face_split(next(face for face in bm.faces if right in face.verts and hub in face.verts), right, hub)
+    bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=True)
+
+
 def case_g_self_mirrored(window, area, region) -> None:
     print("YSE_KNIFE_BOTH_SIDES_CASE=g_self_mirrored", flush=True)
     clear_scene()
@@ -1791,6 +1958,8 @@ def run_test() -> None:
     case_n_weak_band_direct(window, area, region)
     case_o_endpoint_collision_retry(window, area, region)
     case_q_wire_strokes_direct(window, area, region)
+    case_r_network_direct(window, area, region)
+    case_s_network_partial_failure_retry(window, area, region)
     case_g_self_mirrored(window, area, region)
     case_h_simple_crosses(window, area, region)
     case_i_bowtie(window, area, region)
