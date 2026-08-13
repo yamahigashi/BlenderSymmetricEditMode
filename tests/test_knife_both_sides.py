@@ -8,8 +8,8 @@ Cases:
   (b) Stroke with a plane-crossing segment → p-stitch + both-sides mirror (X).
   (c) One-sided stroke (regression) → opposite side still mirrored.
   (d) CROSSES mixed with POSITIVE/NEGATIVE → whole stroke symmetrized.
-  (e) Knife Project fallback (bent polyline, non-boundary) → both-sides mirror.
-  (f) Partial mirror failure (monkeypatch) → full rollback + WARNING only
+  (e) Bent polyline direct mirror regression.
+  (f) Direct mirror failure (monkeypatch) → full rollback + WARNING only
       (no success INFO) + FINISHED.
   (g) Near-self-mirrored stroke → already_present, no double cut.
   (h) Simple 1-segment CROSSES → on-plane p, 4 edges share p, full symmetry.
@@ -50,7 +50,6 @@ from ydd_symmetric_edit import (  # noqa: E402
     operators,
     stitch_common,
     stitch_pathedges,
-    stitch_projection,
     stitch_pstitch,
     stitch_reflect,
 )
@@ -130,6 +129,16 @@ def face_incidence_multiset(bm, precision: int = COORD_PRECISION) -> Counter:
         coords = [coordinate_key(vertex.co, precision) for vertex in face.verts]
         keys.append(_normalize_cycle(coords))
     return Counter(keys)
+
+
+def mesh_signature(bm, precision: int = COORD_PRECISION):
+    """Full mesh signature used to prove native-only rollback."""
+
+    return (
+        vertex_coord_multiset(bm, precision),
+        edge_coord_multiset(bm, precision),
+        face_incidence_multiset(bm, precision),
+    )
 
 
 def mirrored_face_incidence_multiset(bm, precision: int = COORD_PRECISION) -> Counter:
@@ -645,8 +654,8 @@ def case_d_mixed_crosses(window, area, region) -> None:
     print("YSE_KNIFE_BOTH_SIDES_CASE_D=OK", flush=True)
 
 
-def case_e_knife_project_fallback(window, area, region) -> None:
-    print("YSE_KNIFE_BOTH_SIDES_CASE=e_knife_project", flush=True)
+def case_e_bent_direct(window, area, region) -> None:
+    print("YSE_KNIFE_BOTH_SIDES_CASE=e_bent_direct", flush=True)
     clear_scene()
     obj = make_straddling_grid()
     with bpy.context.temp_override(window=window, area=area, region=region):
@@ -666,26 +675,8 @@ def case_e_knife_project_fallback(window, area, region) -> None:
         assert source_edges, {key: len(value) for key, value in by_side.items()}
         assert not by_side["CROSSES"]
         del source_edges
-        # The route premise is pinned empirically with a projection spy: a
-        # gate call with the session's initial (empty) mirror map is always
-        # False and proves nothing about which route the operator takes.
-        projection_calls: list[int] = []
-        original_cutter = stitch_projection.build_reflected_cutter
-
-        def _counting_cutter(*args, **kwargs):
-            projection_calls.append(1)
-            return original_cutter(*args, **kwargs)
-
-        stitch_projection.build_reflected_cutter = _counting_cutter
-        try:
-            finished = bpy.ops.mesh.ydd_symmetric_edit_finish("EXEC_DEFAULT")
-        finally:
-            stitch_projection.build_reflected_cutter = original_cutter
+        finished = bpy.ops.mesh.ydd_symmetric_edit_finish("EXEC_DEFAULT")
         assert finished == {"FINISHED"}, finished
-        # Contract v5 widened interior acceptance: this bent stroke, which
-        # rev3 could only mirror via Knife Project, now completes directly.
-        # Projection-route coverage lives in case_f / case_f2 / case_o.
-        assert not projection_calls, "the bent stroke must complete on the direct route"
 
     bm = bmesh.from_edit_mesh(obj.data)
     # Native bent path.
@@ -705,8 +696,8 @@ def case_e_knife_project_fallback(window, area, region) -> None:
     print("YSE_KNIFE_BOTH_SIDES_CASE_E=OK", flush=True)
 
 
-def case_f_direct_decline_projection_retry(window, area, region) -> None:
-    """Contract v5 R-R1: a direct apply decline retries through Knife Project."""
+def case_f_direct_decline_rollback(window, area, region) -> None:
+    """O16(a): a direct apply decline rolls back to the native-only mesh."""
 
     print("YSE_KNIFE_BOTH_SIDES_CASE=f_partial_rollback", flush=True)
     clear_scene()
@@ -717,12 +708,16 @@ def case_f_direct_decline_projection_retry(window, area, region) -> None:
         bpy.context.tool_settings.mesh_select_mode = (True, False, False)
         prepare_knife_session(bpy.context)
         simulate_one_side_cut(obj)
+        bm = bmesh.from_edit_mesh(obj.data)
+        native_sig = mesh_signature(bm)
 
         def forced_apply(*args, **kwargs):
-            # Apply fully then fail: the retry checkpoint must undo this
-            # partial state before the projection fallback runs.
             result = original_apply(*args, **kwargs)
-            return (*result[:2], "forced partial mirror failure", *result[3:])
+            reason = "forced partial mirror failure"
+            if kwargs.get("return_summary"):
+                summary = result[3] if len(result) > 3 else None
+                return result[0], result[1], reason, summary
+            return result[0], result[1], reason
 
         stitch_reflect.apply_reflected_path_topology = forced_apply
         try:
@@ -732,78 +727,176 @@ def case_f_direct_decline_projection_retry(window, area, region) -> None:
         assert finished == {"FINISHED"}, finished
 
     bm = bmesh.from_edit_mesh(obj.data)
-    # Projection retry completed the mirror: both cuts exist, exactly once.
-    assert has_exact_edge(bm, (-1.5, -1.0, 0.0), (-1.5, 1.0, 0.0))
-    assert has_exact_edge(bm, (1.5, -1.0, 0.0), (1.5, 1.0, 0.0))
-    assert_no_duplicate_edges(bm)
-    assert_x_symmetric(bm)
-    infos = info_messages()
-    assert any("direct mirror declined: forced partial mirror failure" in message for message in infos), (
-        infos,
+    assert mesh_signature(bm) == native_sig
+    warnings = warning_messages()
+    assert any("direct mirror declined: forced partial mirror failure" in message for message in warnings), (
+        warnings,
         operators._FINISH_REPORTS,
     )
-    assert not warning_messages(), operators._FINISH_REPORTS
+    assert not info_messages(), operators._FINISH_REPORTS
     assert not any(kind == "ERROR" for kind, _message in operators._FINISH_REPORTS)
     assert bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER) is None
     assert not operators._SESSIONS
     print("YSE_KNIFE_BOTH_SIDES_CASE_F=OK", flush=True)
 
 
-def case_f2_direct_and_projection_failure_rollback(window, area, region) -> None:
-    """Both direct and the projection retry fail: rollback to native-only."""
+def case_d_knife_project_never_called(window, area, region) -> None:
+    """O16(d): the addon can no longer reference or invoke Knife Project.
 
-    print("YSE_KNIFE_BOTH_SIDES_CASE=f2_double_failure_rollback", flush=True)
+    The bpy.ops proxy offers no persistent attribute hook to spy through, so
+    this pins the stronger static impossibility instead: the projection module
+    is gone and no package source mentions the operator, then a plain cut
+    still completes through the direct route.
+    """
+
+    print("YSE_KNIFE_BOTH_SIDES_CASE=O16_D_knife_project_never_called", flush=True)
+    clear_scene()
+    obj = make_two_quads()
+
+    import importlib.util
+    import pathlib
+
+    assert importlib.util.find_spec("ydd_symmetric_edit.stitch_projection") is None
+    package_dir = pathlib.Path(operators.__file__).parent
+    offenders = [
+        path.name for path in sorted(package_dir.glob("*.py")) if "knife_project" in path.read_text(encoding="utf-8")
+    ]
+    assert not offenders, offenders
+
+    with bpy.context.temp_override(window=window, area=area, region=region):
+        bpy.ops.object.mode_set(mode="EDIT")
+        bpy.context.tool_settings.mesh_select_mode = (True, False, False)
+        prepare_knife_session(bpy.context)
+        simulate_one_side_cut(obj)
+        finished = bpy.ops.mesh.ydd_symmetric_edit_finish("EXEC_DEFAULT")
+        assert finished == {"FINISHED"}, finished
+    assert has_exact_edge(bmesh.from_edit_mesh(obj.data), (1.5, -1.0, 0.0), (1.5, 1.0, 0.0))
+    assert not operators._SESSIONS
+    print("YSE_KNIFE_BOTH_SIDES_CASE_O16_D=OK", flush=True)
+
+
+def case_e2_gate_decline_rollback(window, area, region) -> None:
+    """O16(e2): gate=False raises explicitly without changing native topology."""
+
+    print("YSE_KNIFE_BOTH_SIDES_CASE=e2_gate_decline", flush=True)
+    clear_scene()
+    obj = make_two_quads()
+
+    with bpy.context.temp_override(window=window, area=area, region=region):
+        bpy.ops.object.mode_set(mode="EDIT")
+        bpy.context.tool_settings.mesh_select_mode = (True, False, False)
+        prepare_knife_session(bpy.context)
+        session = next(iter(operators._SESSIONS.values()))
+        tolerance = session.tolerance
+        bm = bmesh.from_edit_mesh(obj.data)
+        # Endpoint-ambiguous wire recipe (organic gate=False): two stray
+        # vertices within tolerance of the mirrored dangling endpoint make
+        # R-W1 endpoint resolution ambiguous, so the gate declines without
+        # any monkeypatch.
+        corner = next(v for v in bm.verts if (v.co - Vector((-2.0, -1.0, 0.0))).length <= 1.0e-6)
+        dangling = bm.verts.new((-1.7, -0.5, 0.2))
+        bm.edges.new((corner, dangling))
+        bm.verts.new((1.7 - 0.25 * tolerance, -0.5, 0.2))
+        bm.verts.new((1.7 + 0.25 * tolerance, -0.5, 0.2))
+        bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+        native_sig = mesh_signature(bm)
+        finished = bpy.ops.mesh.ydd_symmetric_edit_finish("EXEC_DEFAULT")
+        assert finished == {"FINISHED"}, finished
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    assert mesh_signature(bm) == native_sig
+    warnings = warning_messages()
+    assert any(
+        "the mirrored cut cannot be rebuilt directly on the opposite side" in message for message in warnings
+    ), operators._FINISH_REPORTS
+    assert not error_messages(), operators._FINISH_REPORTS
+    assert not operators._SESSIONS
+    print("YSE_KNIFE_BOTH_SIDES_CASE_E2=OK", flush=True)
+
+
+def case_h_count_mismatch_rollback(window, area, region) -> None:
+    """O16(h): an empty-reason count mismatch is an explicit direct decline."""
+
+    print("YSE_KNIFE_BOTH_SIDES_CASE=O16_H_count_mismatch", flush=True)
     clear_scene()
     obj = make_two_quads()
     original_apply = stitch_reflect.apply_reflected_path_topology
-    original_snap = stitch_projection.snap_projected_graph
+
+    def forced_count_mismatch(*args, **kwargs):
+        result = original_apply(*args, **kwargs)
+        if kwargs.get("return_summary"):
+            summary = result[3] if len(result) > 3 else None
+            return 0, 0, "", summary
+        return 0, 0, ""
+
     with bpy.context.temp_override(window=window, area=area, region=region):
         bpy.ops.object.mode_set(mode="EDIT")
         bpy.context.tool_settings.mesh_select_mode = (True, False, False)
         prepare_knife_session(bpy.context)
         simulate_one_side_cut(obj)
         bm = bmesh.from_edit_mesh(obj.data)
-        native_counts = (len(bm.verts), len(bm.edges), len(bm.faces))
-
-        def forced_apply(*args, **kwargs):
-            result = original_apply(*args, **kwargs)
-            return (*result[:2], "forced partial mirror failure", *result[3:])
-
-        def forced_snap(*args, **kwargs):
-            return False, 0.0, "forced projection failure"
-
-        stitch_reflect.apply_reflected_path_topology = forced_apply
-        stitch_projection.snap_projected_graph = forced_snap
+        native_sig = mesh_signature(bm)
+        stitch_reflect.apply_reflected_path_topology = forced_count_mismatch
         try:
             finished = bpy.ops.mesh.ydd_symmetric_edit_finish("EXEC_DEFAULT")
         finally:
             stitch_reflect.apply_reflected_path_topology = original_apply
-            stitch_projection.snap_projected_graph = original_snap
         assert finished == {"FINISHED"}, finished
 
     bm = bmesh.from_edit_mesh(obj.data)
-    assert (len(bm.verts), len(bm.edges), len(bm.faces)) == native_counts, (
-        (len(bm.verts), len(bm.edges), len(bm.faces)),
-        native_counts,
-    )
-    # Native left cut kept; mirrored right cut rolled back.
-    assert has_exact_edge(bm, (-1.5, -1.0, 0.0), (-1.5, 1.0, 0.0))
-    assert not has_exact_edge(bm, (1.5, -1.0, 0.0), (1.5, 1.0, 0.0))
+    assert mesh_signature(bm) == native_sig
     warnings = warning_messages()
-    assert any("forced projection failure" in message for message in warnings), (
-        warnings,
-        operators._FINISH_REPORTS,
-    )
-    assert any("direct mirror declined: forced partial mirror failure" in message for message in warnings), (
-        warnings,
-        operators._FINISH_REPORTS,
-    )
-    # Dual-report suppression: WARNING decline only — no success INFO.
-    assert not info_messages(), operators._FINISH_REPORTS
-    assert not any(kind == "ERROR" for kind, _message in operators._FINISH_REPORTS)
-    assert bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER) is None
+    assert any("did not match the source" in message for message in warnings), operators._FINISH_REPORTS
+    assert not error_messages(), operators._FINISH_REPORTS
     assert not operators._SESSIONS
-    print("YSE_KNIFE_BOTH_SIDES_CASE_F2=OK", flush=True)
+    print("YSE_KNIFE_BOTH_SIDES_CASE_O16_H=OK", flush=True)
+
+
+def case_i_rollback_exception_error(window, area, region) -> None:
+    """O16(i): rollback exceptions are reported as ERROR only."""
+
+    print("YSE_KNIFE_BOTH_SIDES_CASE=O16_I_rollback_exception", flush=True)
+    from ydd_symmetric_edit import backup as backup_mod
+
+    clear_scene()
+    obj = make_two_quads()
+    original_apply = stitch_reflect.apply_reflected_path_topology
+    original_restore = backup_mod.restore_topology_backup
+
+    def forced_apply(*args, **kwargs):
+        result = original_apply(*args, **kwargs)
+        reason = "forced partial mirror failure"
+        if kwargs.get("return_summary"):
+            summary = result[3] if len(result) > 3 else None
+            return result[0], result[1], reason, summary
+        return result[0], result[1], reason
+
+    def broken_restore(*_args, **_kwargs):
+        raise RuntimeError("forced rollback failure")
+
+    with bpy.context.temp_override(window=window, area=area, region=region):
+        bpy.ops.object.mode_set(mode="EDIT")
+        bpy.context.tool_settings.mesh_select_mode = (True, False, False)
+        prepare_knife_session(bpy.context)
+        simulate_one_side_cut(obj)
+        stitch_reflect.apply_reflected_path_topology = forced_apply
+        backup_mod.restore_topology_backup = broken_restore
+        try:
+            finished = bpy.ops.mesh.ydd_symmetric_edit_finish("EXEC_DEFAULT")
+        except RuntimeError as exc:
+            # Blender surfaces operator.report({'ERROR'}) as RuntimeError from
+            # script invocations; the operator itself returned FINISHED.
+            assert "direct mirror declined" in str(exc), exc
+            finished = {"FINISHED"}
+        finally:
+            stitch_reflect.apply_reflected_path_topology = original_apply
+            backup_mod.restore_topology_backup = original_restore
+        assert finished == {"FINISHED"}, finished
+
+    assert error_messages(), operators._FINISH_REPORTS
+    assert not warning_messages(), operators._FINISH_REPORTS
+    assert not operators._SESSIONS
+    print("YSE_KNIFE_BOTH_SIDES_CASE_O16_I=OK", flush=True)
 
 
 def case_n_weak_band_direct(window, area, region) -> None:
@@ -859,28 +952,14 @@ def case_n_weak_band_direct(window, area, region) -> None:
         mirrored_chain = [(-x, y, zz) for x, y, zz in chain]
         bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
 
-        projection_calls: list[int] = []
-        original_cutter = stitch_projection.build_reflected_cutter
-
-        def _counting_cutter(*args, **kwargs):
-            projection_calls.append(1)
-            return original_cutter(*args, **kwargs)
-
-        stitch_projection.build_reflected_cutter = _counting_cutter
-        try:
-            finished = bpy.ops.mesh.ydd_symmetric_edit_finish("EXEC_DEFAULT")
-        finally:
-            stitch_projection.build_reflected_cutter = original_cutter
+        finished = bpy.ops.mesh.ydd_symmetric_edit_finish("EXEC_DEFAULT")
         assert finished == {"FINISHED"}, finished
-        assert not projection_calls, "O8: the weak-band stroke must complete on the direct route"
 
     bm = bmesh.from_edit_mesh(obj.data)
     assert has_exact_edge(bm, mirrored_chain[0], mirrored_chain[1])
     assert has_exact_edge(bm, mirrored_chain[1], mirrored_chain[2])
     assert_no_duplicate_edges(bm)
-    # The KNIFE direct-success path reports via self.report (not
-    # _finish_report), so only the decline channels are asserted here; the
-    # route itself is pinned by the projection spy above.
+    # The KNIFE direct-success path reports via self.report (not _finish_report).
     assert not warning_messages(), operators._FINISH_REPORTS
     assert not any(kind == "ERROR" for kind, _message in operators._FINISH_REPORTS)
     assert bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER) is None
@@ -888,10 +967,10 @@ def case_n_weak_band_direct(window, area, region) -> None:
     print("YSE_KNIFE_BOTH_SIDES_CASE_N=OK", flush=True)
 
 
-def case_o_endpoint_collision_retry(window, area, region) -> None:
-    """O11: gate-invisible endpoint collision declines in apply and retries."""
+def case_o_endpoint_collision_rollback(window, area, region) -> None:
+    """O16(e1): organic apply decline rolls back completely."""
 
-    print("YSE_KNIFE_BOTH_SIDES_CASE=o_endpoint_collision_retry", flush=True)
+    print("YSE_KNIFE_BOTH_SIDES_CASE=o_endpoint_collision_rollback", flush=True)
     clear_scene()
     obj = make_two_quads()
     tolerance = 1.0e-5
@@ -922,28 +1001,16 @@ def case_o_endpoint_collision_retry(window, area, region) -> None:
         host = next(face for face in bm.faces if end_a in face.verts and end_b in face.verts)
         bmesh.utils.face_split(host, end_a, end_b, coords=[(-1.3, -0.5, 0.0)])
         bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
-
-        projection_calls: list[int] = []
-        original_cutter = stitch_projection.build_reflected_cutter
-
-        def _counting_cutter(*args, **kwargs):
-            projection_calls.append(1)
-            return original_cutter(*args, **kwargs)
-
-        stitch_projection.build_reflected_cutter = _counting_cutter
-        try:
-            finished = bpy.ops.mesh.ydd_symmetric_edit_finish("EXEC_DEFAULT")
-        finally:
-            stitch_projection.build_reflected_cutter = original_cutter
+        native_sig = mesh_signature(bm)
+        finished = bpy.ops.mesh.ydd_symmetric_edit_finish("EXEC_DEFAULT")
         assert finished == {"FINISHED"}, finished
 
-    # The outcome follows the projection result; the run must not hard-fail
-    # and must record that the direct mirror declined first.
-    assert projection_calls, "O11: apply decline must retry through Knife Project"
+    # Direct decline is explicit and the native cut remains the only change.
     assert not any(kind == "ERROR" for kind, _message in operators._FINISH_REPORTS)
-    all_messages = [message for _kind, message in operators._FINISH_REPORTS]
-    assert any("direct mirror declined" in message for message in all_messages), operators._FINISH_REPORTS
+    warnings = warning_messages()
+    assert any("direct mirror declined" in message for message in warnings), operators._FINISH_REPORTS
     bm = bmesh.from_edit_mesh(obj.data)
+    assert mesh_signature(bm) == native_sig
     assert bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER) is None
     assert not operators._SESSIONS
     print("YSE_KNIFE_BOTH_SIDES_CASE_O=OK", flush=True)
@@ -968,20 +1035,8 @@ def case_q_wire_strokes_direct(window, area, region) -> None:
         bm.edges.new((free_a, free_b))
         bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
 
-        projection_calls: list[int] = []
-        original_cutter = stitch_projection.build_reflected_cutter
-
-        def _counting_cutter(*args, **kwargs):
-            projection_calls.append(1)
-            return original_cutter(*args, **kwargs)
-
-        stitch_projection.build_reflected_cutter = _counting_cutter
-        try:
-            finished = bpy.ops.mesh.ydd_symmetric_edit_finish("EXEC_DEFAULT")
-        finally:
-            stitch_projection.build_reflected_cutter = original_cutter
+        finished = bpy.ops.mesh.ydd_symmetric_edit_finish("EXEC_DEFAULT")
         assert finished == {"FINISHED"}, finished
-        assert not projection_calls, "O14: pure wire strokes must complete on the direct route"
 
     bm = bmesh.from_edit_mesh(obj.data)
     assert has_exact_edge(bm, (2.0, -1.0, 0.0), (1.7, -0.5, 0.2))
@@ -1007,50 +1062,36 @@ def case_r_network_direct(window, area, region) -> None:
     """O15(f): Y/X network mirrors use the direct topology operator path."""
 
     print("YSE_KNIFE_BOTH_SIDES_CASE=r_network_direct", flush=True)
-    original_cutter = stitch_projection.build_reflected_cutter
-    projection_calls = []
-
-    def _counting_cutter(*args, **kwargs):
-        projection_calls.append((args, kwargs))
-        return original_cutter(*args, **kwargs)
-
-    stitch_projection.build_reflected_cutter = _counting_cutter
-    try:
-        for kind, degree in (("Y", 3), ("X", 4)):
-            clear_scene()
-            obj = make_two_quads()
-            with bpy.context.temp_override(window=window, area=area, region=region):
-                bpy.ops.object.mode_set(mode="EDIT")
-                bpy.context.tool_settings.mesh_select_mode = (True, False, False)
-                prepare_knife_session(bpy.context)
-                _simulate_network_native(obj, kind)
-                finished = bpy.ops.mesh.ydd_symmetric_edit_finish("EXEC_DEFAULT")
-                assert finished == {"FINISHED"}, (kind, finished)
-            bm = bmesh.from_edit_mesh(obj.data)
-            hub = next(
-                vertex
-                for vertex in bm.verts
-                if abs(float(vertex.co.x) - 1.3) < 1.0e-5 and abs(float(vertex.co.y)) < 1.0e-5
-            )
-            assert len(hub.link_edges) == degree, (kind, len(hub.link_edges))
-            assert_no_duplicate_edges(bm)
-            assert_x_symmetric(bm)
-            assert not error_messages(), operators._FINISH_REPORTS
-            assert not operators._SESSIONS
-    finally:
-        stitch_projection.build_reflected_cutter = original_cutter
-    assert not projection_calls
+    for kind, degree in (("Y", 3), ("X", 4)):
+        clear_scene()
+        obj = make_two_quads()
+        with bpy.context.temp_override(window=window, area=area, region=region):
+            bpy.ops.object.mode_set(mode="EDIT")
+            bpy.context.tool_settings.mesh_select_mode = (True, False, False)
+            prepare_knife_session(bpy.context)
+            _simulate_network_native(obj, kind)
+            finished = bpy.ops.mesh.ydd_symmetric_edit_finish("EXEC_DEFAULT")
+            assert finished == {"FINISHED"}, (kind, finished)
+        bm = bmesh.from_edit_mesh(obj.data)
+        hub = next(
+            vertex
+            for vertex in bm.verts
+            if abs(float(vertex.co.x) - 1.3) < 1.0e-5 and abs(float(vertex.co.y)) < 1.0e-5
+        )
+        assert len(hub.link_edges) == degree, (kind, len(hub.link_edges))
+        assert_no_duplicate_edges(bm)
+        assert_x_symmetric(bm)
+        assert not error_messages(), operators._FINISH_REPORTS
+        assert not operators._SESSIONS
     print("YSE_KNIFE_BOTH_SIDES_CASE_R=OK", flush=True)
 
 
-def case_s_network_partial_failure_retry(window, area, region) -> None:
-    """O15(f): a late direct failure is observable for R-R1 retry coverage."""
+def case_s_network_partial_failure_rollback(window, area, region) -> None:
+    """O16(f): a late direct failure rolls back the whole mirror stage."""
 
-    print("YSE_KNIFE_BOTH_SIDES_CASE=s_network_retry", flush=True)
+    print("YSE_KNIFE_BOTH_SIDES_CASE=s_network_rollback", flush=True)
     original_split = stitch_reflect._face_split_mutation
-    original_cutter = stitch_projection.build_reflected_cutter
     split_calls = []
-    projection_calls = []
 
     def _forced_split(*args, **kwargs):
         split_calls.append(True)
@@ -1058,45 +1099,25 @@ def case_s_network_partial_failure_retry(window, area, region) -> None:
             return None, "forced network realization failure"
         return original_split(*args, **kwargs)
 
-    def _counting_cutter(bm, source_edges, axis_index, tolerance):
-        projection_calls.append(True)
-
-        def is_retry_hub(vertex):
-            return (
-                abs(float(vertex.co.x) - 1.3) <= 1.0e-5
-                and abs(float(vertex.co.y)) <= 1.0e-5
-                and abs(float(vertex.co.z)) <= 1.0e-5
-            )
-
-        assert not any(is_retry_hub(vertex) for vertex in bm.verts), (
-            "direct_retry_backup was not restored before projection",
-            [tuple(vertex.co) for vertex in bm.verts if is_retry_hub(vertex)],
-        )
-        assert not any(is_retry_hub(vertex) for edge in bm.edges for vertex in edge.verts), (
-            "direct_retry_backup retained a hub-derived edge",
-        )
-        return original_cutter(bm, source_edges, axis_index, tolerance)
-
     clear_scene()
     obj = make_two_quads()
     stitch_reflect._face_split_mutation = _forced_split
-    stitch_projection.build_reflected_cutter = _counting_cutter
     try:
         with bpy.context.temp_override(window=window, area=area, region=region):
             bpy.ops.object.mode_set(mode="EDIT")
             bpy.context.tool_settings.mesh_select_mode = (True, False, False)
             prepare_knife_session(bpy.context)
             _simulate_network_native(obj, "Y")
+            native_sig = mesh_signature(bmesh.from_edit_mesh(obj.data))
             finished = bpy.ops.mesh.ydd_symmetric_edit_finish("EXEC_DEFAULT")
         assert finished == {"FINISHED"}, finished
         assert len(split_calls) >= 2, split_calls
-        assert projection_calls, projection_calls
         assert not any(kind == "ERROR" for kind, _message in operators._FINISH_REPORTS)
         assert any("direct mirror declined" in message for _kind, message in operators._FINISH_REPORTS)
     finally:
         stitch_reflect._face_split_mutation = original_split
-        stitch_projection.build_reflected_cutter = original_cutter
     bm = bmesh.from_edit_mesh(obj.data)
+    assert mesh_signature(bm) == native_sig
     assert_no_duplicate_edges(bm)
     assert bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER) is None
     assert not operators._SESSIONS
@@ -1952,14 +1973,17 @@ def run_test() -> None:
     case_b_crosses(window, area, region)
     case_c_one_side(window, area, region)
     case_d_mixed_crosses(window, area, region)
-    case_e_knife_project_fallback(window, area, region)
-    case_f_direct_decline_projection_retry(window, area, region)
-    case_f2_direct_and_projection_failure_rollback(window, area, region)
+    case_e_bent_direct(window, area, region)
+    case_f_direct_decline_rollback(window, area, region)
+    case_d_knife_project_never_called(window, area, region)
+    case_e2_gate_decline_rollback(window, area, region)
+    case_h_count_mismatch_rollback(window, area, region)
+    case_i_rollback_exception_error(window, area, region)
     case_n_weak_band_direct(window, area, region)
-    case_o_endpoint_collision_retry(window, area, region)
+    case_o_endpoint_collision_rollback(window, area, region)
     case_q_wire_strokes_direct(window, area, region)
     case_r_network_direct(window, area, region)
-    case_s_network_partial_failure_retry(window, area, region)
+    case_s_network_partial_failure_rollback(window, area, region)
     case_g_self_mirrored(window, area, region)
     case_h_simple_crosses(window, area, region)
     case_i_bowtie(window, area, region)

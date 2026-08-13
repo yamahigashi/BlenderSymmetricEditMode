@@ -27,8 +27,8 @@ from ydd_symmetric_edit import (  # noqa: E402
     matching,
     snapshot,
     stitch_common,
+    stitch_offset,
     stitch_pathedges,
-    stitch_projection,
     stitch_reflect,
 )
 from ydd_symmetric_edit._types import FaceId  # noqa: E402
@@ -1052,36 +1052,6 @@ def _frozen_endpoint_match(a, b, entries, tolerance):
     return best
 
 
-def _frozen_build_reflected_cutter(bm, source_edges, axis_index, tolerance):
-    """Independent eager list oracle for the untouched cutter boundary."""
-
-    existing = [(tuple(edge.verts[0].co), tuple(edge.verts[1].co), None) for edge in bm.edges]
-    _update_indices(bm)
-    vertex_indices = {}
-    vertices = []
-    edges = []
-    already_present = 0
-    for edge in source_edges:
-        reflected = (
-            matching.mirror_coordinate(edge.verts[0].co, axis_index),
-            matching.mirror_coordinate(edge.verts[1].co, axis_index),
-        )
-        if _frozen_endpoint_match(reflected[0], reflected[1], existing, tolerance) is not None:
-            already_present += 1
-            continue
-        cutter_edge = []
-        for source_vertex, coordinate in zip(edge.verts, reflected, strict=True):
-            cutter_index = vertex_indices.get(source_vertex.index)
-            if cutter_index is None:
-                cutter_index = len(vertices)
-                vertex_indices[source_vertex.index] = cutter_index
-                vertices.append(coordinate)
-            cutter_edge.append(cutter_index)
-        if cutter_edge[0] != cutter_edge[1]:
-            edges.append((cutter_edge[0], cutter_edge[1]))
-    return vertices, edges, already_present
-
-
 def _frozen_collapsed_offset_markers(bm, source_edges, axis_index, tolerance):
     """Independent eager list oracle for the untouched collapsed-offset boundary."""
 
@@ -1118,42 +1088,12 @@ def _frozen_collapsed_offset_markers(bm, source_edges, axis_index, tolerance):
     return target_markers, ""
 
 
-def _normalize_cutter(result):
-    vertices, edges, already = result
-    return (
-        tuple(tuple(_float_bits(component) for component in vertex) for vertex in vertices),
-        tuple(edges),
-        already,
-    )
-
-
 def check_viii_unscoped_helper_boundaries():
-    """(viii) Cutter and collapsed-offset call sites retain their eager behavior."""
+    """(viii) The collapsed-offset helper retains its eager behavior."""
 
-    cutter = bmesh.new()
     collapsed = bmesh.new()
-    cutter_oracle = None
     collapsed_oracle = None
     try:
-        matched_source = _add_loose_edge(cutter, (-1.0, 0.0, 0.0), (-1.0, 1.0, 0.0))
-        unmatched_source = _add_loose_edge(cutter, (-2.0, 2.0, 0.0), (-2.0, 3.0, 0.0))
-        _add_loose_edge(cutter, (1.0, 0.0, 0.0), (1.0, 1.0, 0.0))
-        cutter_oracle = _clone_bmesh(cutter)
-        cutter_source_indices = (matched_source.index, unmatched_source.index)
-        candidate_cutter = stitch_projection.build_reflected_cutter(
-            cutter,
-            [matched_source, unmatched_source],
-            AXIS,
-            TOLERANCE,
-        )
-        eager_cutter = _frozen_build_reflected_cutter(
-            cutter_oracle,
-            [cutter_oracle.edges[index] for index in cutter_source_indices],
-            AXIS,
-            TOLERANCE,
-        )
-        assert _normalize_cutter(candidate_cutter) == _normalize_cutter(eager_cutter)
-
         marker_layer = collapsed.edges.layers.int.new(layer_names.EDGE_ORIGINAL_LAYER)
         source = _add_loose_edge(collapsed, (-1.0, 0.0, 0.0), (-1.0, 1.0, 0.0))
         source[marker_layer] = 0
@@ -1165,7 +1105,7 @@ def check_viii_unscoped_helper_boundaries():
             )
             target[marker_layer] = marker
         collapsed_oracle = _clone_bmesh(collapsed)
-        candidate_markers = stitch_projection.collapsed_offset_target_edge_markers(
+        candidate_markers = stitch_offset.collapsed_offset_target_edge_markers(
             collapsed,
             [source],
             AXIS,
@@ -1179,11 +1119,8 @@ def check_viii_unscoped_helper_boundaries():
         )
         assert candidate_markers == eager_markers == ({10}, "")
     finally:
-        if cutter_oracle is not None:
-            cutter_oracle.free()
         if collapsed_oracle is not None:
             collapsed_oracle.free()
-        cutter.free()
         collapsed.free()
 
 
