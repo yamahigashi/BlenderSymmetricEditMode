@@ -10,7 +10,7 @@ import mathutils.geometry
 from mathutils import Vector
 
 from . import stitch_common
-from ._types import FaceId, MirrorFaceMap
+from ._types import CarrierFrameMap, FaceId, MirrorFaceMap
 from .layer_names import EDGE_ORIGINAL_LAYER, FACE_ID_LAYER
 from .matching import coordinates_match, mirror_coordinate
 
@@ -150,11 +150,9 @@ def _resolve_reflected_vertex_on_target(
 def _face_surface_triangles(face: bmesh.types.BMFace):
     """Valid tessellation triangles covering the (possibly curved) face.
 
-    Only tris and quads are covered.  A quad diagonal is valid only when its
-    two triangles wind consistently — on a concave or folded quad the other
-    diagonal spans area outside the real surface and must not be offered.
-    N-gons are not covered at all: their interior-chain acceptance is declined
-    so those strokes keep using the projection fallback.
+    Tris and quads use their validated native tessellation.  N-gons use
+    Blender's ear-clipping tessellation, which covers concave boundary-split
+    faces without spanning outside the polygon.
     """
 
     vertices = face.verts
@@ -209,15 +207,220 @@ def _point_strictly_inside_face(
     return False
 
 
-def _interior_faces_for_point(
-    point: Vector,
-    candidate_faces: set[bmesh.types.BMFace],
-    tolerance: float,
-) -> list[bmesh.types.BMFace]:
-    return sorted(
-        (face for face in candidate_faces if face.is_valid and _point_strictly_inside_face(point, face, tolerance)),
-        key=lambda face: face.index,
+def _host_ids_by_vertex(
+    edge_records: list[tuple[int, int, set[FaceId]]],
+) -> dict[int, FaceId]:
+    """Return H(v) only when every adjacent path edge has one equal target ID."""
+
+    edge_ids_by_vertex: dict[int, list[set[FaceId]]] = defaultdict(list)
+    for source_a, source_b, target_ids in edge_records:
+        edge_ids_by_vertex[source_a].append(target_ids)
+        edge_ids_by_vertex[source_b].append(target_ids)
+
+    hosts: dict[int, FaceId] = {}
+    for vertex_key, target_id_sets in edge_ids_by_vertex.items():
+        if not target_id_sets or any(len(target_ids) != 1 for target_ids in target_id_sets):
+            continue
+        singleton_ids = {next(iter(target_ids)) for target_ids in target_id_sets}
+        if len(singleton_ids) == 1:
+            hosts[vertex_key] = next(iter(singleton_ids))
+    return hosts
+
+
+def _source_face_ids_by_vertex(
+    source_edges: Iterable[bmesh.types.BMEdge],
+    face_layer,
+) -> dict[int, set[FaceId]]:
+    source_face_ids: dict[int, set[FaceId]] = defaultdict(set)
+    for edge in source_edges:
+        face_ids = {FaceId(int(face[face_layer])) for face in edge.link_faces}
+        for vertex in edge.verts:
+            source_face_ids[hash(vertex)].update(face_ids)
+    return source_face_ids
+
+
+def _carrier_vectors(frame):
+    """Return carrier origin, normal and a stable in-plane basis."""
+
+    if frame is None or frame.normal is None:
+        return None
+    origin = Vector(frame.origin.as_tuple())
+    normal = Vector(frame.normal.as_tuple())
+    if normal.length <= 1.0e-12:
+        return None
+    normal.normalize()
+    if frame.basis_u is not None:
+        basis_u = Vector(frame.basis_u.as_tuple())
+        basis_u = basis_u - normal * basis_u.dot(normal)
+    else:
+        basis_u = Vector((1.0, 0.0, 0.0))
+        if abs(normal.dot(basis_u)) > 0.9:
+            basis_u = Vector((0.0, 1.0, 0.0))
+        basis_u = basis_u - normal * basis_u.dot(normal)
+    if basis_u.length <= 1.0e-12:
+        return None
+    basis_u.normalize()
+    basis_v = normal.cross(basis_u)
+    if basis_v.length <= 1.0e-12:
+        return None
+    basis_v.normalize()
+    return origin, normal, basis_u, basis_v
+
+
+def _carrier_plane(carrier_frames: CarrierFrameMap | None, face_id: FaceId):
+    """Return ``(origin, normal)`` for the session carrier plane, if present."""
+
+    if carrier_frames is None:
+        return None
+    frame = carrier_frames.get(face_id)
+    vectors = _carrier_vectors(frame)
+    if vectors is None:
+        return None
+    return vectors[0], vectors[1]
+
+
+def _carrier_deviation(carrier_frames: CarrierFrameMap | None, face_id: FaceId) -> float | None:
+    if carrier_frames is None:
+        return None
+    frame = carrier_frames.get(face_id)
+    if frame is None or frame.normal is None:
+        return None
+    return float(frame.deviation)
+
+
+def _carrier_polygon_2d(carrier_frames: CarrierFrameMap | None, face_id: FaceId):
+    if carrier_frames is None:
+        return None
+    frame = carrier_frames.get(face_id)
+    vectors = _carrier_vectors(frame)
+    if vectors is None or not frame.vertices:
+        return None
+    origin, _normal, basis_u, basis_v = vectors
+    return [
+        (
+            (Vector(vertex.as_tuple()) - origin).dot(basis_u),
+            (Vector(vertex.as_tuple()) - origin).dot(basis_v),
+        )
+        for vertex in frame.vertices
+    ]
+
+
+def _orientation_2d(a, b, c) -> float:
+    return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+
+def _on_segment_2d(a, b, p) -> bool:
+    return (
+        abs(_orientation_2d(a, b, p)) <= 1.0e-12
+        and min(a[0], b[0]) - 1.0e-12 <= p[0] <= max(a[0], b[0]) + 1.0e-12
+        and min(a[1], b[1]) - 1.0e-12 <= p[1] <= max(a[1], b[1]) + 1.0e-12
     )
+
+
+def _segments_intersect_2d(a, b, c, d) -> bool:
+    orientations = (
+        _orientation_2d(a, b, c),
+        _orientation_2d(a, b, d),
+        _orientation_2d(c, d, a),
+        _orientation_2d(c, d, b),
+    )
+    if orientations[0] * orientations[1] < 0.0 and orientations[2] * orientations[3] < 0.0:
+        return True
+    return (
+        (abs(orientations[0]) <= 1.0e-12 and _on_segment_2d(a, b, c))
+        or (abs(orientations[1]) <= 1.0e-12 and _on_segment_2d(a, b, d))
+        or (abs(orientations[2]) <= 1.0e-12 and _on_segment_2d(c, d, a))
+        or (abs(orientations[3]) <= 1.0e-12 and _on_segment_2d(c, d, b))
+    )
+
+
+def _polygon_is_simple_nonzero(polygon) -> bool:
+    if len(polygon) < 3:
+        return False
+    area = sum(
+        polygon[index][0] * polygon[(index + 1) % len(polygon)][1]
+        - polygon[(index + 1) % len(polygon)][0] * polygon[index][1]
+        for index in range(len(polygon))
+    )
+    if abs(area) <= 1.0e-12:
+        return False
+    count = len(polygon)
+    for first in range(count):
+        second = (first + 1) % count
+        for other in range(first + 1, count):
+            other_next = (other + 1) % count
+            if first == other or second == other or first == other_next or second == other_next:
+                continue
+            if _segments_intersect_2d(polygon[first], polygon[second], polygon[other], polygon[other_next]):
+                return False
+    return True
+
+
+def _carrier_admissible(carrier_frames: CarrierFrameMap | None, face_id: FaceId) -> bool:
+    polygon = _carrier_polygon_2d(carrier_frames, face_id)
+    return polygon is not None and _polygon_is_simple_nonzero(polygon)
+
+
+def _projected_point_inside_carrier(
+    point: Vector,
+    face: bmesh.types.BMFace,
+    carrier_frames: CarrierFrameMap | None,
+    face_id: FaceId,
+) -> bool:
+    carrier_plane = _carrier_plane(carrier_frames, face_id)
+    vectors = _carrier_vectors(carrier_frames.get(face_id) if carrier_frames is not None else None)
+    if (
+        carrier_plane is None
+        or vectors is None
+        or not _carrier_admissible(carrier_frames, face_id)
+        or not face.is_valid
+    ):
+        return False
+    origin, normal = carrier_plane
+    _vector_origin, _vector_normal, basis_u, basis_v = vectors
+    polygon = [
+        (
+            (vertex.co - origin).dot(basis_u),
+            (vertex.co - origin).dot(basis_v),
+        )
+        for vertex in face.verts
+    ]
+    if not _polygon_is_simple_nonzero(polygon):
+        return False
+    projected = point - normal * (point - origin).dot(normal)
+    query = ((projected - origin).dot(basis_u), (projected - origin).dot(basis_v))
+    for index, start in enumerate(polygon):
+        if _on_segment_2d(start, polygon[(index + 1) % len(polygon)], query):
+            return False
+    inside = False
+    for index, start in enumerate(polygon):
+        end = polygon[(index + 1) % len(polygon)]
+        if (start[1] > query[1]) != (end[1] > query[1]):
+            crossing = (end[0] - start[0]) * (query[1] - start[1]) / (end[1] - start[1]) + start[0]
+            if query[0] < crossing:
+                inside = not inside
+    return inside
+
+
+def _distance_to_face_surface(point: Vector, face: bmesh.types.BMFace) -> float:
+    distances = []
+    for corner_a, corner_b, corner_c in _face_surface_triangles(face):
+        closest = mathutils.geometry.closest_point_on_tri(point, corner_a, corner_b, corner_c)
+        distances.append((closest - point).length)
+    return min(distances, default=float("inf"))
+
+
+def _point_is_non_near_face(point: Vector, face: bmesh.types.BMFace, tolerance: float) -> bool:
+    if any(coordinates_match(vertex.co, point, tolerance) for vertex in face.verts):
+        return False
+    edge_limit = max(2.0 * tolerance, 1.0e-9)
+    for edge in face.edges:
+        if not edge.is_valid:
+            continue
+        distance, factor = stitch_common._point_segment_distance_and_factor(point, edge)
+        if distance <= edge_limit and stitch_common._is_interior_edge_factor(factor, edge.calc_length(), tolerance):
+            return False
+    return True
 
 
 def _path_adjacency(edge_records: list[tuple[int, int, set[FaceId]]]) -> dict[int, set[int]]:
@@ -236,25 +439,7 @@ class _InteriorChain:
     end_a: int
     end_b: int
     target_face_id: FaceId
-
-
-def _faces_supporting_resolution(
-    kind: str,
-    exact_vertex: bmesh.types.BMVert | None,
-    target_edge: bmesh.types.BMEdge | None,
-    interior_face: bmesh.types.BMFace | None,
-    candidate_faces: set[bmesh.types.BMFace],
-) -> set[bmesh.types.BMFace]:
-    if kind == "exact":
-        assert exact_vertex is not None
-        return {face for face in exact_vertex.link_faces if face.is_valid and face in candidate_faces}
-    if kind == "boundary":
-        assert target_edge is not None
-        return {face for face in target_edge.link_faces if face.is_valid and face in candidate_faces}
-    if kind == "interior":
-        assert interior_face is not None
-        return {interior_face}
-    return set()
+    source_face_ids: tuple[FaceId, ...] = ()
 
 
 def _classify_reflected_vertices(
@@ -263,6 +448,10 @@ def _classify_reflected_vertices(
     target_faces_by_id: dict[FaceId, list[bmesh.types.BMFace]],
     axis_index: int,
     tolerance: float,
+    *,
+    edge_records: list[tuple[int, int, set[FaceId]]] | None = None,
+    source_face_ids_by_vertex: dict[int, set[FaceId]] | None = None,
+    carrier_frames: CarrierFrameMap | None = None,
 ) -> tuple[
     dict[int, tuple[str, bmesh.types.BMVert | None, bmesh.types.BMEdge | None, float, bmesh.types.BMFace | None, str]],
     str,
@@ -277,6 +466,7 @@ def _classify_reflected_vertices(
         int,
         tuple[str, bmesh.types.BMVert | None, bmesh.types.BMEdge | None, float, bmesh.types.BMFace | None, str],
     ] = {}
+    host_ids = _host_ids_by_vertex(edge_records) if edge_records is not None else None
     for source_key, source_vertex in source_vertex_by_key.items():
         expected = mirror_coordinate(source_vertex.co, axis_index)
         candidate_faces = {
@@ -295,16 +485,46 @@ def _classify_reflected_vertices(
             continue
         if kind == "ambiguous":
             return classification, reason
-        interior_faces = _interior_faces_for_point(expected, candidate_faces, tolerance)
-        if len(interior_faces) == 1:
-            classification[source_key] = ("interior", None, None, 0.0, interior_faces[0], "")
+        host_id = host_ids.get(source_key) if host_ids is not None else None
+        if host_id is None:
+            return classification, "interior vertex has no unique singleton target face ID (R-H1)"
+        if not _carrier_admissible(carrier_frames, host_id):
+            return classification, "carrier face is not admissible for an interior host (R-H2)"
+        source_face_ids = (source_face_ids_by_vertex or {}).get(source_key, set())
+        if len(source_face_ids) != 1:
+            return classification, "interior vertex has no unique source face ID"
+        source_face_id = next(iter(source_face_ids))
+        source_deviation = _carrier_deviation(carrier_frames, source_face_id)
+        target_deviation = _carrier_deviation(carrier_frames, host_id)
+        if source_deviation is None or target_deviation is None:
+            return classification, "carrier frame is missing or degenerate for an interior host"
+        effective_surface_limit = max(20.0 * tolerance, 2.5 * max(source_deviation, target_deviation))
+        host_faces = [face for face in target_faces_by_id.get(host_id, ()) if face.is_valid]
+        strict_faces = [face for face in host_faces if _point_strictly_inside_face(expected, face, tolerance)]
+        if len(strict_faces) == 1:
+            classification[source_key] = ("interior", None, None, 0.0, strict_faces[0], "")
             continue
-        if len(interior_faces) > 1:
-            return (
-                classification,
-                "ambiguous mirrored target faces for interior point",
-            )
-        return classification, reason
+        distance_faces = [
+            face for face in host_faces if _distance_to_face_surface(expected, face) <= effective_surface_limit
+        ]
+        relaxed_faces = [
+            face
+            for face in distance_faces
+            if _point_is_non_near_face(expected, face, tolerance)
+            and _projected_point_inside_carrier(expected, face, carrier_frames, host_id)
+        ]
+        if len(relaxed_faces) == 1:
+            classification[source_key] = ("interior", None, None, 0.0, relaxed_faces[0], "")
+            continue
+        if len(relaxed_faces) > 1:
+            return classification, "ambiguous mirrored target faces for interior point"
+        if strict_faces:
+            return classification, "ambiguous mirrored target faces for interior point"
+        if not distance_faces:
+            return classification, "reflected interior point exceeds the carrier surface sanity bound (R-H3)"
+        if not any(_point_is_non_near_face(expected, face, tolerance) for face in distance_faces):
+            return classification, "reflected interior point is too close to a target boundary"
+        return classification, "reflected interior point fails projected containment"
     return classification, ""
 
 
@@ -320,18 +540,24 @@ def _find_interior_chains(
     face_layer,
     axis_index: int,
     tolerance: float,
+    *,
+    edge_records: list[tuple[int, int, set[FaceId]]] | None = None,
+    source_face_ids_by_vertex: dict[int, set[FaceId]] | None = None,
 ) -> tuple[list[_InteriorChain], str]:
-    """Return accepted interior chains, or a non-empty reason on decline."""
+    """Return chains after checking shape and common host IDs only (R-H5)."""
 
     interior_keys = {key for key, (kind, *_rest) in classification.items() if kind == "interior"}
     if not interior_keys:
         return [], ""
+    if edge_records is None:
+        return [], "interior chain host context is missing (R-H1)"
 
     for key in interior_keys:
         if len(adjacency.get(key, ())) != 2:
             # Degree-1 tip or branch (degree >= 3): not a simple chain.
             return [], "a reflected cut vertex is not on a target boundary edge"
 
+    host_ids = _host_ids_by_vertex(edge_records)
     visited: set[int] = set()
     chains: list[_InteriorChain] = []
 
@@ -426,37 +652,16 @@ def _find_interior_chains(
         if classification[end_b][0] in {"missing", "ambiguous"}:
             return [], classification[end_b][5] or "a reflected cut vertex is not on a target boundary edge"
 
-        # Common target face among chain members and both ends.
-        common_faces: set[bmesh.types.BMFace] | None = None
-        for key in (*ordered, end_a, end_b):
-            kind, exact_vertex, target_edge, _factor, interior_face, _reason = classification[key]
-            candidate_faces = {
-                face
-                for target_id in target_ids_by_vertex[key]
-                for face in target_faces_by_id.get(target_id, ())
-                if face.is_valid
-            }
-            supported = _faces_supporting_resolution(
-                kind,
-                exact_vertex,
-                target_edge,
-                interior_face,
-                candidate_faces,
-            )
-            if common_faces is None:
-                common_faces = set(supported)
-            else:
-                common_faces &= supported
-        if not common_faces or len(common_faces) != 1:
+        member_host_ids = {host_ids.get(key) for key in ordered}
+        if len(member_host_ids) != 1 or None in member_host_ids:
             return [], "a reflected cut vertex is not on a target boundary edge"
-
-        common_face = next(iter(common_faces))
-        target_face_id = FaceId(int(common_face[face_layer]))
-        # Every interior member must actually use this same face instance.
-        for key in ordered:
-            interior_face = classification[key][4]
-            if interior_face is None or interior_face != common_face:
-                return [], "a reflected cut vertex is not on a target boundary edge"
+        target_face_id = next(iter(member_host_ids))
+        if target_face_id not in target_ids_by_vertex.get(
+            end_a, set()
+        ) or target_face_id not in target_ids_by_vertex.get(end_b, set()):
+            return [], "a reflected cut vertex has no common target face ID"
+        source_face_sets = [(source_face_ids_by_vertex or {}).get(key, set()) for key in ordered]
+        source_face_ids = tuple(next(iter(face_ids)) for face_ids in source_face_sets if len(face_ids) == 1)
 
         chains.append(
             _InteriorChain(
@@ -464,6 +669,7 @@ def _find_interior_chains(
                 end_a=end_a,
                 end_b=end_b,
                 target_face_id=target_face_id,
+                source_face_ids=source_face_ids,
             )
         )
 
@@ -494,43 +700,83 @@ def _realize_interior_chain(
     realized_face_ids: set[FaceId],
     *,
     selection_tracker: stitch_common._SelectionMutationTracker | None = None,
+    target_faces_by_id: dict[FaceId, list[bmesh.types.BMFace]] | None = None,
+    lineage_by_face: dict[bmesh.types.BMFace, object] | None = None,
+    classification: dict | None = None,
+    carrier_frames: CarrierFrameMap | None = None,
 ) -> tuple[int, int, str, dict | None]:
     """face_split one accepted interior chain. Returns created/already_present delta."""
 
+    if target_faces_by_id is None or lineage_by_face is None or classification is None or carrier_frames is None:
+        return 0, 0, "interior chain realization context is missing (R-H4/R-P1)", existing_edges
     end_a = target_vertex_by_source_key[chain.end_a]
     end_b = target_vertex_by_source_key[chain.end_b]
     reflected_coords = [mirror_coordinate(source_vertex_by_key[member].co, axis_index) for member in chain.members]
     candidate_faces = sorted(
-        (
-            face
-            for face in set(end_a.link_faces).intersection(end_b.link_faces)
-            if face.is_valid and FaceId(int(face[face_layer])) == chain.target_face_id
-        ),
+        (face for face in target_faces_by_id.get(chain.target_face_id, ()) if face.is_valid),
         key=lambda face: face.index,
     )
-    # Descendants of prior splits inherit the parent face id, so several
-    # candidates can share the chain's target id.  Only the face that strictly
-    # contains every reflected interior coordinate is the correct host.
-    #
-    # The strict re-test cannot be applied to the untouched single-candidate
-    # case: the boundary end splits have already turned the host quad into an
-    # n-gon whose ear-clip triangulation deviates from the evaluated quad
-    # surface by more than the tolerance-scale limit on curved meshes, so it
-    # would falsely decline (classification accepted these coordinates on the
-    # pre-split ancestor during this same apply call).  Once an earlier chain
-    # has face_split this target id, a lone shared candidate may be the wrong
-    # descendant, so only then is the strict containment test decisive.
-    if len(candidate_faces) == 1 and chain.target_face_id not in realized_face_ids:
-        target_face = candidate_faces[0]
+    candidate_lineages = {
+        lineage_by_face.get(classification[key][4])
+        for key in chain.members
+        if classification is not None and classification.get(key, (None, None, None, None, None))[4] is not None
+    }
+    if classification is not None and (len(candidate_lineages) != 1 or None in candidate_lineages):
+        return 0, 0, "interior chain classification lineages are inconsistent", existing_edges
+    classification_lineage = next(iter(candidate_lineages), None)
+
+    linked_faces = [face for face in candidate_faces if end_a in face.verts and end_b in face.verts]
+    # A unique live instance with linked ends is the unconditional R-H4-1
+    # route.  Geometry is consulted only for descendant ambiguity.
+    if (
+        len(candidate_faces) == 1
+        and len(linked_faces) == 1
+        and chain.target_face_id not in realized_face_ids
+        and (classification is None or lineage_by_face.get(linked_faces[0]) == classification_lineage)
+    ):
+        target_face = linked_faces[0]
     else:
-        containing_faces = [
+        target_deviation = _carrier_deviation(carrier_frames, chain.target_face_id)
+        if target_deviation is None or len(chain.source_face_ids) != len(chain.members):
+            return 0, 0, "carrier frame is missing or degenerate for an interior host", existing_edges
+        source_deviations = tuple(
+            _carrier_deviation(carrier_frames, source_face_id) for source_face_id in chain.source_face_ids
+        )
+        if any(deviation is None for deviation in source_deviations):
+            return 0, 0, "carrier frame is missing or degenerate for an interior host", existing_edges
+        strict_faces = [
             face
             for face in candidate_faces
             if all(_point_strictly_inside_face(coordinate, face, tolerance) for coordinate in reflected_coords)
         ]
-        if len(containing_faces) != 1:
-            return 0, 0, "could not place mirrored interior chain on a target face", existing_edges
-        target_face = containing_faces[0]
+        if len(strict_faces) == 1:
+            target_face = strict_faces[0]
+        else:
+            relaxed_faces = [
+                face
+                for face in candidate_faces
+                if all(
+                    _distance_to_face_surface(coordinate, face)
+                    <= max(
+                        20.0 * tolerance,
+                        2.5
+                        * max(
+                            source_deviation,
+                            target_deviation,
+                        ),
+                    )
+                    and _point_is_non_near_face(coordinate, face, tolerance)
+                    and _projected_point_inside_carrier(coordinate, face, carrier_frames, chain.target_face_id)
+                    for coordinate, source_deviation in zip(reflected_coords, source_deviations, strict=True)
+                )
+            ]
+            if len(relaxed_faces) != 1:
+                return 0, 0, "could not place mirrored interior chain on a target face", existing_edges
+            target_face = relaxed_faces[0]
+        if target_face not in linked_faces:
+            return 0, 0, "mirrored interior chain winner does not link both endpoints", existing_edges
+        if classification is not None and lineage_by_face.get(target_face) != classification_lineage:
+            return 0, 0, "mirrored interior chain winner has a different classification lineage", existing_edges
 
     try:
         if selection_tracker is not None:
@@ -548,6 +794,9 @@ def _realize_interior_chain(
     if new_face is None or not new_face.is_valid or not target_face.is_valid:
         return 0, 0, "could not split a target face for interior chain", existing_edges
     realized_face_ids.add(chain.target_face_id)
+    lineage_token = lineage_by_face.get(target_face)
+    lineage_by_face[new_face] = lineage_token
+    target_faces_by_id.setdefault(chain.target_face_id, []).append(new_face)
     if selection_tracker is not None:
         selection_tracker.add_face(target_face)
         selection_tracker.add_face(new_face)
@@ -606,12 +855,95 @@ def _realize_interior_chain(
     return created, already, "", existing_edges
 
 
+def _partition_wire_edges(
+    source_edges: list[bmesh.types.BMEdge],
+) -> tuple[list[bmesh.types.BMEdge], list[bmesh.types.BMEdge]]:
+    """Split the path into wire edges (no link faces) and face edges (R-W1)."""
+
+    wire_edges = [edge for edge in source_edges if not edge.link_faces]
+    face_edges = [edge for edge in source_edges if edge.link_faces]
+    return wire_edges, face_edges
+
+
+def _wire_endpoint_candidates(
+    bm: bmesh.types.BMesh,
+    coordinate: Vector,
+    tolerance: float,
+) -> list[bmesh.types.BMVert]:
+    return [vertex for vertex in bm.verts if vertex.is_valid and coordinates_match(vertex.co, coordinate, tolerance)]
+
+
+def _wire_endpoints_resolvable(
+    bm: bmesh.types.BMesh,
+    wire_edges: list[bmesh.types.BMEdge],
+    axis_index: int,
+    tolerance: float,
+) -> bool:
+    for edge in wire_edges:
+        for vertex in edge.verts:
+            expected = mirror_coordinate(vertex.co, axis_index)
+            if len(_wire_endpoint_candidates(bm, expected, tolerance)) > 1:
+                return False
+    return True
+
+
+def _mirror_wire_edges(
+    bm: bmesh.types.BMesh,
+    wire_edges: list[bmesh.types.BMEdge],
+    axis_index: int,
+    tolerance: float,
+    marker_layer,
+    tracker: stitch_common._SelectionMutationTracker,
+) -> tuple[int, int, str]:
+    """Mirror dangling wire strokes as wires (R-W1). Runs after the face
+    pipeline so endpoints it created are reusable for resolution."""
+
+    created = 0
+    already = 0
+    for edge in wire_edges:
+        resolved: list[bmesh.types.BMVert] = []
+        pending_coords: list[Vector] = []
+        for vertex in edge.verts:
+            expected = mirror_coordinate(vertex.co, axis_index)
+            candidates = _wire_endpoint_candidates(bm, expected, tolerance)
+            if len(candidates) > 1:
+                return created, already, "ambiguous mirrored wire endpoint"
+            if candidates:
+                resolved.append(candidates[0])
+                pending_coords.append(None)
+            else:
+                resolved.append(None)
+                pending_coords.append(expected)
+        if resolved[0] is not None and resolved[0] is resolved[1]:
+            return created, already, "a mirrored wire segment is degenerate"
+        if resolved[0] is not None and resolved[1] is not None:
+            existing = bm.edges.get([resolved[0], resolved[1]])
+            if existing is not None:
+                tracker.add_edge(existing)
+                already += 1
+                continue
+        endpoints = []
+        for vertex, expected in zip(resolved, pending_coords, strict=False):
+            if vertex is None:
+                vertex = bm.verts.new(expected)
+                tracker.add_vertex(vertex)
+                vertex.select = False
+            endpoints.append(vertex)
+        new_edge = bm.edges.new((endpoints[0], endpoints[1]))
+        tracker.add_edge(new_edge)
+        new_edge[marker_layer] = 0
+        new_edge.select = False
+        created += 1
+    return created, already, ""
+
+
 def reflected_path_uses_only_target_boundaries(
     bm: bmesh.types.BMesh,
     source_edges: Iterable[bmesh.types.BMEdge],
     axis_index: int,
     tolerance: float,
     mirror_face_ids: MirrorFaceMap,
+    carrier_frames: CarrierFrameMap | None = None,
 ) -> bool:
     """Return whether the direct path builder supports every reflected vertex.
 
@@ -627,6 +959,12 @@ def reflected_path_uses_only_target_boundaries(
     if not source_edges or face_layer is None:
         return False
 
+    wire_edges, face_edges = _partition_wire_edges(source_edges)
+    if wire_edges and not _wire_endpoints_resolvable(bm, wire_edges, axis_index, tolerance):
+        return False
+    if not face_edges:
+        return bool(wire_edges)
+
     (
         source_vertex_by_key,
         target_ids_by_vertex,
@@ -634,7 +972,7 @@ def reflected_path_uses_only_target_boundaries(
         unmatched_face_ids,
         _status,
     ) = _collect_reflected_path_context(
-        source_edges,
+        face_edges,
         face_layer,
         mirror_face_ids,
         require_all_mirrored=True,
@@ -644,12 +982,16 @@ def reflected_path_uses_only_target_boundaries(
 
     needed_target_ids = {target_id for target_ids in target_ids_by_vertex.values() for target_id in target_ids}
     target_faces_by_id = _target_faces_by_id(bm, face_layer, needed_target_ids)
+    source_face_ids_by_vertex = _source_face_ids_by_vertex(face_edges, face_layer)
     classification, reason = _classify_reflected_vertices(
         source_vertex_by_key,
         target_ids_by_vertex,
         target_faces_by_id,
         axis_index,
         tolerance,
+        edge_records=edge_records,
+        source_face_ids_by_vertex=source_face_ids_by_vertex,
+        carrier_frames=carrier_frames,
     )
     if reason:
         return False
@@ -664,6 +1006,8 @@ def reflected_path_uses_only_target_boundaries(
         face_layer,
         axis_index,
         tolerance,
+        edge_records=edge_records,
+        source_face_ids_by_vertex=source_face_ids_by_vertex,
     )
     return not chain_reason
 
@@ -675,6 +1019,7 @@ def apply_reflected_path_topology(
     axis_index: int,
     tolerance: float,
     mirror_face_ids: MirrorFaceMap,
+    carrier_frames: CarrierFrameMap | None = None,
     *,
     return_summary: Literal[False] = ...,
 ) -> tuple[int, int, str]: ...
@@ -685,6 +1030,7 @@ def apply_reflected_path_topology(
     axis_index: int,
     tolerance: float,
     mirror_face_ids: MirrorFaceMap,
+    carrier_frames: CarrierFrameMap | None = None,
     *,
     return_summary: Literal[True],
 ) -> tuple[int, int, str, stitch_common.SelectionMutationSummary]: ...
@@ -694,6 +1040,7 @@ def apply_reflected_path_topology(
     axis_index: int,
     tolerance: float,
     mirror_face_ids: MirrorFaceMap,
+    carrier_frames: CarrierFrameMap | None = None,
     *,
     return_summary: bool = False,
 ) -> tuple[int, int, str] | tuple[int, int, str, stitch_common.SelectionMutationSummary]:
@@ -740,6 +1087,10 @@ def apply_reflected_path_topology(
     if marker_layer is None or face_layer is None:
         return _result(0, 0, "temporary topology markers are missing")
 
+    # Wire (dangling) strokes have no carrier faces and mirror as wires after
+    # the face pipeline (R-W1); the face pipeline below sees face edges only.
+    wire_edges, face_edges = _partition_wire_edges(source_edges)
+
     # Capture every source-side relationship before modifying the target. This
     # also makes faces which touch the symmetry plane safe to process.
     (
@@ -749,7 +1100,7 @@ def apply_reflected_path_topology(
         unmatched_face_ids,
         _status,
     ) = _collect_reflected_path_context(
-        source_edges,
+        face_edges,
         face_layer,
         mirror_face_ids,
         require_all_mirrored=False,
@@ -762,12 +1113,19 @@ def apply_reflected_path_topology(
 
     needed_target_ids = {target_id for target_ids in target_ids_by_vertex.values() for target_id in target_ids}
     target_faces_by_id = _target_faces_by_id(bm, face_layer, needed_target_ids)
+    source_face_ids_by_vertex = _source_face_ids_by_vertex(face_edges, face_layer)
+    lineage_by_face: dict[bmesh.types.BMFace, object] = {
+        face: object() for faces in target_faces_by_id.values() for face in faces if face.is_valid
+    }
     classification, classify_reason = _classify_reflected_vertices(
         source_vertex_by_key,
         target_ids_by_vertex,
         target_faces_by_id,
         axis_index,
         tolerance,
+        edge_records=edge_records,
+        source_face_ids_by_vertex=source_face_ids_by_vertex,
+        carrier_frames=carrier_frames,
     )
     if classify_reason:
         return _result(0, 0, classify_reason)
@@ -782,6 +1140,8 @@ def apply_reflected_path_topology(
         face_layer,
         axis_index,
         tolerance,
+        edge_records=edge_records,
+        source_face_ids_by_vertex=source_face_ids_by_vertex,
     )
     if chain_reason:
         return _result(0, 0, chain_reason)
@@ -849,6 +1209,10 @@ def apply_reflected_path_topology(
             existing_edges,
             realized_face_ids,
             selection_tracker=tracker,
+            target_faces_by_id=target_faces_by_id,
+            lineage_by_face=lineage_by_face,
+            classification=classification,
+            carrier_frames=carrier_frames,
         )
         if fail_reason:
             return _result(created_edges, already_present, fail_reason)
@@ -967,6 +1331,20 @@ def apply_reflected_path_topology(
         if deferred and not progress:
             return _result(created_edges, already_present, f"could not place {len(deferred)} mirrored cut segment(s)")
         pending = deferred
+
+    if wire_edges:
+        wire_created, wire_already, wire_reason = _mirror_wire_edges(
+            bm,
+            wire_edges,
+            axis_index,
+            tolerance,
+            marker_layer,
+            tracker,
+        )
+        created_edges += wire_created
+        already_present += wire_already
+        if wire_reason:
+            return _result(created_edges, already_present, wire_reason)
 
     bm.normal_update()
     return _result(created_edges, already_present, "")

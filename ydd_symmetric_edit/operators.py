@@ -377,6 +377,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
         cutter = None
         cutter_mesh = None
         backup_mesh = None
+        direct_retry_backup = None
         projection_committed = False
         preexisting_vertex_keys = set()
         result = {"CANCELLED"}
@@ -389,6 +390,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
         restore_summary_complete = True
         side: str | None = None
         mirror_failure: str | None = None
+        direct_failure_reason: str | None = None
         rollback_failed = False
         backup_creation_failed = False
         mesh_select_mode = MeshSelectionMode(
@@ -627,7 +629,8 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                 )
                 if unmatched:
                     raise SymmetricKnifeError(f"{len(unmatched)} cut face(s) have no exact mirrored counterpart")
-                if not target_face_ids:
+                wire_only_path = all(not edge.link_faces for edge in source_edges)
+                if not target_face_ids and not wire_only_path:
                     raise SymmetricKnifeError("The native cut path has no carrier faces")
 
                 use_direct_topology = stitch_reflect.reflected_path_uses_only_target_boundaries(
@@ -636,7 +639,12 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     session.axis_index,
                     session.tolerance,
                     live_mirror_face_ids,
+                    session.carrier_frames,
                 )
+                if not use_direct_topology and wire_only_path:
+                    # Wires cannot be knife-projected; without the direct
+                    # route there is no fallback for a carrier-free path.
+                    raise SymmetricKnifeError("The native cut path has no carrier faces")
                 if use_direct_topology:
                     if backup_mesh is None:
                         selection_state = selection.add_selection_layers(bm)
@@ -646,10 +654,26 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                         # The backup only serializes the existing topology; it
                         # cannot change carrier scope or the live mirror map.
                         bm = bmesh.from_edit_mesh(obj.data)
-                        by_side, total_path_edges = _collect_knife_path_edges(bm)
+                        by_side, total_path_edges = _collect_knife_path_edges(bm, topology_changed=True)
+                        live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, _all_path_edges(by_side))
+                        _edge_layer, face_layer = snapshot.get_required_layers(bm)
                         source_edges = by_side["POSITIVE"] + by_side["NEGATIVE"]
                     if not source_edges:
                         raise SymmetricKnifeError("The native cut path was lost before mirroring")
+
+                    # Keep a second checkpoint after the p-stitch/crossing
+                    # scaffold.  A direct failure must retry projection from
+                    # this state; restoring the native checkpoint would lose
+                    # the scaffold and change the path seen by Knife Project.
+                    direct_retry_backup = _create_backup(bm)
+                    bm = bmesh.from_edit_mesh(obj.data)
+                    by_side, total_path_edges = _collect_knife_path_edges(bm, topology_changed=True)
+                    live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, _all_path_edges(by_side))
+                    _edge_layer, face_layer = snapshot.get_required_layers(bm)
+                    source_edges = by_side["POSITIVE"] + by_side["NEGATIVE"]
+                    if not source_edges:
+                        raise SymmetricKnifeError("The native cut path was lost before mirroring")
+
                     created, already_present, direct_reason, reflected_summary = (
                         stitch_reflect.apply_reflected_path_topology(
                             bm,
@@ -657,36 +681,74 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                             session.axis_index,
                             session.tolerance,
                             live_mirror_face_ids,
+                            session.carrier_frames,
                             return_summary=True,
                         )
                     )
-                    restore_mutation_summaries.append(reflected_summary)
-                    restore_summary_complete &= reflected_summary.complete
                     if direct_reason:
-                        raise SymmetricKnifeError(f"Could not rebuild the mirrored {tool_label}: {direct_reason}")
-                    if created + already_present != len(source_edges):
-                        raise SymmetricKnifeError(f"The mirrored {tool_label} topology did not match the source")
+                        direct_failure_reason = direct_reason
+                    elif created + already_present != len(source_edges):
+                        direct_failure_reason = (
+                            f"the mirrored {tool_label} topology did not match the source "
+                            f"({created + already_present}/{len(source_edges)})"
+                        )
+                    else:
+                        restore_mutation_summaries.append(reflected_summary)
+                        restore_summary_complete &= reflected_summary.complete
+                        direct_topology_success = True
+                        projection_committed = True
+                        result = {"FINISHED"}
+                        if not created:
+                            self.report(
+                                {"INFO"},
+                                f"The opposite side already contains this {tool_label}",
+                            )
+                            return result
 
-                    direct_topology_success = True
-
-                    projection_committed = True
-                    result = {"FINISHED"}
-                    if not created:
+                        warning_parts = []
+                        if already_present:
+                            warning_parts.append(f"{already_present} segment(s) already existed")
+                        suffix = f"; {'; '.join(warning_parts)}" if warning_parts else ""
                         self.report(
-                            {"INFO"},
-                            f"The opposite side already contains this {tool_label}",
+                            {"WARNING"} if warning_parts else {"INFO"},
+                            f"Mirrored {created} {tool_label} segment(s) to both sides{suffix}",
                         )
                         return result
 
-                    warning_parts = []
-                    if already_present:
-                        warning_parts.append(f"{already_present} segment(s) already existed")
-                    suffix = f"; {'; '.join(warning_parts)}" if warning_parts else ""
-                    self.report(
-                        {"WARNING"} if warning_parts else {"INFO"},
-                        f"Mirrored {created} {tool_label} segment(s) to both sides{suffix}",
+                    # Direct declined: restore the retry checkpoint and join
+                    # the exact projection entry below.  The restore rebuilds
+                    # every BMesh proxy; discard direct mutation summaries so
+                    # final selection restoration takes the full-restore path.
+                    try:
+                        backup.restore_topology_backup(obj.data, direct_retry_backup)
+                    except Exception as exc:
+                        traceback.print_exc()
+                        raise SymmetricKnifeError(
+                            f"Could not restore the direct retry checkpoint after direct failure: {exc}"
+                        ) from exc
+                    restore_mutation_summaries = []
+                    restore_summary_complete = True
+                    bm = bmesh.from_edit_mesh(obj.data)
+                    by_side, total_path_edges = _collect_knife_path_edges(bm, topology_changed=True)
+                    live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, _all_path_edges(by_side))
+                    _edge_layer, face_layer = snapshot.get_required_layers(bm)
+                    source_edges = by_side["POSITIVE"] + by_side["NEGATIVE"]
+                    if not source_edges:
+                        raise SymmetricKnifeError("The native cut path was lost after direct retry restore")
+
+                    target_face_ids, unmatched = stitch_pathedges.target_face_ids_for_edges(
+                        source_edges,
+                        face_layer,
+                        live_mirror_face_ids,
                     )
-                    return result
+                    if unmatched:
+                        raise SymmetricKnifeError(
+                            f"{len(unmatched)} cut face(s) have no exact mirrored counterpart after direct retry restore"
+                        )
+                    if not target_face_ids:
+                        raise SymmetricKnifeError("The native cut path has no carrier faces after direct retry restore")
+
+                    use_direct_topology = False
 
                 coordinates, cutter_edges, already_present = stitch_projection.build_reflected_cutter(
                     bm,
@@ -701,7 +763,8 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                         # stitched even if the mirror cutter is empty.
                         projection_committed = True
                     result = {"FINISHED"}
-                    self.report({"INFO"}, "The opposite side already contains this cut")
+                    suffix = f"; direct mirror declined: {direct_failure_reason}" if direct_failure_reason else ""
+                    self.report({"INFO"}, f"The opposite side already contains this cut{suffix}")
                     return result
 
                 stitch_projection.reserve_source_path_marker(bm)
@@ -885,6 +948,7 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                         session.axis_index,
                         session.tolerance,
                         live_mirror_face_ids,
+                        session.carrier_frames,
                     )
                     if direct_reason:
                         raise SymmetricKnifeError(f"Could not rebuild the mirrored {tool_label}: {direct_reason}")
@@ -1061,6 +1125,10 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
             except Exception:
                 traceback.print_exc()
             try:
+                backup.remove_backup(direct_retry_backup)
+            except Exception:
+                traceback.print_exc()
+            try:
                 if self.preserve_history_layers:
                     session_state._SESSIONS.pop(window_pointer, None)
                 else:
@@ -1075,6 +1143,8 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
         # rollback exception → fatal ERROR. Pre-mirror decline that never
         # attempted backup stays WARNING.
         if mirror_failure is not None:
+            if direct_failure_reason is not None:
+                mirror_failure = f"{mirror_failure}; direct mirror declined: {direct_failure_reason}"
             if rollback_failed or backup_creation_failed:
                 _finish_report(
                     self,
@@ -1094,11 +1164,15 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
         # _finish_report so tests can observe dual-report suppression.
         if result == {"FINISHED"} and mirrored_segment_count and mirror_failure is None:
             assert side is not None
+            direct_note = f"; direct mirror declined: {direct_failure_reason}" if direct_failure_reason else ""
             if side == "BOTH":
-                message = f"Mirrored {mirrored_segment_count} {tool_label} segment(s) to both sides{warning}"
+                message = (
+                    f"Mirrored {mirrored_segment_count} {tool_label} segment(s) to both sides{warning}{direct_note}"
+                )
             else:
                 message = (
-                    f"Mirrored {mirrored_segment_count} {tool_label} segment(s) from the {side.lower()} side{warning}"
+                    f"Mirrored {mirrored_segment_count} {tool_label} segment(s) from the {side.lower()} side"
+                    f"{warning}{direct_note}"
                 )
             _finish_report(self, {"WARNING"} if warning else {"INFO"}, message)
         return result

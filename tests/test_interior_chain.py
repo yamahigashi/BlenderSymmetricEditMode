@@ -2,25 +2,113 @@
 
 """Headless checks for face-interior terminal chains on the direct topology path.
 
-Contract: .agents/doc/fix_contract_knife_microedge_2026-08-12.md (revision 2)
-Oracle item #4: n=1 / n=2 accept; degree-3 and no-common-face decline.
+Contract: .agents/doc/fix_contract_knife_interior_host_2026-08-13.md (v5)
+Oracle items O2/O3/O4/O10 plus the retained n=1/n=2 and structural declines.
 """
 
 from __future__ import annotations
 
+import inspect
 import sys
 import traceback
 from pathlib import Path
 
 import bmesh
+import mathutils.geometry
 from mathutils import Vector
 
 PACKAGE_PARENT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(PACKAGE_PARENT))
+from fixtures_interior_host import (  # noqa: E402
+    build_endpoint_collision,
+    build_endpoint_link_mismatch,
+    build_lineage_mismatch_chain,
+    build_projection_outside_band,
+    build_rev3_both_side_stroke,
+    build_sanity_excess_band,
+    build_weak_surface_band,
+    fixture_from_builder,
+)
+
 from ydd_symmetric_edit import layer_names, matching, snapshot, stitch_pathedges, stitch_reflect  # noqa: E402
 
 TOLERANCE = 1.0e-5
 AXIS = matching.AXIS_INDEX["X"]
+
+
+def _call_gate(bm, source_edges, topology, axis=AXIS, tolerance=TOLERANCE):
+    """Call both the revision-3 and carrier-aware gate signatures."""
+
+    function = stitch_reflect.reflected_path_uses_only_target_boundaries
+    arguments = (bm, source_edges, axis, tolerance, topology.mirror_face_ids)
+    if "carrier_frames" in inspect.signature(function).parameters:
+        return bool(function(*arguments, carrier_frames=topology.carrier_frames))
+    return bool(function(*arguments))
+
+
+def _call_apply(bm, source_edges, topology, axis=AXIS, tolerance=TOLERANCE):
+    """Call both the revision-3 and carrier-aware apply signatures."""
+
+    function = stitch_reflect.apply_reflected_path_topology
+    arguments = (bm, source_edges, axis, tolerance, topology.mirror_face_ids)
+    if "carrier_frames" in inspect.signature(function).parameters:
+        return function(*arguments, carrier_frames=topology.carrier_frames)
+    return function(*arguments)
+
+
+def _path_interior_vertices(source_edges):
+    adjacency = {}
+    vertices = {}
+    for edge in source_edges:
+        left, right = edge.verts
+        left_key, right_key = hash(left), hash(right)
+        vertices[left_key] = left
+        vertices[right_key] = right
+        adjacency.setdefault(left_key, set()).add(right_key)
+        adjacency.setdefault(right_key, set()).add(left_key)
+    return [vertices[key] for key, neighbours in adjacency.items() if len(neighbours) == 2]
+
+
+def _target_face_for_vertex(fixture, source_vertex):
+    face_layer = fixture.bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
+    assert face_layer is not None
+    source_face = next(face for face in source_vertex.link_faces if face.is_valid)
+    source_id = int(source_face[face_layer])
+    target_id = fixture.topology.mirror_face_ids[source_id]
+    return next(face for face in fixture.bm.faces if int(face[face_layer]) == target_id and face.is_valid)
+
+
+def _target_instances(fixture, source_vertex):
+    face_layer = fixture.bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
+    assert face_layer is not None
+    source_face = next(face for face in source_vertex.link_faces if face.is_valid)
+    target_id = fixture.topology.mirror_face_ids[int(source_face[face_layer])]
+    return [face for face in fixture.bm.faces if face.is_valid and int(face[face_layer]) == target_id]
+
+
+def _surface_distance(point, face):
+    return min(
+        float((mathutils.geometry.closest_point_on_tri(point, a, b, c) - point).length)
+        for a, b, c in stitch_reflect._face_surface_triangles(face)
+    )
+
+
+def _s_eff(fixture, source_vertex, target_face):
+    face_layer = fixture.bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
+    assert face_layer is not None
+    source_face = next(face for face in source_vertex.link_faces if face.is_valid)
+    source_frame = fixture.topology.carrier_frames[int(source_face[face_layer])]
+    target_frame = fixture.topology.carrier_frames[int(target_face[face_layer])]
+    assert source_frame.normal is not None and target_frame.normal is not None
+    return max(20.0 * fixture.tolerance, 2.5 * max(source_frame.deviation, target_frame.deviation))
+
+
+def _project_to_carrier(point, frame):
+    assert frame.normal is not None
+    normal = Vector(frame.normal.as_tuple())
+    origin = Vector(frame.origin.as_tuple())
+    return point - normal * ((point - origin).dot(normal) / normal.length_squared)
 
 
 def build_two_symmetric_quads():
@@ -119,21 +207,9 @@ def check_interior_chain_n1():
         source = collect_source_path_edges(bm)
         assert len(source) == 2, len(source)
 
-        assert stitch_reflect.reflected_path_uses_only_target_boundaries(
-            bm,
-            source,
-            AXIS,
-            TOLERANCE,
-            topology.mirror_face_ids,
-        )
+        assert _call_gate(bm, source, topology)
 
-        created, already, reason = stitch_reflect.apply_reflected_path_topology(
-            bm,
-            source,
-            AXIS,
-            TOLERANCE,
-            topology.mirror_face_ids,
-        )
+        created, already, reason = _call_apply(bm, source, topology)
         assert reason == "", reason
         assert created == 2, (created, already, reason)
         assert already == 0, already
@@ -175,21 +251,9 @@ def check_interior_chain_n2():
         source = collect_source_path_edges(bm)
         assert len(source) == 3, len(source)
 
-        assert stitch_reflect.reflected_path_uses_only_target_boundaries(
-            bm,
-            source,
-            AXIS,
-            TOLERANCE,
-            topology.mirror_face_ids,
-        )
+        assert _call_gate(bm, source, topology)
 
-        created, already, reason = stitch_reflect.apply_reflected_path_topology(
-            bm,
-            source,
-            AXIS,
-            TOLERANCE,
-            topology.mirror_face_ids,
-        )
+        created, already, reason = _call_apply(bm, source, topology)
         assert reason == "", reason
         assert created == 3, (created, already, reason)
         assert already == 0, already
@@ -241,21 +305,9 @@ def check_decline_degree3_interior():
         source = collect_source_path_edges(bm)
         assert len(source) == 3, len(source)
 
-        assert not stitch_reflect.reflected_path_uses_only_target_boundaries(
-            bm,
-            source,
-            AXIS,
-            TOLERANCE,
-            topology.mirror_face_ids,
-        )
+        assert not _call_gate(bm, source, topology)
 
-        created, already, reason = stitch_reflect.apply_reflected_path_topology(
-            bm,
-            source,
-            AXIS,
-            TOLERANCE,
-            topology.mirror_face_ids,
-        )
+        created, already, reason = _call_apply(bm, source, topology)
         assert created == 0 and already == 0
         assert reason == "a reflected cut vertex is not on a target boundary edge", reason
     finally:
@@ -374,30 +426,22 @@ def check_decline_no_common_face():
         source = collect_source_path_edges(bm)
         assert len(source) == 3, len(source)
 
-        assert not stitch_reflect.reflected_path_uses_only_target_boundaries(
-            bm,
-            source,
-            AXIS,
-            TOLERANCE,
-            topology.mirror_face_ids,
+        # Contract v6 R-W1: the wire bridge no longer forces a decline. The
+        # two face segments end on target boundaries and the bridge mirrors
+        # as a wire, so the whole path is now directly acceptable.
+        assert _call_gate(bm, source, topology)
+        created, already, reason = _call_apply(bm, source, topology)
+        assert reason == "", reason
+        assert created == 3 and already == 0, (created, already)
+        bridge_mirror = next(
+            (
+                edge
+                for edge in bm.edges
+                if edge.is_valid and edge.is_wire and all(vertex.co.x > 0.0 for vertex in edge.verts)
+            ),
+            None,
         )
-
-        created, already, reason = stitch_reflect.apply_reflected_path_topology(
-            bm,
-            source,
-            AXIS,
-            TOLERANCE,
-            topology.mirror_face_ids,
-        )
-        assert created == 0 and already == 0
-        # The wire bridge has no linked face, so apply declines at the
-        # no-target-face guard before reaching _find_interior_chains; the
-        # common-face intersection itself is exercised through the gate call
-        # above (gate and apply share the same chain-detection functions).
-        assert reason in {
-            "a reflected cut vertex is not on a target boundary edge",
-            "a source cut edge has no mirrored target face",
-        }, reason
+        assert bridge_mirror is not None
     finally:
         bm.free()
 
@@ -470,20 +514,8 @@ def check_curved_quad_single_candidate():
         source = collect_source_path_edges(bm)
         assert len(source) == 2, len(source)
 
-        assert stitch_reflect.reflected_path_uses_only_target_boundaries(
-            bm,
-            source,
-            AXIS,
-            TOLERANCE,
-            topology.mirror_face_ids,
-        )
-        created, already, reason = stitch_reflect.apply_reflected_path_topology(
-            bm,
-            source,
-            AXIS,
-            TOLERANCE,
-            topology.mirror_face_ids,
-        )
+        assert _call_gate(bm, source, topology)
+        created, already, reason = _call_apply(bm, source, topology)
         assert reason == "", reason
         assert created == 2, (created, already)
 
@@ -533,20 +565,8 @@ def check_two_chains_same_face():
         source = collect_source_path_edges(bm)
         assert len(source) == 4, len(source)
 
-        assert stitch_reflect.reflected_path_uses_only_target_boundaries(
-            bm,
-            source,
-            AXIS,
-            TOLERANCE,
-            topology.mirror_face_ids,
-        )
-        created, already, reason = stitch_reflect.apply_reflected_path_topology(
-            bm,
-            source,
-            AXIS,
-            TOLERANCE,
-            topology.mirror_face_ids,
-        )
+        assert _call_gate(bm, source, topology)
+        created, already, reason = _call_apply(bm, source, topology)
         assert reason == "", reason
         assert created == 4, (created, already)
 
@@ -562,6 +582,199 @@ def check_two_chains_same_face():
         bm.free()
 
 
+def check_o2_weak_surface_band():
+    """O2: accept a weakly curved surface band with exact mirror coordinates."""
+
+    fixture = fixture_from_builder("weak_surface_band", build_weak_surface_band)
+    try:
+        interiors = _path_interior_vertices(fixture.source_edges)
+        assert len(interiors) == 1
+        source_vertex = interiors[0]
+        target_face = _target_face_for_vertex(fixture, source_vertex)
+        reflected = matching.mirror_coordinate(source_vertex.co, fixture.axis)
+        source_distance = _surface_distance(
+            source_vertex.co, next(face for face in source_vertex.link_faces if face.is_valid)
+        )
+        target_distance = _surface_distance(reflected, target_face)
+        s_eff = _s_eff(fixture, source_vertex, target_face)
+        assert source_distance <= 1.0e-6, source_distance
+        assert 2.0 * fixture.tolerance < target_distance <= s_eff, (target_distance, s_eff)
+        assert _call_gate(fixture.bm, fixture.source_edges, fixture.topology)
+        created, already, reason = _call_apply(fixture.bm, fixture.source_edges, fixture.topology)
+        assert reason == "", reason
+        assert created + already == len(fixture.source_edges)
+        mirrored = next(
+            vertex for vertex in fixture.bm.verts if matching.coordinates_match(vertex.co, reflected, fixture.tolerance)
+        )
+        assert tuple(mirrored.co) == tuple(reflected)
+    finally:
+        fixture.free()
+
+
+def check_o3a_sanity_decline():
+    """O3(a): a constructed point beyond S_eff declines for the R-H3 reason."""
+
+    fixture = fixture_from_builder("sanity_excess_band", build_sanity_excess_band)
+    try:
+        source_vertex = _path_interior_vertices(fixture.source_edges)[0]
+        target_face = _target_face_for_vertex(fixture, source_vertex)
+        target_distance = _surface_distance(matching.mirror_coordinate(source_vertex.co, fixture.axis), target_face)
+        s_eff = _s_eff(fixture, source_vertex, target_face)
+        assert target_distance > s_eff, (target_distance, s_eff)
+        assert not _call_gate(fixture.bm, fixture.source_edges, fixture.topology)
+        created, already, reason = _call_apply(fixture.bm, fixture.source_edges, fixture.topology)
+        assert created == 0 and already == 0
+        assert reason and ("s_eff" in reason.lower() or "sanity" in reason.lower()), reason
+    finally:
+        fixture.free()
+
+
+def check_o3b_projection_containment_decline():
+    """O3(b): a near-surface point outside the projected carrier declines."""
+
+    fixture = fixture_from_builder("projection_outside_band", build_projection_outside_band)
+    try:
+        source_vertex = _path_interior_vertices(fixture.source_edges)[0]
+        target_face = _target_face_for_vertex(fixture, source_vertex)
+        face_layer = fixture.bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
+        assert face_layer is not None
+        frame = fixture.topology.carrier_frames[int(target_face[face_layer])]
+        projected = _project_to_carrier(matching.mirror_coordinate(source_vertex.co, fixture.axis), frame)
+        target_distance = _surface_distance(matching.mirror_coordinate(source_vertex.co, fixture.axis), target_face)
+        s_eff = _s_eff(fixture, source_vertex, target_face)
+        assert 2.0 * fixture.tolerance < target_distance <= s_eff, (target_distance, s_eff)
+        assert projected.x > max(float(vertex.co.x) for vertex in target_face.verts), tuple(projected)
+        assert not _call_gate(fixture.bm, fixture.source_edges, fixture.topology)
+        created, already, reason = _call_apply(fixture.bm, fixture.source_edges, fixture.topology)
+        assert created == 0 and already == 0
+        assert reason and "project" in reason.lower(), reason
+    finally:
+        fixture.free()
+
+
+def check_o4c_endpoint_collision_apply_decline():
+    """O4(c): pre-split instances + exact endpoint collapse reach R-H4."""
+
+    fixture = fixture_from_builder("endpoint_collision", build_endpoint_collision)
+    try:
+        interior = _path_interior_vertices(fixture.source_edges)[0]
+        assert len(_target_instances(fixture, interior)) == 2
+        path_vertices = {hash(vertex): vertex for edge in fixture.source_edges for vertex in edge.verts}
+        degree = {key: 0 for key in path_vertices}
+        for edge in fixture.source_edges:
+            degree[hash(edge.verts[0])] += 1
+            degree[hash(edge.verts[1])] += 1
+        endpoints = [path_vertices[key] for key, count in degree.items() if count == 1]
+        assert len(endpoints) == 2
+        target_vertex = next(
+            vertex
+            for vertex in fixture.bm.verts
+            if matching.coordinates_match(
+                vertex.co, matching.mirror_coordinate(endpoints[0].co, fixture.axis), fixture.tolerance
+            )
+        )
+        assert matching.coordinates_match(
+            target_vertex.co,
+            matching.mirror_coordinate(endpoints[1].co, fixture.axis),
+            fixture.tolerance,
+        )
+        assert _call_gate(fixture.bm, fixture.source_edges, fixture.topology)
+        created, already, reason = _call_apply(fixture.bm, fixture.source_edges, fixture.topology)
+        assert created == 0 and already == 0
+        assert reason and any(token in reason.lower() for token in ("split", "endpoint", "face")), reason
+    finally:
+        fixture.free()
+
+
+def check_o4a_lineage_apply_decline():
+    """O4(a): all members share an ID but classification lineages disagree."""
+
+    fixture = fixture_from_builder("lineage_mismatch_chain", build_lineage_mismatch_chain)
+    try:
+        assert len(_target_instances(fixture, _path_interior_vertices(fixture.source_edges)[0])) == 2
+        assert _call_gate(fixture.bm, fixture.source_edges, fixture.topology)
+        created, already, reason = _call_apply(fixture.bm, fixture.source_edges, fixture.topology)
+        assert created == 0 and already == 0
+        assert reason and "lineage" in reason.lower(), reason
+    finally:
+        fixture.free()
+
+
+def check_o4b_endpoint_link_apply_decline():
+    """O4(b): geometric winner does not link both chain endpoints."""
+
+    fixture = fixture_from_builder("endpoint_link_mismatch", build_endpoint_link_mismatch)
+    try:
+        assert len(_target_instances(fixture, _path_interior_vertices(fixture.source_edges)[0])) == 2
+        assert _call_gate(fixture.bm, fixture.source_edges, fixture.topology)
+        created, already, reason = _call_apply(fixture.bm, fixture.source_edges, fixture.topology)
+        assert created == 0 and already == 0
+        assert reason and any(token in reason.lower() for token in ("link", "endpoint", "place")), reason
+    finally:
+        fixture.free()
+
+
+def check_o10_both_side_stroke():
+    """O10: a stroke already present on both sides remains directly accepted."""
+
+    fixture = fixture_from_builder("rev3_both_side_stroke", build_rev3_both_side_stroke)
+    try:
+        assert _call_gate(fixture.bm, fixture.source_edges, fixture.topology)
+        created, already, reason = _call_apply(fixture.bm, fixture.source_edges, fixture.topology)
+        assert reason == "", reason
+        assert created + already == len(fixture.source_edges), (created, already)
+        assert already >= 1
+    finally:
+        fixture.free()
+
+
+def check_o14_wire_mixed():
+    """O14: wires mirror as wires alongside the face chain (R-W1)."""
+
+    from fixtures_interior_host import build_wire_mixed
+
+    fixture = fixture_from_builder("wire_mixed", build_wire_mixed)
+    try:
+        bm = fixture.bm
+        assert _call_gate(bm, fixture.source_edges, fixture.topology)
+        created, already, reason = _call_apply(bm, fixture.source_edges, fixture.topology)
+        assert reason == "", reason
+        assert created == len(fixture.source_edges) and already == 0, (created, already)
+        for edge in fixture.source_edges:
+            ra = Vector((-edge.verts[0].co.x, edge.verts[0].co.y, edge.verts[0].co.z))
+            rb = Vector((-edge.verts[1].co.x, edge.verts[1].co.y, edge.verts[1].co.z))
+            mirrored = next(
+                (
+                    other
+                    for other in bm.edges
+                    if other.is_valid
+                    and (
+                        ((other.verts[0].co - ra).length <= 1e-6 and (other.verts[1].co - rb).length <= 1e-6)
+                        or ((other.verts[0].co - rb).length <= 1e-6 and (other.verts[1].co - ra).length <= 1e-6)
+                    )
+                ),
+                None,
+            )
+            assert mirrored is not None, (tuple(ra), tuple(rb))
+            assert mirrored.is_wire == edge.is_wire
+    finally:
+        fixture.free()
+
+
+def check_o14_wire_ambiguous_decline():
+    """O14: a wire endpoint with two tol-close reflected vertices declines."""
+
+    from fixtures_interior_host import build_wire_ambiguous
+
+    fixture = fixture_from_builder("wire_ambiguous", build_wire_ambiguous)
+    try:
+        assert not _call_gate(fixture.bm, fixture.source_edges, fixture.topology)
+        created, already, reason = _call_apply(fixture.bm, fixture.source_edges, fixture.topology)
+        assert reason and "wire" in reason, (created, already, reason)
+    finally:
+        fixture.free()
+
+
 def run():
     check_interior_chain_n1()
     print("PASS check_interior_chain_n1", flush=True)
@@ -575,6 +788,24 @@ def run():
     print("PASS check_curved_quad_single_candidate", flush=True)
     check_two_chains_same_face()
     print("PASS check_two_chains_same_face", flush=True)
+    check_o2_weak_surface_band()
+    print("PASS check_o2_weak_surface_band", flush=True)
+    check_o3a_sanity_decline()
+    print("PASS check_o3a_sanity_decline", flush=True)
+    check_o3b_projection_containment_decline()
+    print("PASS check_o3b_projection_containment_decline", flush=True)
+    check_o4a_lineage_apply_decline()
+    print("PASS check_o4a_apply_decline", flush=True)
+    check_o4b_endpoint_link_apply_decline()
+    print("PASS check_o4b_apply_decline", flush=True)
+    check_o4c_endpoint_collision_apply_decline()
+    print("PASS check_o4c_endpoint_collision_apply_decline", flush=True)
+    check_o10_both_side_stroke()
+    print("PASS check_o10_both_side_stroke", flush=True)
+    check_o14_wire_mixed()
+    print("PASS check_o14_wire_mixed", flush=True)
+    check_o14_wire_ambiguous_decline()
+    print("PASS check_o14_wire_ambiguous_decline", flush=True)
     print("YSE_INTERIOR_CHAIN_OK", flush=True)
 
 
