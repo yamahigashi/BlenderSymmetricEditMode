@@ -12,7 +12,7 @@ Cases (final expected behavior; wave-1 a–e + wave-2 f–m per contract §D-2):
   (c) ENDPOINT_INTERIOR (T-junction) → endpoint reuse + other edge split, symmetric.
   (d) Partial collinear overlap → WARNING + FINISHED + native kept (rollback).
   (e) One-sided cut (no crossing) → existing both-sides mirror, regression.
-  (f) CROSSES p-stitch + off-plane PROPER pair → both succeed, backup once.
+  (f) CROSSES p-stitch + off-plane PROPER pair → both succeed, native + retry backups.
   (g) On-plane band q (|q_x|≈5e-6 ≤ tol) → single shared on-plane vertex.
   (h) ENDPOINT_ENDPOINT → reuse only, no split duplicates.
   (i) Triple cluster (≥3 segments) → one mirror pair, degree ≥ 6.
@@ -53,6 +53,8 @@ from ydd_symmetric_edit import (  # noqa: E402
     stitch_common,
     stitch_crossings,
     stitch_pathedges,
+    stitch_projection,
+    stitch_reflect,
 )
 
 MARKER_OK = "YSE_KNIFE_CROSS_MIRROR_STITCH_OK"
@@ -985,7 +987,9 @@ def case_f_crosses_plus_crossing(window, area, region) -> None:
         backup_mod.create_topology_backup = original_create  # type: ignore[assignment]
 
     assert finished == {"FINISHED"}, finished
-    assert len(backup_calls) == 1, f"expected exactly 1 backup, got {len(backup_calls)}"
+    # Contract v5 R-R1: the KNIFE direct path adds a direct_retry_backup
+    # checkpoint after the crossing scaffold, on top of the native backup.
+    assert len(backup_calls) == 2, f"expected native + direct-retry backups, got {len(backup_calls)}"
     assert not warning_messages(), operators._FINISH_REPORTS
 
     bm = bmesh.from_edit_mesh(obj.data)
@@ -1001,6 +1005,59 @@ def case_f_crosses_plus_crossing(window, area, region) -> None:
     assert_temp_layers_cleared(bm)
     assert not operators._SESSIONS
     print("YSE_KNIFE_CROSS_MIRROR_STITCH_CASE_F=OK", flush=True)
+
+
+def case_f3_crosses_direct_fail_retry(window, area, region) -> None:
+    """O11: a direct decline after the CROSSES scaffold keeps the scaffold.
+
+    The retry checkpoint (direct_retry_backup) restores the post-p-stitch
+    state, so the projection fallback must still see and preserve the
+    on-plane stitch vertex and the off-plane intersection pair.
+    """
+
+    print("YSE_KNIFE_CROSS_MIRROR_STITCH_CASE=f3_crosses_direct_fail_retry", flush=True)
+    clear_scene()
+    obj = make_symmetric_2x1_grid()
+    begin_edit_knife(window, area, region, obj)
+    simulate_case_f_cuts(obj)
+
+    original_apply = stitch_reflect.apply_reflected_path_topology
+    projection_calls: list[int] = []
+    original_cutter = stitch_projection.build_reflected_cutter
+
+    def forced_apply(*args, **kwargs):
+        result = original_apply(*args, **kwargs)
+        return (*result[:2], "forced partial mirror failure", *result[3:])
+
+    def _counting_cutter(*args, **kwargs):
+        projection_calls.append(1)
+        return original_cutter(*args, **kwargs)
+
+    stitch_reflect.apply_reflected_path_topology = forced_apply
+    stitch_projection.build_reflected_cutter = _counting_cutter
+    try:
+        finished = run_finish(window, area, region)
+    finally:
+        stitch_reflect.apply_reflected_path_topology = original_apply
+        stitch_projection.build_reflected_cutter = original_cutter
+
+    assert finished == {"FINISHED"}, finished
+    assert projection_calls, "the direct decline must retry through Knife Project"
+    assert not any(kind == "ERROR" for kind, _message in operators._FINISH_REPORTS)
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    # The p-stitch scaffold survived the retry restore: on-plane vertex and
+    # the off-plane intersection pair are still present.
+    assert any(abs(float(vertex.co.x)) <= 1.0e-4 for vertex in bm.verts), [tuple(v.co) for v in bm.verts]
+    q_plus = verts_near(bm, CASE_F_Q_PLUS, tolerance=2.0e-2)
+    q_minus = verts_near(bm, CASE_F_Q_MINUS, tolerance=2.0e-2)
+    assert len(q_plus) >= 1, (CASE_F_Q_PLUS, [tuple(v.co) for v in bm.verts])
+    assert len(q_minus) >= 1, (CASE_F_Q_MINUS, [tuple(v.co) for v in bm.verts])
+    assert_no_duplicate_edges(bm)
+    assert_x_symmetric(bm)
+    assert_temp_layers_cleared(bm)
+    assert not operators._SESSIONS
+    print("YSE_KNIFE_CROSS_MIRROR_STITCH_CASE_F3=OK", flush=True)
 
 
 def case_g_onplane_band(window, area, region) -> None:
@@ -1449,6 +1506,7 @@ def run_test() -> None:
         ("d_partial_collinear_decline", case_d_partial_collinear_decline),
         ("e_one_side_noop", case_e_one_side_noop),
         ("f_crosses_plus_crossing", case_f_crosses_plus_crossing),
+        ("f3_crosses_direct_fail_retry", case_f3_crosses_direct_fail_retry),
         ("g_onplane_band", case_g_onplane_band),
         ("h_endpoint_endpoint", case_h_endpoint_endpoint),
         ("i_triple_cluster", case_i_triple_cluster),
