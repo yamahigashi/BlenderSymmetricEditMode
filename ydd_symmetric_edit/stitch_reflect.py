@@ -1424,7 +1424,7 @@ def apply_reflected_path_topology(
     single ``bmesh.utils.face_split(..., coords=...)`` per chain.
 
     Existing segments are detected by BMVert identity *and* by endpoint
-    coordinate tolerance (same store as :func:`build_reflected_cutter`) so a
+    coordinate tolerance (same endpoint store used by the native mirror path) so a
     near-self-mirrored stroke does not invent a geometric duplicate. Multiple
     tol-local vertex candidates decline the whole apply (all-or-nothing).
 
@@ -1647,7 +1647,7 @@ def apply_reflected_path_topology(
         created_edges += created_delta
         already_present += already_delta
 
-    # Endpoint-tol store matches build_reflected_cutter so geometric duplicates
+    # Endpoint-tol store matches the native mirror path so geometric duplicates
     # (different BMVert pairs within tol) count as already_present.  Keep it
     # lazy: the common native-topology case resolves every segment by BMEdge
     # identity and never needs a geometric index.  Freeze the complete target

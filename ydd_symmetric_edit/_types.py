@@ -302,7 +302,6 @@ class KnifeSession:
     tool_kind: str = "KNIFE"
     history_token: int = 0
     saw_modal: bool = False
-    projection_view: ViewState | None = None
     symmetry_flags: SymmetryAxes = SymmetryAxes(False, False, False)
     symmetry_suspended: bool = False
     modal_absent_since: float | None = None

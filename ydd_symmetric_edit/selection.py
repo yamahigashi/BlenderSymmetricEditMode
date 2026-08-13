@@ -46,7 +46,7 @@ def saved_hidden_state_present(bm: bmesh.types.BMesh) -> bool:
 
 
 def add_selection_layers(bm: bmesh.types.BMesh) -> SelectionSnapshot:
-    """Snapshot native Knife's selection immediately before Knife Project."""
+    """Snapshot native Knife's selection immediately before the mirror stage."""
 
     saved_hidden_state_present = False
     for layers, name, _hidden_name in (
@@ -125,7 +125,7 @@ def restore_visibility_and_selection(
     hidden_by_face_id: HiddenFaceMap,
     selection_snapshot: SelectionSnapshot,
 ) -> None:
-    """Undo temporary hiding and Knife Project's selection replacement."""
+    """Undo temporary hiding and the mirror stage's selection replacement."""
 
     face_id_layer = bm.faces.layers.int.get(FACE_ID_LAYER)
     vertex_selection = bm.verts.layers.int.get(VERT_SELECTION_LAYER)

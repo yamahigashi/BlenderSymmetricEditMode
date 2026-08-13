@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import time
 import traceback
 
@@ -20,7 +19,6 @@ from .session import (
     _PASSTHROUGH_STABLE_TICKS,
     MODAL_IDENTIFIER_TOKENS,
     TOOL_PROFILES,
-    _capture_view_state,
     _find_saved_view,
     _find_window,
     cleanup_session,
@@ -100,17 +98,6 @@ def _session_has_new_path(session: KnifeSession) -> bool:
     except (ReferenceError, RuntimeError):
         return False
     return False
-
-
-def _capture_projection_view(session: KnifeSession) -> None:
-    _window, area, _region = _find_saved_view(session)
-    state = _capture_view_state(area)
-    if state is None:
-        return
-    session.projection_view = state
-    record = session_state._HISTORY_RECORDS.get(session.history_token)
-    if record is not None:
-        record.session.projection_view = copy.deepcopy(state)
 
 
 def _capture_native_result_options(session: KnifeSession, context) -> None:
@@ -195,7 +182,6 @@ def _watch_passthrough_session(window_pointer: int, history_token: int):
         return None
 
     record = session_state._HISTORY_RECORDS.get(history_token)
-    _capture_projection_view(session)
     window, area, region = _find_saved_view(session)
     if window is None or area is None or region is None:
         if record is not None:
