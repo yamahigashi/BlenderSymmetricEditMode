@@ -6,3 +6,6 @@ dist/
 
 # Local test runners (machine-specific Blender paths)
 tests/run_*.bat
+
+# Bench outputs (generated)
+tests/benchmarks/
