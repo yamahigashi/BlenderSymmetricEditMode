@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Headless checks for face-interior terminal chains on the direct topology path.
+"""Headless checks for face-interior paths and R-N1 networks.
 
-Contract: .agents/doc/fix_contract_knife_interior_host_2026-08-13.md (v5)
+Contract: .agents/doc/fix_contract_knife_interior_host_2026-08-13.md (v7.1)
 Oracle items O2/O3/O4/O10 plus the retained n=1/n=2 and structural declines.
 """
 
@@ -23,6 +23,13 @@ sys.path.insert(0, str(PACKAGE_PARENT))
 from fixtures_interior_host import (  # noqa: E402
     build_endpoint_collision,
     build_endpoint_link_mismatch,
+    build_interior_network_branch_relay,
+    build_interior_network_decline_dead_end,
+    build_interior_network_decline_loop,
+    build_interior_network_decline_one_anchor,
+    build_interior_network_theta,
+    build_interior_network_x,
+    build_interior_network_y,
     build_lineage_mismatch_chain,
     build_projection_outside_band,
     build_rev3_both_side_stroke,
@@ -277,41 +284,18 @@ def check_interior_chain_n2():
 
 
 def check_decline_degree3_interior():
-    """(c) Degree-3 interior vertex is not a simple chain → gate False / apply fails."""
+    """O15(a): degree-three interior hub is now a direct positive case."""
 
-    bm = build_two_symmetric_quads()
+    fixture = fixture_from_builder("network_y", build_interior_network_y)
     try:
-        topology = snapshot.prepare_topology(bm, AXIS, TOLERANCE)
-        # Place three boundary anchors on the left face.
-        bottom = _split_at_x(_bottom_edge(bm, negative=True), -1.5)
-        top = _split_at_x(_top_edge(bm, negative=True), -1.5)
-        left_mid_edge = next(
-            edge
-            for edge in bm.edges
-            if all(abs(vertex.co.x + 2.0) < 1.0e-8 for vertex in edge.verts)
-            and min(vertex.co.y for vertex in edge.verts) < 0.0 < max(vertex.co.y for vertex in edge.verts)
-        )
-        _e, left_mid = bmesh.utils.edge_split(left_mid_edge, left_mid_edge.verts[0], 0.5)
-        left_mid.co = (-2.0, 0.0, 0.0)
-
-        host = next(face for face in bm.faces if bottom in face.verts and top in face.verts and left_mid in face.verts)
-        # First create bottom--hub--top, then connect left_mid--hub so hub is degree 3.
-        bmesh.utils.face_split(host, bottom, top, coords=[(-1.3, 0.0, 0.0)])
-        hub = find_vertex(bm, (-1.3, 0.0, 0.0))
-        assert hub is not None
-        host2 = next(face for face in bm.faces if left_mid in face.verts and hub in face.verts)
-        bmesh.utils.face_split(host2, left_mid, hub)
-
-        source = collect_source_path_edges(bm)
-        assert len(source) == 3, len(source)
-
-        assert not _call_gate(bm, source, topology)
-
-        created, already, reason = _call_apply(bm, source, topology)
-        assert created == 0 and already == 0
-        assert reason == "a reflected cut vertex is not on a target boundary edge", reason
+        assert _call_gate(fixture.bm, fixture.source_edges, fixture.topology)
+        created, already, reason = _call_apply(fixture.bm, fixture.source_edges, fixture.topology)
+        assert reason == "", reason
+        assert created + already == len(fixture.source_edges), (created, already)
+        hub = find_vertex(fixture.bm, (1.3, 0.0, 0.0))
+        assert hub is not None and len(hub.link_edges) == 3
     finally:
-        bm.free()
+        fixture.free()
 
 
 def check_decline_no_common_face():
@@ -775,6 +759,157 @@ def check_o14_wire_ambiguous_decline():
         fixture.free()
 
 
+def _coordinate(vertex):
+    return tuple(round(float(value), 7) for value in vertex.co)
+
+
+def _normalized_incidence(bm):
+    edges = tuple(sorted(tuple(sorted((_coordinate(edge.verts[0]), _coordinate(edge.verts[1])))) for edge in bm.edges))
+    faces = tuple(sorted(tuple(sorted(_coordinate(vertex) for vertex in face.verts)) for face in bm.faces))
+    return edges, faces
+
+
+def _assert_all_edges_reflected(fixture):
+    for source_edge in fixture.source_edges:
+        expected_a = matching.mirror_coordinate(source_edge.verts[0].co, fixture.axis)
+        expected_b = matching.mirror_coordinate(source_edge.verts[1].co, fixture.axis)
+        assert any(
+            (tuple(edge.verts[0].co) == tuple(expected_a) and tuple(edge.verts[1].co) == tuple(expected_b))
+            or (tuple(edge.verts[0].co) == tuple(expected_b) and tuple(edge.verts[1].co) == tuple(expected_a))
+            for edge in fixture.bm.edges
+            if edge.is_valid
+        ), (tuple(expected_a), tuple(expected_b))
+
+
+def _network_plan_signature(fixture):
+    """Return canonical planner paths independent of source edge iteration."""
+
+    face_layer = fixture.bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
+    assert face_layer is not None
+    source_vertex_by_key, target_ids, records, unmatched, _status = stitch_reflect._collect_reflected_path_context(
+        fixture.source_edges, face_layer, fixture.topology.mirror_face_ids, require_all_mirrored=True
+    )
+    assert not unmatched
+    target_faces = stitch_reflect._target_faces_by_id(
+        fixture.bm, face_layer, {target_id for ids in target_ids.values() for target_id in ids}
+    )
+    source_face_ids = stitch_reflect._source_face_ids_by_vertex(fixture.source_edges, face_layer)
+    classification, reason = stitch_reflect._classify_reflected_vertices(
+        source_vertex_by_key,
+        target_ids,
+        target_faces,
+        fixture.axis,
+        fixture.tolerance,
+        edge_records=records,
+        source_face_ids_by_vertex=source_face_ids,
+        carrier_frames=fixture.topology.carrier_frames,
+    )
+    assert not reason
+    adjacency = stitch_reflect._path_adjacency(records)
+    occurrence = {hash(vertex): index for index, vertex in enumerate(tuple(fixture.bm.verts))}
+    snapshot = stitch_reflect._network_snapshot(source_vertex_by_key, records, classification, adjacency, occurrence)
+    plan = stitch_reflect._plan_interior_network(snapshot)
+    assert not plan.reason, plan.reason
+    return tuple(tuple(snapshot.rank[key] for key in path.vertices) for path in plan.paths)
+
+
+def check_o15_networks():
+    """O15(a)-(e),(g): hubs, relay ordering, theta success, and pure declines."""
+
+    for name, builder, degree in (
+        ("network_y", build_interior_network_y, 3),
+        ("network_x", build_interior_network_x, 4),
+        ("network_branch_relay", build_interior_network_branch_relay, None),
+        ("network_theta", build_interior_network_theta, None),
+    ):
+        fixture = fixture_from_builder(name, builder)
+        try:
+            if name == "network_branch_relay":
+                signature = _network_plan_signature(fixture)
+                lengths = [len(path) - 1 for path in signature]
+                first_single = lengths.index(1)
+                assert any(length > 1 for length in lengths[first_single + 1 :]), signature
+            before = (len(fixture.bm.verts), len(fixture.bm.edges), len(fixture.bm.faces))
+            assert _call_gate(fixture.bm, fixture.source_edges, fixture.topology)
+            assert before == (len(fixture.bm.verts), len(fixture.bm.edges), len(fixture.bm.faces))
+            created, already, reason = _call_apply(fixture.bm, fixture.source_edges, fixture.topology)
+            assert reason == "", (name, reason)
+            assert created == len(fixture.source_edges) and already == 0, (name, created, already)
+            _assert_all_edges_reflected(fixture)
+            source_adjacency = {}
+            source_vertices = {}
+            for edge in fixture.source_edges:
+                left, right = edge.verts
+                source_adjacency.setdefault(hash(left), set()).add(hash(right))
+                source_adjacency.setdefault(hash(right), set()).add(hash(left))
+                source_vertices[hash(left)] = left
+                source_vertices[hash(right)] = right
+            hubs = [
+                source_vertices[key]
+                for key, neighbours in source_adjacency.items()
+                if degree is not None and len(neighbours) == degree
+            ]
+            if degree is None:
+                continue
+            assert hubs, (name, degree)
+            for source_hub in hubs:
+                reflected = matching.mirror_coordinate(source_hub.co, fixture.axis)
+                mirrored_hub = find_vertex(fixture.bm, reflected)
+                assert mirrored_hub is not None and len(mirrored_hub.link_edges) == degree
+        finally:
+            fixture.free()
+
+    first = fixture_from_builder("network_y_order_a", build_interior_network_y)
+    second = fixture_from_builder("network_y_order_b", build_interior_network_y)
+    try:
+        for vertex in tuple(first.bm.verts) + tuple(second.bm.verts):
+            vertex.index = -1
+        edges = list(second.source_edges)
+        second.source_edges[:] = list(reversed(edges))
+        first_plan = _network_plan_signature(first)
+        second_plan = _network_plan_signature(second)
+        assert first_plan == second_plan, (first_plan, second_plan)
+        first_before = (len(first.bm.verts), len(first.bm.edges), len(first.bm.faces))
+        second_before = (len(second.bm.verts), len(second.bm.edges), len(second.bm.faces))
+        assert _call_gate(first.bm, first.source_edges, first.topology)
+        assert _call_gate(second.bm, second.source_edges, second.topology)
+        assert first_before == (len(first.bm.verts), len(first.bm.edges), len(first.bm.faces))
+        assert second_before == (len(second.bm.verts), len(second.bm.edges), len(second.bm.faces))
+        assert _call_apply(first.bm, first.source_edges, first.topology)[2] == ""
+        assert _call_apply(second.bm, second.source_edges, second.topology)[2] == ""
+        assert _normalized_incidence(first.bm) == _normalized_incidence(second.bm)
+    finally:
+        first.free()
+        second.free()
+
+    theta = fixture_from_builder("network_theta_shape", build_interior_network_theta)
+    try:
+        adjacency = {}
+        for edge in theta.source_edges:
+            left, right = map(hash, edge.verts)
+            adjacency.setdefault(left, set()).add(right)
+            adjacency.setdefault(right, set()).add(left)
+        assert sorted(len(neighbours) for neighbours in adjacency.values()).count(1) == 2
+        assert len(theta.source_edges) == len(adjacency), "the two-anchor graph must contain an interior cycle"
+    finally:
+        theta.free()
+
+    for name, builder in (
+        ("network_decline_loop", build_interior_network_decline_loop),
+        ("network_decline_one_anchor", build_interior_network_decline_one_anchor),
+        ("network_decline_dead_end", build_interior_network_decline_dead_end),
+    ):
+        fixture = fixture_from_builder(name, builder)
+        try:
+            before = (len(fixture.bm.verts), len(fixture.bm.edges), len(fixture.bm.faces))
+            assert not _call_gate(fixture.bm, fixture.source_edges, fixture.topology), name
+            assert before == (len(fixture.bm.verts), len(fixture.bm.edges), len(fixture.bm.faces)), name
+            created, already, reason = _call_apply(fixture.bm, fixture.source_edges, fixture.topology)
+            assert created == 0 and already == 0 and reason, (name, created, already, reason)
+        finally:
+            fixture.free()
+
+
 def run():
     check_interior_chain_n1()
     print("PASS check_interior_chain_n1", flush=True)
@@ -806,6 +941,8 @@ def run():
     print("PASS check_o14_wire_mixed", flush=True)
     check_o14_wire_ambiguous_decline()
     print("PASS check_o14_wire_ambiguous_decline", flush=True)
+    check_o15_networks()
+    print("PASS check_o15_networks", flush=True)
     print("YSE_INTERIOR_CHAIN_OK", flush=True)
 
 

@@ -442,6 +442,212 @@ class _InteriorChain:
     source_face_ids: tuple[FaceId, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class _InteriorNetworkSnapshot:
+    """Immutable source graph captured before any target mutation (R-N1)."""
+
+    vertices: tuple[int, ...]
+    edges: tuple[tuple[int, int], ...]
+    anchors: frozenset[int]
+    rank: dict[int, tuple[int, int]]
+    host_ids: dict[int, FaceId]
+    network_vertices: frozenset[int]
+
+
+@dataclass(frozen=True, slots=True)
+class _InteriorNetworkPath:
+    """One planner path, represented by source vertex keys."""
+
+    vertices: tuple[int, ...]
+
+    @property
+    def edges(self) -> tuple[tuple[int, int], ...]:
+        return tuple(zip(self.vertices, self.vertices[1:], strict=False))
+
+
+@dataclass(frozen=True, slots=True)
+class _InteriorNetworkPlan:
+    """Deterministic decomposition of one or more interior network components."""
+
+    paths: tuple[_InteriorNetworkPath, ...]
+    edge_keys: frozenset[frozenset[int]]
+    reason: str = ""
+
+
+def _network_snapshot(
+    source_vertex_by_key: dict[int, bmesh.types.BMVert],
+    edge_records: list[tuple[int, int, set[FaceId]]],
+    classification: dict,
+    adjacency: dict[int, set[int]],
+    occurrence_by_key: dict[int, int],
+) -> _InteriorNetworkSnapshot:
+    """Capture only source graph data used by the pure R-N1 planner."""
+
+    interior = {key for key, value in classification.items() if value[0] == "interior"}
+    network_components: list[set[int]] = []
+    seen: set[int] = set()
+    for start in sorted(interior, key=lambda key: (source_vertex_by_key[key].index, key)):
+        if start in seen:
+            continue
+        component: set[int] = set()
+        stack = [start]
+        while stack:
+            key = stack.pop()
+            if key in component:
+                continue
+            component.add(key)
+            seen.add(key)
+            stack.extend(neighbour for neighbour in adjacency.get(key, ()) if neighbour in interior)
+        if any(len(adjacency.get(key, ())) >= 3 for key in component):
+            network_components.append(component)
+
+    network_vertices = set().union(*network_components) if network_components else set()
+    network_edges: list[tuple[int, int]] = []
+    anchors: set[int] = set()
+    host_ids = _host_ids_by_vertex(edge_records)
+    for left, right, _target_ids in edge_records:
+        if left not in network_vertices and right not in network_vertices:
+            continue
+        if left not in network_vertices:
+            anchors.add(left)
+        if right not in network_vertices:
+            anchors.add(right)
+        network_edges.append((left, right))
+    vertices = set(anchors) | network_vertices
+    # BMVert.index is assigned once by BMesh; the second component makes the
+    # ordering total even for synthetic vertices with an unset/equal index.
+    ordered = sorted(vertices, key=lambda key: (source_vertex_by_key[key].index, occurrence_by_key[key]))
+    # Freeze occurrence once from the canonical source snapshot.  It is the
+    # second rank component and is never recomputed after target mutation.
+    rank = {key: (source_vertex_by_key[key].index, occurrence_by_key[key]) for key in ordered}
+    network_edges.sort(key=lambda edge: (min(rank[edge[0]], rank[edge[1]]), max(rank[edge[0]], rank[edge[1]])))
+    return _InteriorNetworkSnapshot(
+        vertices=tuple(ordered),
+        edges=tuple(network_edges),
+        anchors=frozenset(anchors),
+        rank=rank,
+        host_ids={key: host_ids[key] for key in network_vertices if key in host_ids},
+        network_vertices=frozenset(network_vertices),
+    )
+
+
+def _plan_interior_network(snapshot: _InteriorNetworkSnapshot) -> _InteriorNetworkPlan:
+    """Pure, deterministic R-N1 path decomposition.
+
+    The planner owns the R_V/U_E state.  It never consults or mutates BMesh;
+    gate and apply therefore consume the same source snapshot semantics.
+    """
+
+    if not snapshot.edges:
+        return _InteriorNetworkPlan((), frozenset(), "")
+    if not snapshot.anchors or len(snapshot.anchors) < 2:
+        return _InteriorNetworkPlan((), frozenset(), "interior network cannot reach two anchors")
+    if set(snapshot.host_ids) != set(snapshot.network_vertices):
+        return _InteriorNetworkPlan((), frozenset(), "interior network has no common host face ID (R-H1)")
+    interior_adjacency: dict[int, set[int]] = defaultdict(set)
+    for left, right in snapshot.edges:
+        if left in snapshot.network_vertices and right in snapshot.network_vertices:
+            interior_adjacency[left].add(right)
+            interior_adjacency[right].add(left)
+    seen: set[int] = set()
+    for start in snapshot.network_vertices:
+        if start in seen:
+            continue
+        component: set[int] = set()
+        component_stack = [start]
+        while component_stack:
+            key = component_stack.pop()
+            if key in component:
+                continue
+            component.add(key)
+            seen.add(key)
+            component_stack.extend(interior_adjacency[key])
+        if len({snapshot.host_ids[key] for key in component}) != 1:
+            return _InteriorNetworkPlan((), frozenset(), "interior network has no common host face ID (R-H1)")
+
+    adjacency: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    for edge_number, (left, right) in enumerate(snapshot.edges):
+        adjacency[left].append((right, edge_number))
+        adjacency[right].append((left, edge_number))
+    for neighbours in adjacency.values():
+        neighbours.sort(key=lambda item: (snapshot.rank[item[0]], item[1]))
+
+    remaining = set(range(len(snapshot.edges)))
+    realized = set(snapshot.anchors)
+    paths: list[_InteriorNetworkPath] = []
+    max_iterations = len(remaining)
+
+    for _iteration in range(max_iterations):
+        if not remaining:
+            break
+        candidates: dict[tuple[tuple[int, int], ...], _InteriorNetworkPath] = {}
+        for start in sorted(realized, key=snapshot.rank.__getitem__):
+            stack: list[tuple[int, tuple[int, ...], frozenset[int]]] = [(start, (start,), frozenset())]
+            while stack:
+                current, vertices, used = stack.pop()
+                for neighbour, edge_number in adjacency.get(current, ()):
+                    if edge_number not in remaining or edge_number in used:
+                        continue
+                    if neighbour in vertices:
+                        continue
+                    next_vertices = vertices + (neighbour,)
+                    next_used = used | {edge_number}
+                    if neighbour in realized and neighbour != start:
+                        forward = tuple(snapshot.rank[key] for key in next_vertices)
+                        backward = tuple(reversed(forward))
+                        canonical = min(forward, backward)
+                        candidates[canonical] = _InteriorNetworkPath(next_vertices)
+                    elif neighbour not in realized:
+                        stack.append((neighbour, next_vertices, next_used))
+        if not candidates:
+            return _InteriorNetworkPlan(
+                tuple(paths),
+                frozenset(edge for path in paths for edge in (frozenset(pair) for pair in path.edges)),
+                "interior network has an unrealized edge with no admissible path",
+            )
+        selected = min(
+            candidates.values(),
+            key=lambda path: (
+                len(path.edges),
+                min(
+                    tuple(snapshot.rank[key] for key in path.vertices),
+                    tuple(reversed(tuple(snapshot.rank[key] for key in path.vertices))),
+                ),
+            ),
+        )
+        paths.append(selected)
+        for left, right in selected.edges:
+            edge_number = next(
+                number
+                for number, edge in enumerate(snapshot.edges)
+                if number in remaining and set(edge) == {left, right}
+            )
+            remaining.remove(edge_number)
+        realized.update(selected.vertices[1:-1])
+
+    if remaining:
+        return _InteriorNetworkPlan(
+            tuple(paths),
+            frozenset(edge for path in paths for edge in (frozenset(pair) for pair in path.edges)),
+            "interior network planning exceeded its iteration bound",
+        )
+    return _InteriorNetworkPlan(
+        tuple(paths),
+        frozenset(edge for path in paths for edge in (frozenset(pair) for pair in path.edges)),
+        "",
+    )
+
+
+def _source_vertex_occurrence(
+    bm: bmesh.types.BMesh,
+    source_vertex_by_key: dict[int, bmesh.types.BMVert],
+) -> dict[int, int]:
+    """Return one source-independent occurrence order from the BMesh snapshot."""
+
+    source_keys = set(source_vertex_by_key)
+    return {hash(vertex): position for position, vertex in enumerate(tuple(bm.verts)) if hash(vertex) in source_keys}
+
+
 def _classify_reflected_vertices(
     source_vertex_by_key: dict[int, bmesh.types.BMVert],
     target_ids_by_vertex: dict[int, set[FaceId]],
@@ -687,6 +893,114 @@ def _chain_source_edge_keys(chains: list[_InteriorChain]) -> set[frozenset[int]]
     return keys
 
 
+def _refresh_face_split_context(
+    face_id: FaceId,
+    target_faces_by_id: dict[FaceId, list[bmesh.types.BMFace]],
+    lineage_by_face: dict[bmesh.types.BMFace, object],
+) -> None:
+    """Keep the FaceId→live-face index and lineage map coherent after a split."""
+
+    live_faces = [face for face in target_faces_by_id.get(face_id, ()) if face.is_valid]
+    target_faces_by_id[face_id] = live_faces
+    for face in live_faces:
+        lineage_by_face.setdefault(face, object())
+
+
+def _register_face_edges(
+    face_layer,
+    faces: Iterable[bmesh.types.BMFace],
+    existing_edges,
+    tolerance: float,
+    registered_entries: dict[bmesh.types.BMEdge, tuple[tuple[int, int, int], tuple]] | None = None,
+) -> None:
+    if existing_edges is None:
+        return
+    for face in faces:
+        if not face.is_valid:
+            continue
+        for edge in face.edges:
+            if edge.is_valid:
+                primary, coordinate_a, coordinate_b = stitch_common._canonical_edge_endpoints(
+                    edge.verts[0].co,
+                    edge.verts[1].co,
+                    tolerance,
+                )
+                linked_ids = frozenset(FaceId(int(linked[face_layer])) for linked in edge.link_faces)
+                entry = (None, coordinate_a, coordinate_b, linked_ids)
+                if registered_entries is not None:
+                    previous = registered_entries.get(edge)
+                    if previous == (primary, entry):
+                        continue
+                    if previous is not None:
+                        previous_primary, previous_entry = previous
+                        bucket = existing_edges.get(previous_primary, [])
+                        if previous_entry in bucket:
+                            bucket.remove(previous_entry)
+                        if not bucket:
+                            existing_edges.pop(previous_primary, None)
+                    existing_edges.setdefault(primary, []).append(entry)
+                    registered_entries[edge] = (primary, entry)
+                    continue
+                stitch_common._register_edge_endpoint_pair(
+                    existing_edges, edge.verts[0].co, edge.verts[1].co, tolerance, face_ids=linked_ids
+                )
+
+
+def _face_split_mutation(
+    target_face: bmesh.types.BMFace,
+    end_a: bmesh.types.BMVert,
+    end_b: bmesh.types.BMVert,
+    *,
+    coords: list[tuple[float, float, float]] | None,
+    face_layer,
+    target_faces_by_id: dict[FaceId, list[bmesh.types.BMFace]],
+    lineage_by_face: dict[bmesh.types.BMFace, object],
+    existing_edges,
+    realized_face_ids: set[FaceId],
+    registered_entries: dict[bmesh.types.BMEdge, tuple[tuple[int, int, int], tuple]] | None,
+    tolerance: float,
+    selection_tracker: stitch_common._SelectionMutationTracker | None,
+) -> tuple[bmesh.types.BMFace | None, str]:
+    """Single mutation boundary for every direct network/chain face_split."""
+
+    if not target_face.is_valid or end_a is end_b:
+        return None, "could not split a target face"
+    face_id = FaceId(int(target_face[face_layer]))
+    lineage_token = lineage_by_face.get(target_face, object())
+    if selection_tracker is not None:
+        selection_tracker.add_vertex(end_a)
+        selection_tracker.add_vertex(end_b)
+        selection_tracker.add_face(target_face)
+    try:
+        # face_split rejects an empty/None coords argument outright and only
+        # accepts plain float tuples, so normalize or omit it entirely.
+        if coords:
+            coordinate_tuples = [tuple(coordinate) for coordinate in coords]
+            new_face, _new_loop = bmesh.utils.face_split(target_face, end_a, end_b, coords=coordinate_tuples)
+        else:
+            new_face, _new_loop = bmesh.utils.face_split(target_face, end_a, end_b)
+    except (RuntimeError, ValueError) as exc:
+        return None, f"could not split a target face: {exc}"
+    if new_face is None or not new_face.is_valid:
+        return None, "could not split a target face"
+    lineage_by_face[target_face] = lineage_token
+    lineage_by_face[new_face] = lineage_token
+    target_faces_by_id.setdefault(face_id, []).append(new_face)
+    _refresh_face_split_context(face_id, target_faces_by_id, lineage_by_face)
+    realized_face_ids.add(face_id)
+    _register_face_edges(
+        face_layer,
+        (target_face, new_face),
+        existing_edges,
+        tolerance,
+        registered_entries,
+    )
+    if selection_tracker is not None:
+        selection_tracker.add_face(target_face)
+        selection_tracker.add_face(new_face)
+    return new_face, ""
+
+
 def _realize_interior_chain(
     bm: bmesh.types.BMesh,
     chain: _InteriorChain,
@@ -704,10 +1018,11 @@ def _realize_interior_chain(
     lineage_by_face: dict[bmesh.types.BMFace, object] | None = None,
     classification: dict | None = None,
     carrier_frames: CarrierFrameMap | None = None,
+    registered_entries: dict[bmesh.types.BMEdge, tuple[tuple[int, int, int], tuple]] | None = None,
 ) -> tuple[int, int, str, dict | None]:
     """face_split one accepted interior chain. Returns created/already_present delta."""
 
-    if target_faces_by_id is None or lineage_by_face is None or classification is None or carrier_frames is None:
+    if target_faces_by_id is None or lineage_by_face is None or classification is None:
         return 0, 0, "interior chain realization context is missing (R-H4/R-P1)", existing_edges
     end_a = target_vertex_by_source_key[chain.end_a]
     end_b = target_vertex_by_source_key[chain.end_b]
@@ -716,12 +1031,16 @@ def _realize_interior_chain(
         (face for face in target_faces_by_id.get(chain.target_face_id, ()) if face.is_valid),
         key=lambda face: face.index,
     )
+    path_keys = (*chain.members, chain.end_a, chain.end_b)
     candidate_lineages = {
         lineage_by_face.get(classification[key][4])
-        for key in chain.members
-        if classification is not None and classification.get(key, (None, None, None, None, None))[4] is not None
+        for key in path_keys
+        if classification is not None
+        and classification.get(key, (None, None, None, None, None))[0] == "interior"
+        and classification[key][4] is not None
     }
-    if classification is not None and (len(candidate_lineages) != 1 or None in candidate_lineages):
+    has_interior_path_vertex = any(classification.get(key, (None,))[0] == "interior" for key in path_keys)
+    if has_interior_path_vertex and (len(candidate_lineages) != 1 or None in candidate_lineages):
         return 0, 0, "interior chain classification lineages are inconsistent", existing_edges
     classification_lineage = next(iter(candidate_lineages), None)
 
@@ -735,7 +1054,18 @@ def _realize_interior_chain(
         and (classification is None or lineage_by_face.get(linked_faces[0]) == classification_lineage)
     ):
         target_face = linked_faces[0]
+    elif not reflected_coords:
+        linked_lineage_faces = [
+            face
+            for face in linked_faces
+            if classification_lineage is None or lineage_by_face.get(face) == classification_lineage
+        ]
+        if len(linked_lineage_faces) != 1:
+            return 0, 0, "mirrored network edge has no unique linked target face", existing_edges
+        target_face = linked_lineage_faces[0]
     else:
+        if carrier_frames is None:
+            return 0, 0, "carrier frame is missing or degenerate for an interior host", existing_edges
         target_deviation = _carrier_deviation(carrier_frames, chain.target_face_id)
         if target_deviation is None or len(chain.source_face_ids) != len(chain.members):
             return 0, 0, "carrier frame is missing or degenerate for an interior host", existing_edges
@@ -778,33 +1108,61 @@ def _realize_interior_chain(
         if classification is not None and lineage_by_face.get(target_face) != classification_lineage:
             return 0, 0, "mirrored interior chain winner has a different classification lineage", existing_edges
 
-    try:
+    if end_a is end_b:
+        # Two path endpoints collapsed onto one target vertex (for example a
+        # boundary split followed by an exact re-resolution within tolerance).
+        return 0, 0, "mirrored chain endpoints collapse to one vertex", existing_edges
+    existing_edge = bm.edges.get([end_a, end_b])
+    # A pre-existing connector counts as already_present only when it bounds
+    # the lineage-verified host face; an edge between the same vertex pair on
+    # an unrelated same-ID instance must not satisfy this path's counting.
+    if existing_edge is not None and existing_edge not in tuple(target_face.edges):
+        existing_edge = None
+    if not reflected_coords and existing_edge is not None:
+        if existing_edges is not None:
+            _register_face_edges(
+                face_layer,
+                existing_edge.link_faces,
+                existing_edges,
+                tolerance,
+                registered_entries,
+            )
         if selection_tracker is not None:
-            selection_tracker.add_vertex(end_a)
-            selection_tracker.add_vertex(end_b)
-            selection_tracker.add_face(target_face)
-        new_face, _new_loop = bmesh.utils.face_split(
-            target_face,
-            end_a,
-            end_b,
-            coords=[tuple(coordinate) for coordinate in reflected_coords],
-        )
-    except (RuntimeError, ValueError) as exc:
-        return 0, 0, f"could not split a target face for interior chain: {exc}", existing_edges
-    if new_face is None or not new_face.is_valid or not target_face.is_valid:
-        return 0, 0, "could not split a target face for interior chain", existing_edges
-    realized_face_ids.add(chain.target_face_id)
-    lineage_token = lineage_by_face.get(target_face)
-    lineage_by_face[new_face] = lineage_token
-    target_faces_by_id.setdefault(chain.target_face_id, []).append(new_face)
-    if selection_tracker is not None:
-        selection_tracker.add_face(target_face)
-        selection_tracker.add_face(new_face)
+            selection_tracker.add_edge(existing_edge)
+        existing_edge[marker_layer] = 0
+        existing_edge.select = False
+        return 0, 1, "", existing_edges
 
+    new_face, split_reason = _face_split_mutation(
+        target_face,
+        end_a,
+        end_b,
+        coords=[tuple(coordinate) for coordinate in reflected_coords] or None,
+        face_layer=face_layer,
+        target_faces_by_id=target_faces_by_id,
+        lineage_by_face=lineage_by_face,
+        existing_edges=existing_edges,
+        realized_face_ids=realized_face_ids,
+        registered_entries=registered_entries,
+        tolerance=tolerance,
+        selection_tracker=selection_tracker,
+    )
+    if new_face is None:
+        return 0, 0, split_reason or "could not split a target face for interior chain", existing_edges
     # The coords vertices lie exactly on the cut path both descendants share,
     # so they are the shared vertices minus the chain ends.  This stays local
     # to the two faces; snapshotting bm.verts/bm.edges around the split costs
     # seconds of proxy iteration on dense meshes.
+    if not chain.members:
+        edge = bm.edges.get([end_a, end_b])
+        if edge is None:
+            return 0, 0, "target face split made no edge", existing_edges
+        edge[marker_layer] = 0
+        edge.select = False
+        if selection_tracker is not None:
+            selection_tracker.add_edge(edge)
+        return 1, 0, "", existing_edges
+
     end_hashes = {hash(end_a), hash(end_b)}
     target_vert_hashes = {hash(vertex) for vertex in target_face.verts}
     new_verts = [
@@ -951,7 +1309,7 @@ def reflected_path_uses_only_target_boundaries(
     existing face boundaries. Multi-click Knife strokes may also place an
     intentional face-interior terminal chain (degree-2 interior vertices whose
     ends resolve on one common target face). Those chains are accepted here;
-    interior networks with branches still use the Knife Project fallback.
+    branching interior networks are planned and realized directly by R-N1.
     """
 
     source_edges = list(source_edges)
@@ -997,8 +1355,17 @@ def reflected_path_uses_only_target_boundaries(
         return False
 
     adjacency = _path_adjacency(edge_records)
+    occurrence_by_key = _source_vertex_occurrence(bm, source_vertex_by_key)
+    network_snapshot = _network_snapshot(
+        source_vertex_by_key, edge_records, classification, adjacency, occurrence_by_key
+    )
+    network_plan = _plan_interior_network(network_snapshot)
+    network_vertices = set(network_snapshot.vertices) - set(network_snapshot.anchors)
+    if network_plan.reason:
+        return False
+    simple_classification = {key: value for key, value in classification.items() if key not in network_vertices}
     _chains, chain_reason = _find_interior_chains(
-        classification,
+        simple_classification,
         adjacency,
         source_vertex_by_key,
         target_ids_by_vertex,
@@ -1131,8 +1498,17 @@ def apply_reflected_path_topology(
         return _result(0, 0, classify_reason)
 
     adjacency = _path_adjacency(edge_records)
+    occurrence_by_key = _source_vertex_occurrence(bm, source_vertex_by_key)
+    network_snapshot = _network_snapshot(
+        source_vertex_by_key, edge_records, classification, adjacency, occurrence_by_key
+    )
+    network_plan = _plan_interior_network(network_snapshot)
+    network_vertices = set(network_snapshot.vertices) - set(network_snapshot.anchors)
+    if network_plan.reason:
+        return _result(0, 0, network_plan.reason)
+    simple_classification = {key: value for key, value in classification.items() if key not in network_vertices}
     chains, chain_reason = _find_interior_chains(
-        classification,
+        simple_classification,
         adjacency,
         source_vertex_by_key,
         target_ids_by_vertex,
@@ -1146,7 +1522,7 @@ def apply_reflected_path_topology(
     if chain_reason:
         return _result(0, 0, chain_reason)
 
-    chain_edge_keys = _chain_source_edge_keys(chains)
+    chain_edge_keys = _chain_source_edge_keys(chains) | set(network_plan.edge_keys)
     target_vertex_by_source_key: dict[int, bmesh.types.BMVert] = {}
 
     # Resolve non-interior vertices first so chain ends exist before face_split.
@@ -1196,6 +1572,57 @@ def apply_reflected_path_topology(
     already_present = 0
 
     realized_face_ids: set[FaceId] = set()
+    registered_entries: dict[bmesh.types.BMEdge, tuple[tuple[int, int, int], tuple]] = {}
+    if network_plan.paths:
+        # Network mutation starts with a live endpoint store so every
+        # face_split can update it through the common helper (R-N1).
+        existing_edges = {}
+        for faces in target_faces_by_id.values():
+            _register_face_edges(face_layer, faces, existing_edges, tolerance, registered_entries)
+    # The planner is consumed exactly once.  In particular, do not re-plan
+    # after a face_split has changed BMVert/BMFace indices (R-N1).
+    for planned_path in network_plan.paths:
+        member_keys = planned_path.vertices[1:-1]
+        target_face_id = next(
+            (network_snapshot.host_ids[key] for key in planned_path.vertices if key in network_snapshot.host_ids),
+            None,
+        )
+        if target_face_id is None:
+            return _result(created_edges, already_present, "interior network has no common host face ID (R-H1)")
+        network_chain = _InteriorChain(
+            members=tuple(member_keys),
+            end_a=planned_path.vertices[0],
+            end_b=planned_path.vertices[-1],
+            target_face_id=target_face_id,
+            source_face_ids=tuple(
+                next(iter(source_face_ids_by_vertex[key]))
+                for key in member_keys
+                if len(source_face_ids_by_vertex.get(key, ())) == 1
+            ),
+        )
+        created_delta, already_delta, fail_reason, existing_edges = _realize_interior_chain(
+            bm,
+            network_chain,
+            source_vertex_by_key,
+            target_vertex_by_source_key,
+            axis_index,
+            tolerance,
+            face_layer,
+            marker_layer,
+            existing_edges,
+            realized_face_ids,
+            selection_tracker=tracker,
+            target_faces_by_id=target_faces_by_id,
+            lineage_by_face=lineage_by_face,
+            classification=classification,
+            carrier_frames=carrier_frames,
+            registered_entries=registered_entries,
+        )
+        if fail_reason:
+            return _result(created_edges, already_present, fail_reason)
+        created_edges += created_delta
+        already_present += already_delta
+
     for chain in chains:
         created_delta, already_delta, fail_reason, existing_edges = _realize_interior_chain(
             bm,
@@ -1213,6 +1640,7 @@ def apply_reflected_path_topology(
             lineage_by_face=lineage_by_face,
             classification=classification,
             carrier_frames=carrier_frames,
+            registered_entries=registered_entries,
         )
         if fail_reason:
             return _result(created_edges, already_present, fail_reason)

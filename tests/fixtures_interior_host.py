@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Deterministic BMesh fixtures for the interior-host contract."""
+"""Deterministic BMesh fixtures for the interior-host contract.
+
+Network builders reference R-N1/R-D2 in
+``.agents/doc/fix_contract_knife_interior_host_2026-08-13.md`` v7.1.
+"""
 
 from __future__ import annotations
 
@@ -23,6 +27,7 @@ AXIS = matching.AXIS_INDEX["X"]
 
 # Builders retain the preparation made before native path topology is added.
 _PREPARATIONS: dict[int, object] = {}
+_EXPLICIT_SOURCE_EDGES: dict[int, tuple[bmesh.types.BMEdge, ...]] = {}
 
 
 @dataclass
@@ -36,6 +41,7 @@ class InteriorHostFixture:
 
     def free(self) -> None:
         _PREPARATIONS.pop(id(self.bm), None)
+        _EXPLICIT_SOURCE_EDGES.pop(id(self.bm), None)
         self.bm.free()
 
 
@@ -92,6 +98,18 @@ def _split_side_boundary(bm: bmesh.types.BMesh, *, y: float, x: float, positive:
     return bmesh.utils.edge_split(edge, start, factor)[1]
 
 
+def _split_vertical_boundary(bm: bmesh.types.BMesh, *, x: float, y: float):
+    edge = next(
+        edge
+        for edge in bm.edges
+        if all(abs(float(vertex.co.x) - x) <= 1.0e-8 for vertex in edge.verts)
+        and min(float(vertex.co.y) for vertex in edge.verts) < y < max(float(vertex.co.y) for vertex in edge.verts)
+    )
+    start = edge.verts[0]
+    factor = (y - float(start.co.y)) / (float(edge.verts[1].co.y) - float(start.co.y))
+    return bmesh.utils.edge_split(edge, start, factor)[1]
+
+
 def _host(bm: bmesh.types.BMesh, first, second):
     return next(face for face in bm.faces if first in face.verts and second in face.verts)
 
@@ -117,6 +135,198 @@ def build_interior_chain_n2() -> bmesh.types.BMesh:
         coords=[(-1.4, -0.25, 0.0), (-1.2, 0.25, 0.0)],
     )
     return bm
+
+
+def build_interior_network_y() -> bmesh.types.BMesh:
+    """Y: three boundary anchors and one degree-three interior hub (R-N1)."""
+
+    bm = _base_pair()
+    _prepare_before_native_cut(bm)
+    bottom = _split_boundary(bm, y=-1.0, x=-1.5)
+    top = _split_boundary(bm, y=1.0, x=-1.5)
+    left = _split_vertical_boundary(bm, x=-2.0, y=0.0)
+    bmesh.utils.face_split(_host(bm, bottom, top), bottom, top, coords=[(-1.3, 0.0, 0.0)])
+    hub = next(
+        vertex for vertex in bm.verts if abs(float(vertex.co.x) + 1.3) < 1.0e-6 and abs(float(vertex.co.y)) < 1.0e-6
+    )
+    bmesh.utils.face_split(_host(bm, left, hub), left, hub)
+    return bm
+
+
+build_network_y = build_interior_network_y
+
+
+def build_interior_network_x() -> bmesh.types.BMesh:
+    """X: four boundary anchors and one degree-four crossing hub (R-N1)."""
+
+    bm = _base_pair()
+    _prepare_before_native_cut(bm)
+    bottom = _split_boundary(bm, y=-1.0, x=-1.5)
+    top = _split_boundary(bm, y=1.0, x=-1.5)
+    left = _split_vertical_boundary(bm, x=-2.0, y=-0.25)
+    right = _split_vertical_boundary(bm, x=-1.0, y=0.25)
+    bmesh.utils.face_split(_host(bm, bottom, top), bottom, top, coords=[(-1.3, 0.0, 0.0)])
+    hub = next(
+        vertex for vertex in bm.verts if abs(float(vertex.co.x) + 1.3) < 1.0e-6 and abs(float(vertex.co.y)) < 1.0e-6
+    )
+    bmesh.utils.face_split(_host(bm, left, hub), left, hub)
+    bmesh.utils.face_split(_host(bm, right, hub), right, hub)
+    return bm
+
+
+build_network_x = build_interior_network_x
+
+
+def build_interior_network_branch_relay() -> bmesh.types.BMesh:
+    """Branch plus relay; a single-edge path precedes a later multi path (R-N1)."""
+
+    bm = _base_pair()
+    _prepare_before_native_cut(bm)
+    bottom = _split_boundary(bm, y=-1.0, x=-1.7)
+    top = _split_boundary(bm, y=1.0, x=-1.4)
+    left = _split_vertical_boundary(bm, x=-2.0, y=-0.1)
+    right = _split_vertical_boundary(bm, x=-1.0, y=0.25)
+    bmesh.utils.face_split(_host(bm, bottom, top), bottom, top, coords=[(-1.3, 0.0, 0.0)])
+    hub = next(
+        vertex for vertex in bm.verts if abs(float(vertex.co.x) + 1.3) < 1.0e-6 and abs(float(vertex.co.y)) < 1.0e-6
+    )
+    bmesh.utils.face_split(_host(bm, left, hub), left, hub)
+    bmesh.utils.face_split(_host(bm, right, hub), right, hub, coords=[(-1.2, 0.35, 0.0)])
+    return bm
+
+
+build_network_branch_relay = build_interior_network_branch_relay
+
+
+def _replace_left_face_with_graph(
+    bm: bmesh.types.BMesh,
+    interior_coordinates: tuple[tuple[float, float, float], ...],
+    face_cycles: tuple[tuple[str | int, ...], ...],
+    source_pairs: tuple[tuple[str | int, str | int], ...],
+) -> bmesh.types.BMesh:
+    """Replace the source quad while retaining its snapshot FaceId.
+
+    The explicit edge list isolates the contract graph from triangulation
+    support edges.  All replacement faces inherit the original carrier ID.
+    """
+
+    face_layer = bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
+    assert face_layer is not None
+    source_face = next(face for face in bm.faces if all(float(vertex.co.x) < 0.0 for vertex in face.verts))
+    face_id = int(source_face[face_layer])
+    corners = {
+        "a": next(vertex for vertex in source_face.verts if tuple(vertex.co) == (-2.0, -1.0, 0.0)),
+        "b": next(vertex for vertex in source_face.verts if tuple(vertex.co) == (-1.0, -1.0, 0.0)),
+        "c": next(vertex for vertex in source_face.verts if tuple(vertex.co) == (-1.0, 1.0, 0.0)),
+        "d": next(vertex for vertex in source_face.verts if tuple(vertex.co) == (-2.0, 1.0, 0.0)),
+    }
+    interior = {index: bm.verts.new(coordinate) for index, coordinate in enumerate(interior_coordinates)}
+    vertices: dict[str | int, bmesh.types.BMVert] = {**corners, **interior}
+    bmesh.ops.delete(bm, geom=[source_face], context="FACES_ONLY")
+    for cycle in face_cycles:
+        face = bm.faces.new([vertices[key] for key in cycle])
+        face[face_layer] = face_id
+    source_edges = tuple(bm.edges.get((vertices[left], vertices[right])) for left, right in source_pairs)
+    assert all(edge is not None and edge.link_faces for edge in source_edges)
+    _EXPLICIT_SOURCE_EDGES[id(bm)] = source_edges
+    bm.normal_update()
+    return bm
+
+
+def build_interior_network_theta() -> bmesh.types.BMesh:
+    """R-N1/O15(e): two anchors attached to an interior four-edge cycle."""
+
+    bm = _base_pair()
+    _prepare_before_native_cut(bm)
+    result = _replace_left_face_with_graph(
+        bm,
+        (
+            (-1.7, -0.3, 0.0),
+            (-1.3, -0.3, 0.0),
+            (-1.3, 0.3, 0.0),
+            (-1.7, 0.3, 0.0),
+        ),
+        (
+            ("a", "b", 0),
+            ("a", 0, 3),
+            ("a", 3, "d"),
+            ("d", 3, "c"),
+            ("b", 1, 0),
+            ("b", "c", 2),
+            ("b", 2, 1),
+            ("c", 3, 2),
+            (0, 1, 2, 3),
+        ),
+        ((0, 1), (1, 2), (2, 3), (3, 0), ("b", 0), ("c", 3)),
+    )
+    return result
+
+
+build_network_theta = build_interior_network_theta
+
+
+def build_interior_network_decline_loop() -> bmesh.types.BMesh:
+    """R-D2/O15(d): an anchor-free triangular interior loop."""
+
+    bm = _base_pair()
+    _prepare_before_native_cut(bm)
+    return _replace_left_face_with_graph(
+        bm,
+        ((-1.65, -0.3, 0.0), (-1.25, 0.0, 0.0), (-1.65, 0.3, 0.0)),
+        (
+            ("a", "b", 0),
+            ("b", 1, 0),
+            ("b", "c", 1),
+            ("c", 2, 1),
+            ("c", "d", 2),
+            ("d", "a", 0),
+            ("d", 0, 2),
+            (0, 1, 2),
+        ),
+        ((0, 1), (1, 2), (2, 0)),
+    )
+
+
+def build_interior_network_decline_one_anchor() -> bmesh.types.BMesh:
+    """R-D2/O15(d): one boundary anchor attached to an interior loop."""
+
+    bm = _base_pair()
+    _prepare_before_native_cut(bm)
+    return _replace_left_face_with_graph(
+        bm,
+        ((-1.65, -0.3, 0.0), (-1.25, 0.0, 0.0), (-1.65, 0.3, 0.0)),
+        (
+            ("a", "b", 0),
+            ("b", 1, 0),
+            ("b", "c", 1),
+            ("c", 2, 1),
+            ("c", "d", 2),
+            ("d", "a", 0),
+            ("d", 0, 2),
+            (0, 1, 2),
+        ),
+        ((0, 1), (1, 2), (2, 0), ("a", 0)),
+    )
+
+
+def build_interior_network_decline_dead_end() -> bmesh.types.BMesh:
+    """R-D2/O15(d): two-anchor main path plus an interior dead end."""
+
+    bm = _base_pair()
+    _prepare_before_native_cut(bm)
+    return _replace_left_face_with_graph(
+        bm,
+        ((-1.4, 0.0, 0.0), (-1.75, 0.0, 0.0)),
+        (
+            ("a", "b", 1),
+            ("b", 0, 1),
+            ("b", "c", 0),
+            ("c", "d", 1),
+            ("c", 1, 0),
+            ("d", "a", 1),
+        ),
+        (("b", 0), (0, "c"), (0, 1)),
+    )
 
 
 def build_plane_two_chains() -> bmesh.types.BMesh:
@@ -556,7 +766,7 @@ def fixture_from_builder(name: str, builder: Callable[[], bmesh.types.BMesh]) ->
     bm = builder()
     topology = _PREPARATIONS.pop(id(bm), None)
     assert topology is not None, name
-    source_edges = _source_edges(bm)
+    source_edges = list(_EXPLICIT_SOURCE_EDGES.pop(id(bm), ())) or _source_edges(bm)
     if name == "curved_quad_single_candidate":
         assert len(source_edges) == 2
     if name == "two_chains_same_face":
@@ -582,6 +792,20 @@ GOLDEN_BUILDERS: tuple[tuple[str, Callable[[], bmesh.types.BMesh]], ...] = (
 )
 
 
+NETWORK_BUILDERS: tuple[tuple[str, Callable[[], bmesh.types.BMesh]], ...] = (
+    ("network_y", build_interior_network_y),
+    ("network_x", build_interior_network_x),
+    ("network_branch_relay", build_interior_network_branch_relay),
+    ("network_theta", build_interior_network_theta),
+)
+
+NETWORK_DECLINE_BUILDERS: tuple[tuple[str, Callable[[], bmesh.types.BMesh]], ...] = (
+    ("network_decline_loop", build_interior_network_decline_loop),
+    ("network_decline_one_anchor", build_interior_network_decline_one_anchor),
+    ("network_decline_dead_end", build_interior_network_decline_dead_end),
+)
+
+
 # rev3 declines these at the gate (rev4/v5 must direct-apply them, O13) —
 # except endpoint_collision, which passes the gate on both revisions and
 # fails in apply (R-R1 projection-retry material, O11).
@@ -594,6 +818,10 @@ NON_EQUIVALENCE_BUILDERS: tuple[tuple[str, Callable[[], bmesh.types.BMesh]], ...
 
 def golden_fixtures() -> list[InteriorHostFixture]:
     return [fixture_from_builder(name, builder) for name, builder in GOLDEN_BUILDERS]
+
+
+def network_fixtures() -> list[InteriorHostFixture]:
+    return [fixture_from_builder(name, builder) for name, builder in NETWORK_BUILDERS]
 
 
 def non_equivalence_fixtures() -> list[InteriorHostFixture]:
