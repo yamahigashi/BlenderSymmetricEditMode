@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import time
+import traceback
 from dataclasses import dataclass
 
 import bmesh
 import bpy
 
-from . import matching, rip, session_state, snapshot
+from . import extrude, matching, rip, session_state, snapshot
 from ._types import (
     KnifeSession,
     MeshSelectionMode,
@@ -82,7 +83,44 @@ TOOL_PROFILES: dict[str, ToolProfile] = {
         supports_nested_offset=False,
         supports_adjust_repeat=False,
     ),
+    "EXTRUDE_NORMAL": ToolProfile(
+        kind="EXTRUDE_NORMAL",
+        label="Extrude",
+        wm_operator_names=("MESH_OT_extrude_region_move",),
+        primary_wm_operator="MESH_OT_extrude_region_move",
+        tool_idnames=(),
+        keymap_operator="view3d.edit_mesh_extrude_move_normal",
+        passthrough_handoff_grace=0.04,
+        passthrough_stable_ticks=3,
+        supports_nested_offset=False,
+        supports_adjust_repeat=False,
+    ),
+    "EXTRUDE_CONTEXT": ToolProfile(
+        kind="EXTRUDE_CONTEXT",
+        label="Extrude Region",
+        wm_operator_names=("MESH_OT_extrude_context_move",),
+        primary_wm_operator="MESH_OT_extrude_context_move",
+        tool_idnames=("3D View Tool: Edit Mesh, Extrude Region",),
+        keymap_operator="mesh.extrude_context_move",
+        passthrough_handoff_grace=0.04,
+        passthrough_stable_ticks=3,
+        supports_nested_offset=False,
+        supports_adjust_repeat=False,
+    ),
+    "EXTRUDE_SHRINK_FATTEN": ToolProfile(
+        kind="EXTRUDE_SHRINK_FATTEN",
+        label="Extrude Along Normals",
+        wm_operator_names=("MESH_OT_extrude_region_shrink_fatten",),
+        primary_wm_operator="MESH_OT_extrude_region_shrink_fatten",
+        tool_idnames=("3D View Tool: Edit Mesh, Extrude Along Normals",),
+        keymap_operator="mesh.extrude_region_shrink_fatten",
+        passthrough_handoff_grace=0.04,
+        passthrough_stable_ticks=3,
+        supports_nested_offset=False,
+        supports_adjust_repeat=False,
+    ),
 }
+EXTRUDE_TOOL_KINDS = frozenset({"EXTRUDE_NORMAL", "EXTRUDE_CONTEXT", "EXTRUDE_SHRINK_FATTEN"})
 TOOL_LABELS = {profile.kind: profile.label for profile in TOOL_PROFILES.values()}
 MODAL_IDENTIFIER_TOKENS = {profile.kind: profile.wm_operator_names for profile in TOOL_PROFILES.values()}
 _PASSTHROUGH_HANDOFF_GRACE = {profile.kind: profile.passthrough_handoff_grace for profile in TOOL_PROFILES.values()}
@@ -173,8 +211,15 @@ def _cleanup_object_layers(session: KnifeSession) -> None:
     try:
         if obj.mode == "EDIT":
             bm = bmesh.from_edit_mesh(obj.data)
-            if snapshot.remove_temporary_layers(bm):
-                bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+            try:
+                snapshot.remove_temporary_layers(bm)
+            except Exception:
+                traceback.print_exc()
+            finally:
+                try:
+                    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+                except Exception:
+                    traceback.print_exc()
         else:
             snapshot.remove_temporary_mesh_attributes(obj.data)
     except (ReferenceError, RuntimeError):
@@ -282,6 +327,7 @@ def _prepare_session(
     report,
     *,
     tool_kind: str = "KNIFE",
+    route_kmi_properties: tuple[tuple[str, object], ...] = (),
 ) -> bool:
     from .history import _remember_history_session
     from .watcher import _schedule_passthrough_watcher
@@ -324,6 +370,10 @@ def _prepare_session(
             if level == "WARNING":
                 report({"WARNING"}, f"Rip is not mirrored: {reason}")
             return False
+    if tool_kind in EXTRUDE_TOOL_KINDS and len(bm.faces) == 0:
+        snapshot.remove_temporary_layers(bm)
+        bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+        return False
 
     history_token = session_state._new_history_token()
     topology = snapshot.prepare_topology(
@@ -331,11 +381,14 @@ def _prepare_session(
         axis_index,
         settings.tolerance,
         history_token,
-        mark_vertex_ids=tool_kind == "RIP",
+        mark_vertex_ids=tool_kind == "RIP" or tool_kind in EXTRUDE_TOOL_KINDS,
         mesh_object=obj,
     )
 
     rip_snapshot = None
+    extrude_snapshot = None
+    prepare_disposition = "APPLY"
+    prepare_disposition_reason = ""
     if tool_kind == "RIP":
         # The bulk capture no longer refreshes BMesh indices, but the rip
         # snapshot keys its region and one-ring by vertex.index.
@@ -351,6 +404,31 @@ def _prepare_session(
             snapshot.remove_temporary_layers(bm)
             bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
             return False
+    elif tool_kind in EXTRUDE_TOOL_KINDS:
+        extrude.stamp_all_vertex_ids(bm)
+        extrude_snapshot = extrude.build_snapshot(
+            bm,
+            axis_index,
+            settings.tolerance,
+            tool_kind=tool_kind,
+            route_kmi_properties=route_kmi_properties,
+            mesh_select_mode=MeshSelectionMode(
+                vertices=bool(context.tool_settings.mesh_select_mode[0]),
+                edges=bool(context.tool_settings.mesh_select_mode[1]),
+                faces=bool(context.tool_settings.mesh_select_mode[2]),
+            ),
+            mesh_object=obj,
+        )
+        if extrude_snapshot is None:
+            snapshot.remove_temporary_layers(bm)
+            bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+            return False
+        prepare_disposition, prepare_disposition_reason = extrude.evaluate_prepare_gates(extrude_snapshot)
+        if prepare_disposition == "DECLINE" and prepare_disposition_reason:
+            report(
+                {"WARNING"},
+                f"Extrude was not mirrored: {prepare_disposition_reason} (native kept; mirror manually or undo)",
+            )
 
     bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
     session = KnifeSession(
@@ -380,6 +458,9 @@ def _prepare_session(
         ),
         rip=rip_snapshot,
         topology_resolution=topology.topology_resolution,
+        extrude=extrude_snapshot,
+        prepare_disposition=prepare_disposition,
+        prepare_disposition_reason=prepare_disposition_reason,
     )
     session_state._SESSIONS[window_pointer] = session
     _suspend_mesh_symmetry(session, obj)

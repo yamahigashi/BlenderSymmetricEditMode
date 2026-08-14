@@ -19,21 +19,27 @@ from ._types import (
 )
 from .face_mapping import FaceRegistry, _snapshot_face_map
 from .layer_names import (
+    EDGE_APPLY_ID_LAYER,
     EDGE_HIDDEN_LAYER,
+    EDGE_LIVE_HIDDEN_LAYER,
     EDGE_ORIGINAL_LAYER,
     EDGE_SELECTION_LAYER,
+    FACE_APPLY_ID_LAYER,
     FACE_HIDDEN_LAYER,
     FACE_ID_LAYER,
+    FACE_LIVE_HIDDEN_LAYER,
     FACE_MIRROR_ID_LAYER,
     FACE_SELECTION_LAYER,
     HISTORY_TOKEN_LAYER,
     TEMP_LAYER_NAMES,
+    VERT_APPLY_ID_LAYER,
     VERT_BACKUP_ID_LAYER,
     VERT_COLLAPSE_GROUP_LAYER,
     VERT_HIDDEN_LAYER,
+    VERT_LIVE_HIDDEN_LAYER,
     VERT_MERGE_GROUP_LAYER,
-    VERT_RIP_ID_LAYER,
     VERT_SELECTION_LAYER,
+    VERT_SESSION_ID_LAYER,
 )
 from .matching import (
     VertexMirrorLookup,
@@ -59,8 +65,14 @@ def remove_temporary_layers(bm: bmesh.types.BMesh) -> bool:
         (bm.faces.layers.int, FACE_SELECTION_LAYER),
         (bm.verts.layers.int, VERT_HIDDEN_LAYER),
         (bm.edges.layers.int, EDGE_HIDDEN_LAYER),
+        (bm.verts.layers.int, VERT_LIVE_HIDDEN_LAYER),
+        (bm.edges.layers.int, EDGE_LIVE_HIDDEN_LAYER),
+        (bm.faces.layers.int, FACE_LIVE_HIDDEN_LAYER),
+        (bm.verts.layers.int, VERT_APPLY_ID_LAYER),
+        (bm.edges.layers.int, EDGE_APPLY_ID_LAYER),
+        (bm.faces.layers.int, FACE_APPLY_ID_LAYER),
         (bm.verts.layers.int, VERT_BACKUP_ID_LAYER),
-        (bm.verts.layers.int, VERT_RIP_ID_LAYER),
+        (bm.verts.layers.int, VERT_SESSION_ID_LAYER),
         (bm.verts.layers.int, VERT_MERGE_GROUP_LAYER),
         (bm.verts.layers.int, VERT_COLLAPSE_GROUP_LAYER),
     )
@@ -808,15 +820,15 @@ def prepare_topology(
     vertex_hidden_layer = _reuse(bm.verts.layers.int, VERT_HIDDEN_LAYER, bool(hide_vertices.any()))
     face_hidden_layer = _reuse(bm.faces.layers.int, FACE_HIDDEN_LAYER, bool(hide_faces.any()))
     if mark_vertex_ids:
-        # RIP IDs are populated only after its snapshot has resolved the
-        # selected region. Recreate the layer so a repeated prepare cannot
-        # leak positive IDs from an earlier, differently scoped snapshot.
-        stale_rip_layer = bm.verts.layers.int.get(VERT_RIP_ID_LAYER)
-        if stale_rip_layer is not None:
-            bm.verts.layers.int.remove(stale_rip_layer)
-        bm.verts.layers.int.new(VERT_RIP_ID_LAYER)
+        # Session vertex IDs are populated after prepare (RIP: selected
+        # region; extrude: every vertex). Recreate the layer so a repeated
+        # prepare cannot leak positive IDs from an earlier snapshot.
+        stale_session_layer = bm.verts.layers.int.get(VERT_SESSION_ID_LAYER)
+        if stale_session_layer is not None:
+            bm.verts.layers.int.remove(stale_session_layer)
+        bm.verts.layers.int.new(VERT_SESSION_ID_LAYER)
     else:
-        _reuse(bm.verts.layers.int, VERT_RIP_ID_LAYER, False)
+        _reuse(bm.verts.layers.int, VERT_SESSION_ID_LAYER, False)
     for edge_id, edge in enumerate(bm.edges, start=1):
         edge[edge_layer] = edge_id
         if edge_hidden_layer is not None:

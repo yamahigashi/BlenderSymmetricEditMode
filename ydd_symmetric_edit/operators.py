@@ -11,6 +11,7 @@ from bpy.props import BoolProperty, StringProperty
 
 from . import (
     backup,
+    extrude,
     face_mapping,
     layer_names,
     rip,
@@ -61,6 +62,7 @@ from .session import (
     _PASSTHROUGH_HANDOFF_GRACE,
     _PASSTHROUGH_STABLE_TICKS,
     _WM_OPERATOR_TO_TOOL,
+    EXTRUDE_TOOL_KINDS,
     MODAL_IDENTIFIER_TOKENS,
     TOOL_LABELS,
     TOOL_PROFILES,
@@ -160,11 +162,14 @@ class MESH_OT_ydd_symmetric_edit_intercept(bpy.types.Operator):
         tool_kind = keymaps.route_tool_kind(self.route_key)
         if tool_kind is None:
             return {"PASS_THROUGH"}
+        if tool_kind in EXTRUDE_TOOL_KINDS and keymaps.live_route_has_dissolve_and_intersect(self.route_key):
+            return {"PASS_THROUGH"}
         try:
             _prepare_session(
                 context,
                 self.report,
                 tool_kind=tool_kind,
+                route_kmi_properties=keymaps.route_kmi_properties(self.route_key),
             )
         except Exception:
             traceback.print_exc()
@@ -246,6 +251,286 @@ def _finish_rip_session(
         _finish_report(operator, level, f"ydd Symmetric Edit: Rip was not mirrored: {reason}")
     else:
         _finish_report(operator, {"INFO"}, f"Mirrored Rip across {mirrored_count} seam edge(s)")
+        _maybe_extend_selection_to_mirror(obj, session.axis_index, session.tolerance)
+    return {"FINISHED"}
+
+
+def _write_session_disposition(session: KnifeSession, disposition: str, reason: str) -> None:
+    session.prepare_disposition = disposition
+    session.prepare_disposition_reason = reason
+    record = session_state._HISTORY_RECORDS.get(session.history_token)
+    if record is not None:
+        record.session.prepare_disposition = disposition
+        record.session.prepare_disposition_reason = reason
+
+
+def _write_extrude_freeze(session: KnifeSession, freeze) -> None:
+    session.extrude_freeze = freeze
+    record = session_state._HISTORY_RECORDS.get(session.history_token)
+    if record is not None:
+        record.session.extrude_freeze = freeze
+
+
+def _finish_extrude_session(
+    operator: bpy.types.Operator,
+    session: KnifeSession,
+    obj,
+    window_pointer: int,
+    context,
+) -> OperatorResult:
+    """Mirror a confirmed native region extrude. All-or-nothing, four states."""
+
+    backup_mesh = None
+    reason: str | None = None
+    backup_creation_failed = False
+    rollback_failed = False
+    applied = False
+    mutated = False
+    selection_state = None
+    write_decline = False
+    mesh_select_mode = session.mesh_select_mode
+
+    try:
+        if session.extrude is None:
+            reason = "the pre-extrude snapshot was lost"
+            write_decline = True
+        else:
+            intervening = extrude.intervening_operator_reason(session, context)
+            if intervening is not None:
+                reason = intervening
+                write_decline = True
+            elif session.prepare_disposition == "DECLINE":
+                reason = session.prepare_disposition_reason or "the extrusion selection cannot be mirrored"
+            elif not session.extrude_options_captured:
+                reason = "native extrude options could not be captured"
+            else:
+                bm = bmesh.from_edit_mesh(obj.data)
+                if session.extrude_freeze is not None:
+                    classified, classify_reason = extrude.reconnect_freeze(
+                        bm,
+                        session.extrude,
+                        session.extrude_freeze,
+                    )
+                else:
+                    classified, classify_reason = extrude.classify_live(bm, session.extrude)
+                if classified is None:
+                    reason = classify_reason or "the native extrude result could not be classified"
+                    write_decline = True
+                else:
+                    if session.extrude_freeze is None:
+                        _write_extrude_freeze(session, classified.freeze)
+                    description, describe_reason = extrude.describe_source(bm, session.extrude, classified)
+                    if description is None:
+                        reason = describe_reason or "the native extrude could not be described"
+                        write_decline = True
+                    else:
+                        selection_state = selection.add_selection_layers(bm)
+                        selection.snapshot_live_hidden(bm)
+                        try:
+                            backup_mesh = backup.create_topology_backup(bm)
+                        except Exception as exc:
+                            traceback.print_exc()
+                            backup_creation_failed = True
+                            reason = "backup_creation_failed"
+                            del exc
+                        if backup_mesh is not None:
+                            bm = bmesh.from_edit_mesh(obj.data)
+                            if session.extrude_freeze is not None:
+                                classified, classify_reason = extrude.reconnect_freeze(
+                                    bm,
+                                    session.extrude,
+                                    session.extrude_freeze,
+                                )
+                            else:
+                                classified, classify_reason = extrude.classify_live(bm, session.extrude)
+                            if classified is None or classify_reason is not None:
+                                reason = classify_reason or "classification was lost after backup"
+                                write_decline = True
+                            else:
+                                description, describe_reason = extrude.describe_source(
+                                    bm,
+                                    session.extrude,
+                                    classified,
+                                )
+                                if description is None:
+                                    reason = describe_reason or "source description was lost after backup"
+                                    write_decline = True
+                                else:
+                                    stationarity_reason = extrude.check_origin_stationarity(
+                                        bm,
+                                        session.extrude,
+                                        classified,
+                                    )
+                                    if stationarity_reason is not None:
+                                        reason = stationarity_reason
+                                        write_decline = True
+                                    else:
+                                        source_copy_coords = {
+                                            vertex_id: (
+                                                float(copy.co.x),
+                                                float(copy.co.y),
+                                                float(copy.co.z),
+                                            )
+                                            for vertex_id, copy in classified.copies.items()
+                                        }
+                                        source_origin_coords = {
+                                            vertex_id: (
+                                                float(origin.co.x),
+                                                float(origin.co.y),
+                                                float(origin.co.z),
+                                            )
+                                            for vertex_id, origin in classified.origins.items()
+                                        }
+                                        mirror_copies, apply_reason, apply_audit = extrude.apply_mirror(
+                                            bm,
+                                            session.extrude,
+                                            classified,
+                                            description,
+                                        )
+                                        mutated = True
+                                        if apply_reason is not None or apply_audit is None:
+                                            reason = apply_reason or "the mirrored extrude could not be applied"
+                                            write_decline = True
+                                        else:
+                                            verify_reason = extrude.verify_mirror(
+                                                bm,
+                                                session.extrude,
+                                                classified,
+                                                description,
+                                                mirror_copies,
+                                                source_copy_coords,
+                                                source_origin_coords,
+                                                apply_audit,
+                                            )
+                                            if verify_reason is not None:
+                                                reason = verify_reason
+                                                write_decline = True
+                                            else:
+                                                applied = True
+                                                bmesh.update_edit_mesh(
+                                                    obj.data,
+                                                    loop_triangles=True,
+                                                    destructive=True,
+                                                )
+    except Exception as exc:
+        traceback.print_exc()
+        reason = str(exc)
+        write_decline = True
+        if backup_mesh is not None and mutated:
+            try:
+                backup.restore_topology_backup(obj.data, backup_mesh)
+                applied = False
+                mutated = False
+            except Exception:
+                traceback.print_exc()
+                rollback_failed = True
+                reason = f"Extrude mirror failed and rollback failed: {exc}"
+    finally:
+        try:
+            if backup_mesh is not None and mutated and not applied:
+                try:
+                    backup.restore_topology_backup(obj.data, backup_mesh)
+                    mutated = False
+                except Exception:
+                    traceback.print_exc()
+                    rollback_failed = True
+                    reason = f"Extrude mirror failed and rollback failed: {reason}"
+                    _finish_report(
+                        operator,
+                        {"WARNING"},
+                        "ydd Symmetric Edit: extrude backup restore failed",
+                    )
+        finally:
+            try:
+                if obj is not None and obj.mode == "EDIT":
+                    try:
+                        bm = bmesh.from_edit_mesh(obj.data)
+                        context.tool_settings.mesh_select_mode = mesh_select_mode.as_tuple()
+                        if selection_state is not None:
+                            selection.restore_visibility_and_selection(
+                                bm,
+                                session.hidden_by_face_id,
+                                selection_state,
+                                use_live_hidden=True,
+                            )
+                    except Exception:
+                        traceback.print_exc()
+                        _finish_report(
+                            operator,
+                            {"WARNING"},
+                            "ydd Symmetric Edit: extrude visibility/selection restore failed",
+                        )
+            finally:
+                try:
+                    if obj is not None and obj.mode == "EDIT":
+                        try:
+                            bm = bmesh.from_edit_mesh(obj.data)
+                            snapshot.remove_temporary_layers(bm)
+                        except Exception:
+                            traceback.print_exc()
+                            _finish_report(
+                                operator,
+                                {"WARNING"},
+                                "ydd Symmetric Edit: temporary extrude layers could not be removed",
+                            )
+                finally:
+                    try:
+                        if obj is not None and obj.mode == "EDIT":
+                            try:
+                                bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=True)
+                            except Exception:
+                                traceback.print_exc()
+                                _finish_report(
+                                    operator,
+                                    {"WARNING"},
+                                    "ydd Symmetric Edit: extrude mesh update failed",
+                                )
+                    finally:
+                        try:
+                            backup.remove_backup(backup_mesh)
+                        except Exception:
+                            traceback.print_exc()
+                            _finish_report(
+                                operator,
+                                {"WARNING"},
+                                "ydd Symmetric Edit: extrude backup release failed",
+                            )
+                        finally:
+                            try:
+                                cleanup_session(window_pointer, keep_history_record=True)
+                            except Exception:
+                                traceback.print_exc()
+                                _finish_report(
+                                    operator,
+                                    {"WARNING"},
+                                    "ydd Symmetric Edit: extrude session cleanup failed",
+                                )
+
+    if write_decline and reason is not None and reason != "native extrude options could not be captured":
+        _write_session_disposition(session, "DECLINE", reason)
+
+    kept_hint = " (native kept; mirror manually or undo)"
+    if reason is not None:
+        if rollback_failed:
+            _finish_report(
+                operator,
+                {"ERROR"},
+                f"ydd Symmetric Edit: Extrude mirror failed and rollback failed: {reason}. Undo to recover.",
+            )
+        elif backup_creation_failed:
+            _finish_report(
+                operator,
+                {"WARNING"},
+                f"ydd Symmetric Edit: Extrude was not mirrored: {reason}{kept_hint}",
+            )
+        else:
+            _finish_report(
+                operator,
+                {"WARNING"},
+                f"ydd Symmetric Edit: Extrude was not mirrored: {reason}{kept_hint}",
+            )
+    else:
+        _finish_report(operator, {"INFO"}, "Mirrored Extrude")
         _maybe_extend_selection_to_mirror(obj, session.axis_index, session.tolerance)
     return {"FINISHED"}
 
@@ -337,6 +622,9 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     _finish_report(self, {"ERROR"}, f"ydd Symmetric Edit resolution failed: {exc}")
                     return {"FINISHED"}
             return _finish_rip_session(self, session, obj, window_pointer)
+
+        if session.tool_kind in EXTRUDE_TOOL_KINDS:
+            return _finish_extrude_session(self, session, obj, window_pointer, context)
 
         backup_mesh = None
         mirror_committed = False

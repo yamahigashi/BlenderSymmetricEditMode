@@ -10,8 +10,14 @@ EDGE_SELECTION_LAYER = ".yse_edge_selection"
 FACE_SELECTION_LAYER = ".yse_face_selection"
 VERT_HIDDEN_LAYER = ".yse_vertex_hidden"
 EDGE_HIDDEN_LAYER = ".yse_edge_hidden"
+VERT_LIVE_HIDDEN_LAYER = ".yse_live_vert_hidden"
+EDGE_LIVE_HIDDEN_LAYER = ".yse_live_edge_hidden"
+FACE_LIVE_HIDDEN_LAYER = ".yse_live_face_hidden"
+VERT_APPLY_ID_LAYER = ".yse_apply_vert_id"
+EDGE_APPLY_ID_LAYER = ".yse_apply_edge_id"
+FACE_APPLY_ID_LAYER = ".yse_apply_face_id"
 VERT_BACKUP_ID_LAYER = ".yse_backup_vertex_id"
-VERT_RIP_ID_LAYER = ".yse_rip_vertex_id"
+VERT_SESSION_ID_LAYER = ".yse_session_vertex_id"
 VERT_MERGE_GROUP_LAYER = ".yse_merge_group"
 VERT_COLLAPSE_GROUP_LAYER = ".yse_collapse_group"
 TEMP_LAYER_NAMES = (
@@ -25,8 +31,14 @@ TEMP_LAYER_NAMES = (
     FACE_SELECTION_LAYER,
     VERT_HIDDEN_LAYER,
     EDGE_HIDDEN_LAYER,
+    VERT_LIVE_HIDDEN_LAYER,
+    EDGE_LIVE_HIDDEN_LAYER,
+    FACE_LIVE_HIDDEN_LAYER,
+    VERT_APPLY_ID_LAYER,
+    EDGE_APPLY_ID_LAYER,
+    FACE_APPLY_ID_LAYER,
     VERT_BACKUP_ID_LAYER,
-    VERT_RIP_ID_LAYER,
+    VERT_SESSION_ID_LAYER,
     VERT_MERGE_GROUP_LAYER,
     VERT_COLLAPSE_GROUP_LAYER,
 )

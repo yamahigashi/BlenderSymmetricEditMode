@@ -26,6 +26,7 @@ from ._types import (
 )
 from .session import (
     _WM_OPERATOR_TO_TOOL,
+    EXTRUDE_TOOL_KINDS,
     TOOL_PROFILES,
     _cleanup_repair_session,
     _find_saved_view,
@@ -416,11 +417,15 @@ def _restore_history_record_session(obj, record: HistoryRecord, *, adjusted_path
             # flags. Treat that state like the tail of the original modal operation
             # so finish restores the exact native setting captured by the session.
             session.symmetry_suspended = current_symmetry != session.symmetry_flags
-        restored = (
-            _restore_session_face_maps(session, obj)
-            if adjusted_path_signatures is None
-            else _prepare_adjusted_session_face_maps(session, obj, adjusted_path_signatures)
-        )
+        if session.tool_kind in EXTRUDE_TOOL_KINDS:
+            # Extrude repair must not use FACE_ID domain checks (inherited IDs are not unique).
+            restored = session.extrude is not None
+        else:
+            restored = (
+                _restore_session_face_maps(session, obj)
+                if adjusted_path_signatures is None
+                else _prepare_adjusted_session_face_maps(session, obj, adjusted_path_signatures)
+            )
     except Exception:
         traceback.print_exc()
         record.status = "FAILED"
@@ -630,8 +635,13 @@ def _prepare_adjust_last_operation_repeat() -> bool:
         return False
     if tokens:
         try:
-            bm = bmesh.from_edit_mesh(obj.data)
-            path_state = stitch_pathedges.native_path_edge_state(bm)
+            if prior_record.session.tool_kind in EXTRUDE_TOOL_KINDS:
+                # Do not run the loopcut marker predicate on extrude records.
+                # Full extrude PRESENT is deferred; UNKNOWN keeps this helper off.
+                path_state = "UNKNOWN"
+            else:
+                bm = bmesh.from_edit_mesh(obj.data)
+                path_state = stitch_pathedges.native_path_edge_state(bm)
         except Exception:
             return False
         if path_state != "ABSENT":

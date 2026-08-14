@@ -20,12 +20,15 @@ from ._types import (
 from .matching import VertexRegistry, _coordinate_3d, build_vertex_pair_table
 from .snapshot import (
     EDGE_HIDDEN_LAYER,
+    EDGE_LIVE_HIDDEN_LAYER,
     EDGE_ORIGINAL_LAYER,
     EDGE_SELECTION_LAYER,
     FACE_HIDDEN_LAYER,
     FACE_ID_LAYER,
+    FACE_LIVE_HIDDEN_LAYER,
     FACE_SELECTION_LAYER,
     VERT_HIDDEN_LAYER,
+    VERT_LIVE_HIDDEN_LAYER,
     VERT_SELECTION_LAYER,
     capture_selection_snapshot,
 )
@@ -120,10 +123,43 @@ def add_selection_layers(bm: bmesh.types.BMesh) -> SelectionSnapshot:
     return snapshot
 
 
+def snapshot_live_hidden(bm: bmesh.types.BMesh) -> None:
+    """Stamp every live hide flag onto dedicated post-native layers."""
+
+    for sequence, name in (
+        (bm.verts, VERT_LIVE_HIDDEN_LAYER),
+        (bm.edges, EDGE_LIVE_HIDDEN_LAYER),
+        (bm.faces, FACE_LIVE_HIDDEN_LAYER),
+    ):
+        layers = sequence.layers.int
+        old = layers.get(name)
+        if old is not None:
+            layers.remove(old)
+        layer = layers.new(name)
+        for element in sequence:
+            element[layer] = int(element.hide)
+
+
+def restore_live_hidden(bm: bmesh.types.BMesh) -> None:
+    """Restore hide flags from the post-native snapshot. Unstamped stay visible."""
+
+    vertex_layer = bm.verts.layers.int.get(VERT_LIVE_HIDDEN_LAYER)
+    edge_layer = bm.edges.layers.int.get(EDGE_LIVE_HIDDEN_LAYER)
+    face_layer = bm.faces.layers.int.get(FACE_LIVE_HIDDEN_LAYER)
+    for face in bm.faces:
+        face.hide = bool(face_layer is not None and face[face_layer])
+    for edge in bm.edges:
+        edge.hide = bool(edge_layer is not None and edge[edge_layer])
+    for vertex in bm.verts:
+        vertex.hide = bool(vertex_layer is not None and vertex[vertex_layer])
+
+
 def restore_visibility_and_selection(
     bm: bmesh.types.BMesh,
     hidden_by_face_id: HiddenFaceMap,
     selection_snapshot: SelectionSnapshot,
+    *,
+    use_live_hidden: bool = False,
 ) -> None:
     """Undo temporary hiding and the mirror stage's selection replacement."""
 
@@ -137,28 +173,31 @@ def restore_visibility_and_selection(
 
     # Visibility must be restored before selection: unhiding a face clears its
     # selection flag as a side effect.
-    for face in bm.faces:
-        if face_id_layer is not None:
-            face_id = FaceId(int(face[face_id_layer]))
-            face.hide = bool(hidden_by_face_id.get(face_id, False))
-        hidden_face_count += int(face.hide)
-    for edge in bm.edges:
-        edge.hide = bool(edge_hidden and edge[edge_hidden])
-    for vertex in bm.verts:
-        vertex.hide = bool(vertex_hidden and vertex[vertex_hidden])
-
-    # Through-face edges and vertices created inside a temporarily unhidden face
-    # start with zero hide data.  Hide them when every adjacent restored face is
-    # hidden, while preserving exact flags on all pre-existing elements.
-    # With no hidden face, every linked edge/vertex fails the all-hidden test;
-    # skip those full-mesh scans while preserving the original path otherwise.
-    if hidden_face_count:
+    if use_live_hidden:
+        restore_live_hidden(bm)
+    else:
+        for face in bm.faces:
+            if face_id_layer is not None:
+                face_id = FaceId(int(face[face_id_layer]))
+                face.hide = bool(hidden_by_face_id.get(face_id, False))
+            hidden_face_count += int(face.hide)
         for edge in bm.edges:
-            if edge.link_faces and all(face.hide for face in edge.link_faces):
-                edge.hide = True
+            edge.hide = bool(edge_hidden and edge[edge_hidden])
         for vertex in bm.verts:
-            if vertex.link_faces and all(face.hide for face in vertex.link_faces):
-                vertex.hide = True
+            vertex.hide = bool(vertex_hidden and vertex[vertex_hidden])
+
+        # Through-face edges and vertices created inside a temporarily unhidden face
+        # start with zero hide data.  Hide them when every adjacent restored face is
+        # hidden, while preserving exact flags on all pre-existing elements.
+        # With no hidden face, every linked edge/vertex fails the all-hidden test;
+        # skip those full-mesh scans while preserving the original path otherwise.
+        if hidden_face_count:
+            for edge in bm.edges:
+                if edge.link_faces and all(face.hide for face in edge.link_faces):
+                    edge.hide = True
+            for vertex in bm.verts:
+                if vertex.link_faces and all(face.hide for face in vertex.link_faces):
+                    vertex.hide = True
 
     # Clear broad-to-narrow, then restore narrow-to-broad.  Assigning a false
     # face flag can cascade into its boundary, while select_flush_mode() can

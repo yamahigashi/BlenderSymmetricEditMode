@@ -241,7 +241,7 @@ def assert_x_symmetric_full(bm, label=""):
 
 
 def assert_layers_removed(bm):
-    assert bm.verts.layers.int.get(layer_names.VERT_RIP_ID_LAYER) is None, "rip vertex layer leaked"
+    assert bm.verts.layers.int.get(layer_names.VERT_SESSION_ID_LAYER) is None, "rip vertex layer leaked"
     assert bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER) is None, "edge layer leaked"
     assert bm.faces.layers.int.get(layer_names.FACE_ID_LAYER) is None, "face layer leaked"
 

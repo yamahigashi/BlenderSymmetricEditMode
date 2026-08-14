@@ -1506,7 +1506,7 @@ def _check_rip_lookup_validation():
 
             validation_calls = 0
             rebuild_calls = 0
-            vertex_layer = bm.verts.layers.int.get(layer_names.VERT_RIP_ID_LAYER)
+            vertex_layer = bm.verts.layers.int.get(layer_names.VERT_SESSION_ID_LAYER)
             assert vertex_layer is not None
             bm.verts.layers.int.remove(vertex_layer)
             assert rip_module.build_snapshot(bm, 0, TOLERANCE, lookup=valid) is None
@@ -1538,7 +1538,7 @@ def _check_rip_scoped_vertex_ids():
         bm.verts[1].select = True
 
         topology = snapshot_module.prepare_topology(bm, 0, TOLERANCE, mark_vertex_ids=True)
-        vertex_layer = bm.verts.layers.int.get(layer_names.VERT_RIP_ID_LAYER)
+        vertex_layer = bm.verts.layers.int.get(layer_names.VERT_SESSION_ID_LAYER)
         assert vertex_layer is not None
         assert all(int(vertex[vertex_layer]) == 0 for vertex in bm.verts)
 
@@ -1570,7 +1570,7 @@ def _check_rip_scoped_vertex_ids():
 
         # Re-preparing must not retain positive IDs from the prior scoped run.
         topology = snapshot_module.prepare_topology(bm, 0, TOLERANCE, mark_vertex_ids=True)
-        vertex_layer = bm.verts.layers.int.get(layer_names.VERT_RIP_ID_LAYER)
+        vertex_layer = bm.verts.layers.int.get(layer_names.VERT_SESSION_ID_LAYER)
         assert vertex_layer is not None
         assert all(int(vertex[vertex_layer]) == 0 for vertex in bm.verts)
         for vertex in bm.verts:

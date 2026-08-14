@@ -15,6 +15,8 @@ PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE_PARENT))
 
 from ydd_symmetric_edit import (  # noqa: E402
+    extrude,
+    keymaps,
     layer_names,
     matching,
     selection,
@@ -632,6 +634,292 @@ def check_edge_side_tol_boundary_classification():
         bm.free()
 
 
+class _FakeKeymapProps:
+    bl_rna = type("RNA", (), {"properties": ()})()
+
+    def is_property_set(self, identifier):
+        return False
+
+
+class _FakeKeymapItem:
+    def __init__(self, idname, type="E", value="PRESS"):
+        self.idname = idname
+        self.active = True
+        self.type = type
+        self.value = value
+        self.any = False
+        self.shift = 0
+        self.ctrl = 0
+        self.alt = 0
+        self.oskey = 0
+        self.hyper = 0
+        self.key_modifier = "NONE"
+        self.direction = "ANY"
+        self.repeat = False
+        self.properties = _FakeKeymapProps()
+
+
+class _FakeKeymap:
+    def __init__(self, items):
+        self.name = "Mesh"
+        self.space_type = "EMPTY"
+        self.region_type = "WINDOW"
+        self.is_modal = False
+        self.keymap_items = items
+
+
+class _FakeWindowManager:
+    def __init__(self, items):
+        keymap = _FakeKeymap(items)
+        self.keyconfigs = type(
+            "KeyConfigs",
+            (),
+            {
+                "user": type("User", (), {"keymaps": [keymap]})(),
+                "active": type("Active", (), {"name": "Blender"})(),
+            },
+        )()
+
+
+def check_extrude_keymap_layers():
+    knife = "mesh.knife_tool"
+    extrude_e = "view3d.edit_mesh_extrude_move_normal"
+    extrude_context = "mesh.extrude_context_move"
+    original_operators = keymaps.OPERATOR_TOOL_KINDS
+    original_extrude = keymaps.EXTRUDE_TOOL_KINDS
+    keymaps.OPERATOR_TOOL_KINDS = {**original_operators, extrude_context: "EXTRUDE_CONTEXT"}
+    keymaps.EXTRUDE_TOOL_KINDS = frozenset({*original_extrude, "EXTRUDE_CONTEXT"})
+    try:
+        routes, _fingerprint = keymaps._native_routes(
+            _FakeWindowManager([_FakeKeymapItem(knife), _FakeKeymapItem(extrude_e)])
+        )
+        kinds = {route.tool_kind for route in routes}
+        assert "KNIFE" in kinds, kinds
+        assert "EXTRUDE_NORMAL" not in kinds, kinds
+
+        routes, _fingerprint = keymaps._native_routes(
+            _FakeWindowManager(
+                [
+                    _FakeKeymapItem(extrude_e, type="E"),
+                    _FakeKeymapItem(extrude_context, type="E"),
+                    _FakeKeymapItem(knife, type="K"),
+                ]
+            )
+        )
+        kinds = {route.tool_kind for route in routes}
+        assert "KNIFE" in kinds, kinds
+        assert "EXTRUDE_NORMAL" not in kinds, kinds
+        assert "EXTRUDE_CONTEXT" not in kinds, kinds
+
+        routes, _fingerprint = keymaps._native_routes(
+            _FakeWindowManager(
+                [
+                    _FakeKeymapItem(knife, type="K"),
+                    _FakeKeymapItem(extrude_e, type="E"),
+                ]
+            )
+        )
+        kinds = {route.tool_kind for route in routes}
+        assert "KNIFE" in kinds, kinds
+        assert "EXTRUDE_NORMAL" in kinds, kinds
+    finally:
+        keymaps.OPERATOR_TOOL_KINDS = original_operators
+        keymaps.EXTRUDE_TOOL_KINDS = original_extrude
+
+
+class _ExplicitFakeProps:
+    def __init__(self, values, *, set_identifiers=None):
+        self._values = dict(values)
+        self._set_identifiers = set(self._values) if set_identifiers is None else set(set_identifiers)
+        self.bl_rna = type(
+            "RNA",
+            (),
+            {"properties": [type("P", (), {"identifier": name})() for name in self._values]},
+        )()
+
+    def is_property_set(self, identifier):
+        return identifier in self._set_identifiers
+
+    def __getattr__(self, identifier):
+        try:
+            return self._values[identifier]
+        except KeyError as exc:
+            raise AttributeError(identifier) from exc
+
+
+class _NonScalarChild:
+    pointer = object()
+
+
+class _FakeMacroChild:
+    def __init__(self):
+        self.use_normal_flip = True
+        self.use_dissolve_ortho_edges = False
+        self.mirror = True
+
+
+class _FakeExtrudeMacro:
+    def __init__(self, *, topology_name, transform_name, omit=()):
+        if topology_name not in omit:
+            setattr(self, topology_name, _FakeMacroChild())
+        if transform_name not in omit:
+            setattr(
+                self,
+                transform_name,
+                _ExplicitFakeProps(
+                    {"value": 0.0, "use_even_offset": True},
+                    set_identifiers={"use_even_offset"},
+                ),
+            )
+
+
+def check_extrude_option_capture():
+    expected_children = {
+        "EXTRUDE_NORMAL": ("MESH_OT_extrude_region", "TRANSFORM_OT_translate"),
+        "EXTRUDE_CONTEXT": ("MESH_OT_extrude_context", "TRANSFORM_OT_translate"),
+        "EXTRUDE_SHRINK_FATTEN": ("MESH_OT_extrude_region", "TRANSFORM_OT_shrink_fatten"),
+    }
+    for tool_kind, (topology_name, transform_name) in expected_children.items():
+        # Each required macro child is independently fail-closed.
+        assert (
+            extrude.capture_native_options(
+                _FakeExtrudeMacro(
+                    topology_name=topology_name,
+                    transform_name=transform_name,
+                    omit=(topology_name,),
+                ),
+                tool_kind,
+            )
+            is None
+        )
+        assert (
+            extrude.capture_native_options(
+                _FakeExtrudeMacro(
+                    topology_name=topology_name,
+                    transform_name=transform_name,
+                    omit=(transform_name,),
+                ),
+                tool_kind,
+            )
+            is None
+        )
+
+        options = extrude.capture_native_options(
+            _FakeExtrudeMacro(topology_name=topology_name, transform_name=transform_name),
+            tool_kind,
+        )
+        assert options is not None, tool_kind
+        assert options.use_normal_flip is True
+        assert options.use_dissolve_ortho_edges is False
+        assert options.mirror is True
+        assert dict(options.transform_props) == {"value": 0.0, "use_even_offset": True}
+
+
+def check_kmi_scalar_capture():
+    pointer = object()
+    item = _FakeKeymapItem("mesh.extrude_context_move")
+    item.properties = _ExplicitFakeProps(
+        {
+            "bool_value": True,
+            "int_value": 7,
+            "float_value": 2.5,
+            "str_value": "native",
+            "pointer_value": pointer,
+        }
+    )
+    captured = keymaps._capture_set_kmi_properties(item)
+    assert dict(captured) == {
+        "bool_value": True,
+        "int_value": 7,
+        "float_value": 2.5,
+        "str_value": "native",
+    }, captured
+    assert all(isinstance(value, (bool, int, float, str)) for _, value in captured)
+
+
+def check_extrude_keymap_regressions():
+    extrude_e = "view3d.edit_mesh_extrude_move_normal"
+    original_routes = dict(keymaps._ROUTES_BY_KEY)
+    original_running = keymaps._RUNNING
+    original_enabled = keymaps._ENABLED
+    original_window_manager = keymaps._window_manager
+    try:
+        child = _NonScalarChild()
+        scalar_item = _FakeKeymapItem(extrude_e, type="E")
+        scalar_item.properties = _ExplicitFakeProps(
+            {
+                "dissolve_and_intersect": False,
+                "MESH_OT_extrude_region": child,
+            }
+        )
+        routes, _fingerprint = keymaps._native_routes(_FakeWindowManager([scalar_item]))
+        extrude_routes = [route for route in routes if route.tool_kind == "EXTRUDE_NORMAL"]
+        assert len(extrude_routes) == 1, extrude_routes
+        props = dict(extrude_routes[0].kmi_properties)
+        assert props.get("dissolve_and_intersect") is False, props
+        assert "MESH_OT_extrude_region" not in props, props
+        assert all(isinstance(value, (bool, int, float, str)) for value in props.values()), props
+
+        routes, _fingerprint = keymaps._native_routes(
+            _FakeWindowManager(
+                [
+                    _FakeKeymapItem(extrude_e, type="E"),
+                    _FakeKeymapItem(extrude_e, type="E"),
+                ]
+            )
+        )
+        assert all(route.tool_kind != "EXTRUDE_NORMAL" for route in routes), routes
+
+        live_item = _FakeKeymapItem(extrude_e, type="E")
+        live_item.properties = _ExplicitFakeProps({"dissolve_and_intersect": False})
+        live_wm = _FakeWindowManager([live_item])
+        routes, _fingerprint = keymaps._native_routes(live_wm)
+        route = next(candidate for candidate in routes if candidate.tool_kind == "EXTRUDE_NORMAL")
+        keymaps._ROUTES_BY_KEY.clear()
+        keymaps._ROUTES_BY_KEY[route.route_key] = route
+        keymaps._RUNNING = True
+        keymaps._ENABLED = True
+        keymaps._window_manager = lambda: live_wm
+        assert keymaps.route_is_current(route.route_key) is True
+        # Stage 1: every supported operator kind on the saved key/event is
+        # counted, so an additional supported KMI invalidates the route.
+        duplicate = _FakeKeymapItem(extrude_e, type="E")
+        live_wm.keyconfigs.user.keymaps[0].keymap_items.append(duplicate)
+        assert keymaps.route_is_current(route.route_key) is False
+        live_wm.keyconfigs.user.keymaps[0].keymap_items.remove(duplicate)
+        assert keymaps.route_is_current(route.route_key) is True
+        # Stage 1 must count every supported kind, not only the saved idname.
+        # Keep the saved KMI and add another supported kind on the same event.
+        context_item = _FakeKeymapItem("mesh.extrude_context_move", type="E")
+        live_wm.keyconfigs.user.keymaps[0].keymap_items.append(context_item)
+        assert keymaps.route_is_current(route.route_key) is False
+        live_wm.keyconfigs.user.keymaps[0].keymap_items.remove(context_item)
+        assert keymaps.route_is_current(route.route_key) is True
+        # Stage 2: a different supported operator replacing the saved KMI is
+        # stale even though the keymap still has exactly one supported item.
+        live_item.idname = "mesh.extrude_context_move"
+        assert keymaps.route_is_current(route.route_key) is False
+        live_item.idname = extrude_e
+        live_item.properties = _ExplicitFakeProps({"dissolve_and_intersect": True})
+        assert keymaps.route_is_current(route.route_key) is False
+
+        dissolve_item = _FakeKeymapItem(extrude_e, type="E")
+        dissolve_item.properties = _ExplicitFakeProps({"dissolve_and_intersect": True})
+        dissolve_wm = _FakeWindowManager([dissolve_item])
+        routes, _fingerprint = keymaps._native_routes(dissolve_wm)
+        dissolve_route = next(candidate for candidate in routes if candidate.tool_kind == "EXTRUDE_NORMAL")
+        keymaps._ROUTES_BY_KEY.clear()
+        keymaps._ROUTES_BY_KEY[dissolve_route.route_key] = dissolve_route
+        keymaps._window_manager = lambda: dissolve_wm
+        assert keymaps.live_route_has_dissolve_and_intersect(dissolve_route.route_key) is True
+    finally:
+        keymaps._ROUTES_BY_KEY.clear()
+        keymaps._ROUTES_BY_KEY.update(original_routes)
+        keymaps._RUNNING = original_running
+        keymaps._ENABLED = original_enabled
+        keymaps._window_manager = original_window_manager
+
+
 def run():
     bm = build_two_symmetric_quads()
     topology = snapshot.prepare_topology(bm, matching.AXIS_INDEX["X"], 1.0e-5)
@@ -815,6 +1103,10 @@ def run():
     check_vertex_mirror_lookup_asymmetric_returns_none()
     check_vertex_mirror_lookup_nearest_among_candidates()
     check_edge_side_tol_boundary_classification()
+    check_extrude_keymap_layers()
+    check_kmi_scalar_capture()
+    check_extrude_option_capture()
+    check_extrude_keymap_regressions()
     print("YSE_CORE_TEST_OK", flush=True)
 
 

@@ -108,7 +108,7 @@ def build_snapshot(
     if lookup is not None and not _lookup_matches_mesh(lookup, bm, axis_index, tolerance):
         lookup = matching.build_vertex_mirror_lookup([vertex.co for vertex in bm.verts], axis_index, tolerance)
 
-    vertex_id_layer = bm.verts.layers.int.get(layer_names.VERT_RIP_ID_LAYER)
+    vertex_id_layer = bm.verts.layers.int.get(layer_names.VERT_SESSION_ID_LAYER)
     face_id_layer = bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
     if vertex_id_layer is None or face_id_layer is None:
         return None
@@ -247,7 +247,7 @@ def _lookup_matches_mesh(
 def has_rip_result(bm: bmesh.types.BMesh) -> bool:
     """True as soon as one duplicated vertex ID exists."""
 
-    vertex_id_layer = bm.verts.layers.int.get(layer_names.VERT_RIP_ID_LAYER)
+    vertex_id_layer = bm.verts.layers.int.get(layer_names.VERT_SESSION_ID_LAYER)
     if vertex_id_layer is None:
         return False
     seen: set[int] = set()
@@ -264,7 +264,7 @@ def has_rip_result(bm: bmesh.types.BMesh) -> bool:
 def rip_result_signature(bm: bmesh.types.BMesh) -> RipSignature | None:
     """Stable signature of the native result: duplicated IDs and coordinates."""
 
-    vertex_id_layer = bm.verts.layers.int.get(layer_names.VERT_RIP_ID_LAYER)
+    vertex_id_layer = bm.verts.layers.int.get(layer_names.VERT_SESSION_ID_LAYER)
     if vertex_id_layer is None:
         return None
     groups: dict[int, list[Coordinate3D]] = {}
@@ -311,7 +311,7 @@ class _DerivedRip:
 def _derive(
     bm: bmesh.types.BMesh, snapshot: RipSnapshot, mirror_face_ids: MirrorFaceMap
 ) -> tuple[_DerivedRip | None, str | None]:
-    vertex_id_layer = bm.verts.layers.int.get(layer_names.VERT_RIP_ID_LAYER)
+    vertex_id_layer = bm.verts.layers.int.get(layer_names.VERT_SESSION_ID_LAYER)
     edge_layer = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
     face_id_layer = bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
     if vertex_id_layer is None or edge_layer is None or face_id_layer is None:
@@ -567,7 +567,7 @@ def apply_mirrored_rip(
     bmesh.ops.split_edges(bm, edges=mirror_edges, verts=mirror_split_verts, use_verts=True)
 
     # split_edges invalidates wrappers; rebuild the ID table before matching.
-    vertex_id_layer = bm.verts.layers.int.get(layer_names.VERT_RIP_ID_LAYER)
+    vertex_id_layer = bm.verts.layers.int.get(layer_names.VERT_SESSION_ID_LAYER)
     face_id_layer = bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
     if vertex_id_layer is None or face_id_layer is None:
         return 0, "temporary topology markers were lost while splitting"

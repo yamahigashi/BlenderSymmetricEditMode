@@ -125,6 +125,70 @@ class RipSnapshot:
         return {record.vertex_id: record for record in self.vertices}
 
 
+@dataclass(frozen=True, slots=True)
+class ExtrudeFreezeEntry:
+    """Immutable origin/copy reconnection row written on first successful classify."""
+
+    vertex_id: int
+    entity_class: str
+    origin_preop: Coordinate3D
+    copy_post: Coordinate3D
+
+
+@dataclass(frozen=True, slots=True)
+class ExtrudeNativeOptions:
+    """Native extrude-region + transform-child props captured after confirm."""
+
+    use_normal_flip: bool = False
+    use_dissolve_ortho_edges: bool = False
+    mirror: bool = False
+    transform_props: tuple[tuple[str, object], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ExtrudeSnapshot:
+    """Immutable pre-extrude capture. Gates G4–G6 and repair read only this."""
+
+    axis_index: int
+    tolerance: float
+    tool_kind: str
+    route_kmi_properties: tuple[tuple[str, object], ...]
+    mesh_select_mode: MeshSelectionMode
+    selected_vertex_ids: frozenset[int]
+    selected_edge_markers: frozenset[int]
+    selected_face_ids: frozenset[int]
+    vertex_preop: tuple[tuple[int, Coordinate3D], ...]
+    vertex_pairs: tuple[tuple[int, int | None], ...]
+    edge_pairs: tuple[tuple[int, int | None], ...]
+    face_pairs: tuple[tuple[int, int | None], ...]
+    hidden_vertex_ids: frozenset[int]
+    hidden_edge_markers: frozenset[int]
+    hidden_face_ids: frozenset[int]
+    face_corners: tuple[tuple[int, tuple[int, ...]], ...]
+    edge_endpoints: tuple[tuple[int, tuple[int, int]], ...]
+    vertex_count: int
+    edge_count: int
+    face_count: int
+
+    def vertex_preop_map(self) -> dict[int, Coordinate3D]:
+        return dict(self.vertex_preop)
+
+    def vertex_pair_map(self) -> dict[int, int | None]:
+        return dict(self.vertex_pairs)
+
+    def edge_pair_map(self) -> dict[int, int | None]:
+        return dict(self.edge_pairs)
+
+    def face_pair_map(self) -> dict[int, int | None]:
+        return dict(self.face_pairs)
+
+    def face_corner_map(self) -> dict[int, tuple[int, ...]]:
+        return dict(self.face_corners)
+
+    def edge_endpoint_map(self) -> dict[int, tuple[int, int]]:
+        return dict(self.edge_endpoints)
+
+
 class MirrorOverlap(Enum):
     """How a selection S relates to its own mirror image ρ(S).
 
@@ -311,6 +375,15 @@ class KnifeSession:
     native_operator_pointer: int = 0
     rip: RipSnapshot | None = None
     topology_resolution: LazyTopologyResolution | None = None
+    extrude: ExtrudeSnapshot | None = None
+    prepare_disposition: str = "APPLY"
+    prepare_disposition_reason: str = ""
+    extrude_freeze: tuple[ExtrudeFreezeEntry, ...] | None = None
+    extrude_options: ExtrudeNativeOptions | None = None
+    extrude_options_captured: bool = False
+    confirmed_operator_idname: str = ""
+    confirmed_operator_pointer: int = 0
+    confirmed_selection_signature: tuple[tuple[int, bool], ...] = ()
 
 
 @dataclass
@@ -372,6 +445,7 @@ class NativeRoute:
     tool_kind: str
     event: KeymapEvent
     route_key: str
+    kmi_properties: tuple[tuple[str, object], ...] = ()
 
     @property
     def keymap_identity(self) -> KeymapIdentity:

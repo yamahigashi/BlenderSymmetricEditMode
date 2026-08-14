@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import bpy
 
 from ._types import KeymapEvent, KeymapEventLike, KeymapFingerprint, KeymapIdentity, NativeRoute
-from .operators import TOOL_PROFILES
+from .operators import EXTRUDE_TOOL_KINDS, TOOL_PROFILES
 
 INTERCEPT_OPERATOR = "mesh.ydd_symmetric_edit_intercept"
 CONNECT_OPERATOR = "mesh.ydd_symmetric_edit_connect"
@@ -151,11 +151,11 @@ def _capture_set_kmi_properties(item) -> tuple[tuple[str, object], ...]:
             if not props.is_property_set(identifier):
                 continue
             value = getattr(props, identifier)
-            # Fingerprint / seen-set require hashable values.
+            # Fingerprint / seen-set require hashable, stable values. Macro
+            # child pointers stringify with a changing address and must not
+            # participate in route identity (G2 only needs scalar KMI props).
             if isinstance(value, (bool, int, float, str)):
                 captured.append((identifier, value))
-            else:
-                captured.append((identifier, str(value)))
     except Exception:
         traceback.print_exc()
         return ()
@@ -184,14 +184,19 @@ def _native_routes(window_manager) -> tuple[list[NativeRoute], KeymapFingerprint
         if keymap.is_modal:
             continue
 
-        items_by_event: dict[KeymapEvent, list[KeymapEventLike]] = {}
+        legacy_by_event: dict[KeymapEvent, list[KeymapEventLike]] = {}
+        extrude_by_event: dict[KeymapEvent, list[KeymapEventLike]] = {}
         for item in keymap.keymap_items:
             if not item.active or item.idname not in OPERATOR_TOOL_KINDS:
                 continue
             event = _event_signature(item)
-            items_by_event.setdefault(event, []).append(item)
+            tool_kind = OPERATOR_TOOL_KINDS[item.idname]
+            if tool_kind in EXTRUDE_TOOL_KINDS:
+                extrude_by_event.setdefault(event, []).append(item)
+            else:
+                legacy_by_event.setdefault(event, []).append(item)
 
-        for event, matching_items in items_by_event.items():
+        for event, matching_items in legacy_by_event.items():
             native_operators = tuple(dict.fromkeys(item.idname for item in matching_items))
             # Two different supported operators on the exact same physical
             # event cannot be identified by a PASS_THROUGH pre-hook.  Skipping
@@ -200,14 +205,6 @@ def _native_routes(window_manager) -> tuple[list[NativeRoute], KeymapFingerprint
             if len(native_operators) != 1:
                 continue
             native_operator = native_operators[0]
-
-            route_key = _make_route_key(
-                keymap.name,
-                keymap.space_type,
-                keymap.region_type,
-                native_operator,
-                event,
-            )
             routes.append(
                 NativeRoute(
                     keymap_name=keymap.name,
@@ -217,7 +214,42 @@ def _native_routes(window_manager) -> tuple[list[NativeRoute], KeymapFingerprint
                     native_operator=native_operator,
                     tool_kind=OPERATOR_TOOL_KINDS[native_operator],
                     event=event,
-                    route_key=route_key,
+                    route_key=_make_route_key(
+                        keymap.name,
+                        keymap.space_type,
+                        keymap.region_type,
+                        native_operator,
+                        event,
+                    ),
+                )
+            )
+
+        for event, matching_items in extrude_by_event.items():
+            if event in legacy_by_event:
+                continue
+            native_operators = tuple(dict.fromkeys(item.idname for item in matching_items))
+            if len(native_operators) != 1:
+                continue
+            if len(matching_items) > 1:
+                continue
+            native_operator = native_operators[0]
+            routes.append(
+                NativeRoute(
+                    keymap_name=keymap.name,
+                    space_type=keymap.space_type,
+                    region_type=keymap.region_type,
+                    is_tool=keymap.name in TOOL_KEYMAP_NAMES,
+                    native_operator=native_operator,
+                    tool_kind=OPERATOR_TOOL_KINDS[native_operator],
+                    event=event,
+                    route_key=_make_route_key(
+                        keymap.name,
+                        keymap.space_type,
+                        keymap.region_type,
+                        native_operator,
+                        event,
+                    ),
+                    kmi_properties=_capture_set_kmi_properties(matching_items[0]),
                 )
             )
 
@@ -554,6 +586,36 @@ def _ensure_watcher() -> None:
         )
 
 
+def _unique_live_supported_kmi(route: NativeRoute):
+    """Return the unique live supported KMI for ``route``, or ``None``.
+
+    Contract v7 §4.2: on the saved route's keymap + event, count every active
+    KMI whose ``idname`` is in ``OPERATOR_TOOL_KINDS`` (any kind). That total
+    must be exactly 1, and that idname must equal the saved route.
+    """
+
+    window_manager = _window_manager()
+    if window_manager is None or window_manager.keyconfigs.user is None:
+        return None
+    keymap = _find_keymap(
+        window_manager.keyconfigs.user,
+        route.keymap_identity,
+    )
+    if keymap is None:
+        return None
+
+    matching = [
+        item
+        for item in keymap.keymap_items
+        if item.active and item.idname in OPERATOR_TOOL_KINDS and _event_signature(item) == route.event
+    ]
+    if len(matching) != 1:
+        return None
+    if matching[0].idname != route.native_operator:
+        return None
+    return matching[0]
+
+
 def route_is_current(route_key: str) -> bool:
     """Return whether an intercept still precedes the native route it cloned."""
 
@@ -563,20 +625,12 @@ def route_is_current(route_key: str) -> bool:
     if route is None:
         return False
 
-    window_manager = _window_manager()
-    if window_manager is None or window_manager.keyconfigs.user is None:
+    item = _unique_live_supported_kmi(route)
+    if item is None:
         return False
-    keymap = _find_keymap(
-        window_manager.keyconfigs.user,
-        route.keymap_identity,
-    )
-    if keymap is None:
-        return False
-
-    return any(
-        item.active and item.idname == route.native_operator and _event_signature(item) == route.event
-        for item in keymap.keymap_items
-    )
+    if route.tool_kind in EXTRUDE_TOOL_KINDS:
+        return _capture_set_kmi_properties(item) == route.kmi_properties
+    return True
 
 
 def route_tool_kind(route_key: str) -> str | None:
@@ -584,6 +638,37 @@ def route_tool_kind(route_key: str) -> str | None:
 
     route = _ROUTES_BY_KEY.get(route_key)
     return route.tool_kind if route is not None else None
+
+
+def route_kmi_properties(route_key: str) -> tuple[tuple[str, object], ...]:
+    """Return the KMI props captured when the route was registered."""
+
+    route = _ROUTES_BY_KEY.get(route_key)
+    return route.kmi_properties if route is not None else ()
+
+
+def live_route_kmi_properties(route_key: str) -> tuple[tuple[str, object], ...] | None:
+    """Return explicit props of the unique live KMI for an extrude route.
+
+    ``None`` means the live KMI is missing or not unique.
+    """
+
+    route = _ROUTES_BY_KEY.get(route_key)
+    if route is None:
+        return None
+    item = _unique_live_supported_kmi(route)
+    if item is None:
+        return None
+    return _capture_set_kmi_properties(item)
+
+
+def live_route_has_dissolve_and_intersect(route_key: str) -> bool:
+    """G2 live check: True when the current KMI sets dissolve_and_intersect."""
+
+    props = live_route_kmi_properties(route_key)
+    if props is None:
+        return False
+    return any(name == "dissolve_and_intersect" and bool(value) for name, value in props)
 
 
 def has_delete_routes() -> bool:
