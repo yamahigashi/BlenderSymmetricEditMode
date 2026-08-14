@@ -82,12 +82,17 @@ def viewport_context():
 
 
 def click_drag_threshold_px():
+    # Preferences store the threshold in UI dots; the window manager compares
+    # against physical pixels, so display scaling widens the real threshold.
     inputs = bpy.context.preferences.inputs
     if hasattr(inputs, "drag_threshold_mouse"):
-        return max(1, int(inputs.drag_threshold_mouse))
-    if hasattr(inputs, "drag_threshold"):
-        return max(1, int(inputs.drag_threshold))
-    raise RuntimeError("preferences.inputs exposes neither drag_threshold_mouse nor drag_threshold")
+        base = int(inputs.drag_threshold_mouse)
+    elif hasattr(inputs, "drag_threshold"):
+        base = int(inputs.drag_threshold)
+    else:
+        raise RuntimeError("preferences.inputs exposes neither drag_threshold_mouse nor drag_threshold")
+    scale = float(getattr(bpy.context.preferences.system, "ui_scale", 1.0))
+    return max(1, int(round(base * scale)) + 1)
 
 
 def configure_view(area):
@@ -354,9 +359,7 @@ def wait_modal(done, started=None):
                 bpy.app.timers.register(done, first_interval=0.05)
                 return None
             if time.monotonic() - started > 4.0:
-                raise RuntimeError(
-                    f"native dispatcher never went modal; sessions={list(operators._SESSIONS)}"
-                )
+                raise RuntimeError(f"native dispatcher never went modal; sessions={list(operators._SESSIONS)}")
             return 0.05
         except BaseException:
             fail()

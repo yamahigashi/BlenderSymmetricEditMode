@@ -63,7 +63,7 @@ class Case:
     second_axis: bool = False
     proportional: bool = False
     hidden_partner: bool = False
-    asymmetric: bool = False
+    asymmetric: str | None = None
     drag: tuple[int, int] = (0, 80)
     event_interval: float = 0.09
     undo_redo: bool = False
@@ -83,7 +83,8 @@ CASES = (
     Case("proportional_decline", "EXTRUDE_CONTEXT", "face", False, "DECLINE", proportional=True),
     Case("plane_origin_decline", "EXTRUDE_CONTEXT", "plane_face", False, "DECLINE"),
     Case("hidden_partner_abort", "EXTRUDE_CONTEXT", "face", False, "DECLINE", hidden_partner=True),
-    Case("asymmetric_abort", "EXTRUDE_CONTEXT", "face", False, "DECLINE", asymmetric=True),
+    Case("asymmetric_far_adopted", "EXTRUDE_CONTEXT", "face", False, "APPLY", asymmetric="far"),
+    Case("asymmetric_partner_decline", "EXTRUDE_CONTEXT", "face", False, "DECLINE", asymmetric="partner"),
     Case("two_axis_not_adopted", "EXTRUDE_CONTEXT", "face", False, None, second_axis=True),
     Case("click_only", "EXTRUDE_CONTEXT", "face", None, None, drag=(0, 0)),
     Case(
@@ -96,6 +97,7 @@ CASES = (
     ),
     Case("kmi_exclusion", "EXTRUDE_CONTEXT", "face", True, intercept=True),
     Case("gizmo_then_kmi_grace", "EXTRUDE_CONTEXT", "face", True),
+    Case("double_extrude_undo", "EXTRUDE_CONTEXT", "face", None, None),
     # The wire fixture stays last: rebuilding a faced grid after the faceless
     # native extrude crashes Blender in the next case's undo sync.
     Case("faceless_bypass_not_adopted", "EXTRUDE_CONTEXT", "wire_edge", False, None, intercept=True),
@@ -368,8 +370,10 @@ def build_mesh(case: Case):
         for vertex in bm.verts:
             if float(vertex.co.x) < -0.5:
                 vertex.hide = True
-    if case.asymmetric:
+    if case.asymmetric == "far":
         grid_vert(bm, 1, 0).co.y += 0.125
+    elif case.asymmetric == "partner":
+        grid_vert(bm, 2, 1).co.y += 0.125
     bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
     with override():
         result = bpy.ops.ed.undo_push(message=f"YSE gizmo baseline {case.name}")
@@ -492,6 +496,92 @@ def send_undetected_flick(case, done):
     bpy.app.timers.register(wait_dead, first_interval=0.05)
 
 
+def wait_quiet(done, started=None):
+    started = time.monotonic() if started is None else started
+
+    def poll():
+        try:
+            if STATE["window"].modal_operators or operators._SESSIONS:
+                if time.monotonic() - started > 15.0:
+                    raise RuntimeError("double extrude leg did not settle")
+                return 0.05
+            bpy.app.timers.register(done, first_interval=0.25)
+        except BaseException:
+            fail()
+        return None
+
+    bpy.app.timers.register(poll, first_interval=0.05)
+
+
+def send_double_extrude_undo(case: Case, done):
+    # Two adopted extrudes stack; a single undo must drop only the second one
+    # on BOTH sides (the repair remirrors the first from its baked token).
+    def second_leg():
+        # Reselect a flat face away from the first cap so the second press has
+        # a deterministic anchor on both Blender versions.  Even if the modal
+        # start reverts the unpushed selection, the reverted selection is the
+        # first cap, which extrudes too, so the undo assertions still hold.
+        obj = test_object()
+        bm = bmesh.from_edit_mesh(obj.data)
+        clear_selection(bm)
+        target = grid_face(bm, 5, 0)
+        target.select = True
+        bm.select_flush_mode()
+        bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+
+        def press():
+            # A programmatic INVOKE is gizmo-equivalent under the armed poll
+            # and sidesteps version-specific event routing after the first
+            # adopted extrude.
+            bm2 = bmesh.from_edit_mesh(test_object().data)
+            selected = [vertex for vertex in bm2.verts if vertex.select]
+            center = sum((vertex.co for vertex in selected), Vector()) / len(selected)
+            x, y = window_coordinate(center)
+            with override():
+                result = bpy.ops.mesh.extrude_context_move("INVOKE_DEFAULT")
+            assert "RUNNING_MODAL" in result or "FINISHED" in result, result
+            dx, dy = case.drag
+            events = [
+                {"type": "MOUSEMOVE", "value": "NOTHING", "x": x + dx // 2, "y": y + dy // 2},
+                {"type": "MOUSEMOVE", "value": "NOTHING", "x": x + dx, "y": y + dy},
+                {"type": "LEFTMOUSE", "value": "PRESS", "x": x + dx, "y": y + dy},
+                {"type": "LEFTMOUSE", "value": "RELEASE", "x": x + dx, "y": y + dy},
+            ]
+            send_events(events, lambda: wait_quiet(run_undo), case.event_interval)
+            return None
+
+        bpy.app.timers.register(press, first_interval=0.4)
+        return None
+
+    def run_undo():
+        try:
+            with override():
+                assert bpy.ops.ed.undo() == {"FINISHED"}
+            bpy.app.timers.register(verify, first_interval=0.6)
+        except BaseException:
+            fail()
+        return None
+
+    def verify():
+        try:
+            bm = bmesh.from_edit_mesh(test_object().data)
+            base = STATE["baseline"]
+            assert is_x_symmetric(bm), "undo after two gizmo extrudes lost the first mirror"
+            assert (len(bm.verts), len(bm.edges), len(bm.faces)) == (
+                base[0] + 8,
+                base[1] + 16,
+                base[2] + 8,
+            ), (len(bm.verts), len(bm.edges), len(bm.faces))
+
+            assert_layers_removed(bm)
+            done()
+        except BaseException:
+            fail()
+        return None
+
+    send_events(drag_events(case), lambda: wait_quiet(second_leg), case.event_interval)
+
+
 def send_gizmo_then_kmi(case: Case, done):
     # First drag adopts through the gizmo route; the second fires the KMI
     # right after confirm so a still-live GIZMO_ADOPTED session must be
@@ -589,7 +679,7 @@ def verify_case(case: Case, done):
             def after_repair():
                 try:
                     repaired = bmesh.from_edit_mesh(obj.data)
-                    assert not is_x_symmetric(repaired), "gizmo redo unexpectedly remirrored"
+                    assert is_x_symmetric(repaired), "gizmo redo was not remirrored by repair"
                     assert_layers_removed(repaired)
                     done()
                 except BaseException:
@@ -625,6 +715,8 @@ def run_case(index):
                     send_undetected_flick(case, proceed)
                 elif case.name == "gizmo_then_kmi_grace":
                     send_gizmo_then_kmi(case, proceed)
+                elif case.name == "double_extrude_undo":
+                    send_double_extrude_undo(case, proceed)
                 else:
                     send_events(
                         drag_events(case),

@@ -402,9 +402,6 @@ def _prepare_adjusted_session_face_maps(session: KnifeSession, obj, path_signatu
 
 
 def _restore_history_record_session(obj, record: HistoryRecord, *, adjusted_path_signatures=None):
-    if record.session.route == "GIZMO_ADOPTED":
-        _cleanup_object_temporary_layers(obj)
-        return None
     try:
         session = copy.deepcopy(record.session)
         session.object_name = obj.name
@@ -475,9 +472,7 @@ def _repair_history_state():
         committed_tokens = [
             (token, session_state._HISTORY_RECORDS[token])
             for token in tokens
-            if token in session_state._HISTORY_RECORDS
-            and session_state._HISTORY_RECORDS[token].status == "COMMITTED"
-            and session_state._HISTORY_RECORDS[token].session.route != "GIZMO_ADOPTED"
+            if token in session_state._HISTORY_RECORDS and session_state._HISTORY_RECORDS[token].status == "COMMITTED"
         ]
         if len(committed_tokens) != 1:
             continue

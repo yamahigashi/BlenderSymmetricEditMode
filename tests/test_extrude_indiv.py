@@ -65,12 +65,17 @@ def viewport_context():
 
 
 def click_drag_threshold_px():
+    # Preferences store the threshold in UI dots; the window manager compares
+    # against physical pixels, so display scaling widens the real threshold.
     inputs = bpy.context.preferences.inputs
     if hasattr(inputs, "drag_threshold_mouse"):
-        return max(1, int(inputs.drag_threshold_mouse))
-    if hasattr(inputs, "drag_threshold"):
-        return max(1, int(inputs.drag_threshold))
-    raise RuntimeError("preferences.inputs exposes neither drag_threshold_mouse nor drag_threshold")
+        base = int(inputs.drag_threshold_mouse)
+    elif hasattr(inputs, "drag_threshold"):
+        base = int(inputs.drag_threshold)
+    else:
+        raise RuntimeError("preferences.inputs exposes neither drag_threshold_mouse nor drag_threshold")
+    scale = float(getattr(bpy.context.preferences.system, "ui_scale", 1.0))
+    return max(1, int(round(base * scale)) + 1)
 
 
 def configure_view(area, *, gizmos=False):
@@ -81,7 +86,7 @@ def configure_view(area, *, gizmos=False):
     region_3d.view_perspective = "ORTHO"
     region_3d.view_rotation = Quaternion((1.0, 0.0, 0.0, 0.0))
     region_3d.view_location = (0.0, 0.0, 0.0)
-    region_3d.view_distance = 8.0
+    region_3d.view_distance = 14.0
     region_3d.update()
 
 

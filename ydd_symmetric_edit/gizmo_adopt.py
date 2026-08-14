@@ -355,34 +355,21 @@ def _cycle_matches(first: tuple, second: tuple) -> bool:
     return extrude._signatures_match(first, second)
 
 
-def _classify_vertices(bm, axis_index: int, tolerance: float):
-    # Selected vertices are the copy candidates and, at detection time, may
-    # still coincide with their origins; they must stay out of the survivor
-    # matching entirely (rails and census validate them later).  Mid-modal the
-    # vertex flags may lag the edge/face flags, so all three domains count.
+def _classify_vertices(bm):
+    # Selected elements are the copy candidates; at detection time copies may
+    # coincide with their origins, and mid-modal the vertex flags may lag the
+    # edge/face flags, so all three domains count.  No global mirror pairing:
+    # only the origins and the mirrored region need counterparts (G5 scope).
     vertices = tuple(bm.verts)
-    new: set[bmesh.types.BMVert] = {vertex for vertex in vertices if vertex.select}
+    copies: set[bmesh.types.BMVert] = {vertex for vertex in vertices if vertex.select}
     for edge in bm.edges:
         if edge.select:
-            new.update(edge.verts)
+            copies.update(edge.verts)
     for face in bm.faces:
         if face.select:
-            new.update(face.verts)
-    unselected = [vertex for vertex in vertices if vertex not in new]
-    lookup = matching.build_vertex_mirror_lookup([vertex.co for vertex in unselected], axis_index, tolerance)
-    assigned = lookup.find_all_mirrored([vertex.co for vertex in unselected])
-    survivors: set[bmesh.types.BMVert] = set()
-    partners: dict[bmesh.types.BMVert, bmesh.types.BMVert] = {}
-    for vertex, index in zip(unselected, assigned, strict=True):
-        if index is None:
-            print(
-                f"YSE_GIZMO_DEBUG unpaired co={tuple(vertex.co)} select={vertex.select} nsel={len(new)}"
-                f" census={len(bm.verts)}/{len(bm.edges)}/{len(bm.faces)}"
-            )
-            return None, None, None, "an unselected vertex has no unique mirrored counterpart"
-        survivors.add(vertex)
-        partners[vertex] = unselected[index]
-    return survivors, new, partners, None
+            copies.update(face.verts)
+    survivors = {vertex for vertex in vertices if vertex not in copies}
+    return survivors, copies
 
 
 def _edge_between(first, second):
@@ -402,18 +389,14 @@ def _face_with_cycle(start, cycle):
 
 
 def _build_read_plan(bm, axis_index: int, tolerance: float, kind: str, mesh_select_mode: MeshSelectionMode):
-    survivors, copies, vertex_partner, reason = _classify_vertices(bm, axis_index, tolerance)
-    if survivors is None or copies is None or vertex_partner is None:
-        return None, reason
+    survivors, copies = _classify_vertices(bm)
     if not copies:
         return None, "the native gizmo made no extrusion copies"
 
     copy_origin: dict[bmesh.types.BMVert, bmesh.types.BMVert] = {}
     for copy in copies:
         origins = {
-            edge.other_vert(copy)
-            for edge in copy.link_edges
-            if edge.is_valid and edge.other_vert(copy) in survivors and not edge.other_vert(copy).select
+            edge.other_vert(copy) for edge in copy.link_edges if edge.is_valid and edge.other_vert(copy) in survivors
         }
         if len(origins) == 0:
             return None, "a copy has no unique surviving rail origin"
@@ -421,55 +404,36 @@ def _build_read_plan(bm, axis_index: int, tolerance: float, kind: str, mesh_sele
             return None, "a copy has multiple surviving rail origins"
         origin = next(iter(origins))
         if abs(float(origin.co[axis_index])) <= tolerance:
-            return None, "an extrusion origin lies on the mirror plane"
-        partner = vertex_partner.get(origin)
-        if partner is None or partner.hide:
-            return None, "an extrusion origin has a missing or hidden mirror vertex"
+            return None, "the extrusion selection includes a vertex on the mirror plane"
         copy_origin[copy] = origin
 
-    survivor_edges = {edge for edge in bm.edges if all(vertex in survivors for vertex in edge.verts)}
-    new_edges = set(bm.edges) - survivor_edges
+    # Mirror counterparts are resolved only for the origins; the rest of the
+    # mesh may be arbitrarily asymmetric without blocking adoption.
+    origin_list = sorted(set(copy_origin.values()), key=lambda vertex: vertex.index)
+    survivor_list = tuple(survivors)
+    lookup = matching.build_vertex_mirror_lookup([vertex.co for vertex in survivor_list], axis_index, tolerance)
+    assigned = lookup.find_all_mirrored([vertex.co for vertex in origin_list])
+    vertex_partner: dict[bmesh.types.BMVert, bmesh.types.BMVert] = {}
+    for origin, index in zip(origin_list, assigned, strict=True):
+        if index is None:
+            return None, "an extrusion origin has no unique mirrored counterpart"
+        partner = survivor_list[index]
+        if partner is origin or partner.hide:
+            return None, "an extrusion origin has a missing or hidden mirror vertex"
+        vertex_partner[origin] = partner
+        vertex_partner[partner] = origin
+    if len({vertex_partner[origin].index for origin in origin_list}) != len(origin_list):
+        return None, "the extrusion origins do not have distinct mirror vertices"
+
+    new_edges = {edge for edge in bm.edges if any(vertex in copies for vertex in edge.verts)}
+    survivor_edges = set(bm.edges) - new_edges
+    new_faces = {face for face in bm.faces if any(vertex in copies for vertex in face.verts)}
+    survivor_faces = set(bm.faces) - new_faces
+
     edge_partner: dict[bmesh.types.BMEdge, bmesh.types.BMEdge] = {}
-    one_sided_edges: list[bmesh.types.BMEdge] = []
-    for edge in survivor_edges:
-        first = vertex_partner[edge.verts[0]]
-        second = vertex_partner[edge.verts[1]]
-        partner = _edge_between(first, second)
-        if partner is None:
-            one_sided_edges.append(edge)
-        else:
-            if partner.hide:
-                return None, "a mirrored counterpart edge is hidden"
-            edge_partner[edge] = partner
-    if len(set(edge_partner.values())) != len(edge_partner):
-        return None, "the surviving edge correspondence is not injective"
-
-    survivor_faces = {face for face in bm.faces if all(vertex in survivors for vertex in face.verts)}
-    new_faces = set(bm.faces) - survivor_faces
     face_partner: dict[bmesh.types.BMFace, bmesh.types.BMFace] = {}
-    one_sided_faces: list[bmesh.types.BMFace] = []
-    for face in survivor_faces:
-        reflected = tuple(vertex_partner[loop.vert] for loop in reversed(face.loops))
-        matches = _face_with_cycle(reflected[0], reflected)
-        if len(matches) > 1:
-            return None, "a reflected face has multiple live counterparts"
-        if not matches:
-            one_sided_faces.append(face)
-        else:
-            partner = matches[0]
-            if partner.hide:
-                return None, "a mirrored counterpart face is hidden"
-            face_partner[face] = partner
-    if len(set(face_partner.values())) != len(face_partner):
-        return None, "the surviving face correspondence is not injective"
-
-    mirror_origins = {vertex_partner[origin] for origin in copy_origin.values()}
-    deleted_edge_targets = tuple(edge for edge in one_sided_edges if set(edge.verts).issubset(mirror_origins))
-    deleted_face_targets = tuple(face for face in one_sided_faces if set(face.verts).issubset(mirror_origins))
-    if len(deleted_edge_targets) != len(one_sided_edges) or len(deleted_face_targets) != len(one_sided_faces):
-        return None, "the live mesh is asymmetric outside the mirrored extrusion region"
-    if any(edge.hide for edge in deleted_edge_targets) or any(face.hide for face in deleted_face_targets):
-        return None, "a mirrored region counterpart is hidden"
+    deleted_edge_targets: tuple[bmesh.types.BMEdge, ...] = ()
+    deleted_face_targets: tuple[bmesh.types.BMFace, ...] = ()
 
     selected_copy_edges = tuple(
         edge for edge in new_edges if edge.select and all(vertex in copies for vertex in edge.verts)
@@ -477,40 +441,62 @@ def _build_read_plan(bm, axis_index: int, tolerance: float, kind: str, mesh_sele
     copy_source_cycles: dict[bmesh.types.BMVert, tuple[bmesh.types.BMVert, ...]] = {}
     if mesh_select_mode.faces:
         caps = [face for face in new_faces if all(vertex in copies for vertex in face.verts)]
-        source_cycles = [tuple(copy_origin[loop.vert] for loop in face.loops) for face in caps]
-        deleted_cycles = [
-            tuple(vertex_partner[loop.vert] for loop in reversed(face.loops)) for face in deleted_face_targets
-        ]
-        unmatched = list(deleted_cycles)
-        for cap, cycle in zip(caps, source_cycles, strict=True):
-            matches = [candidate for candidate in unmatched if _cycle_matches(cycle, candidate)]
+        targets: list[bmesh.types.BMFace] = []
+        seen_targets: set[int] = set()
+        for cap in caps:
+            source_cycle = tuple(copy_origin[loop.vert] for loop in cap.loops)
+            if _face_with_cycle(source_cycle[0], source_cycle):
+                return None, "a cap face still has its live source face"
+            mirror_cycle = tuple(vertex_partner[vertex] for vertex in reversed(source_cycle))
+            matches = _face_with_cycle(mirror_cycle[0], mirror_cycle)
             if len(matches) != 1:
+                return None, "the mirrored region face is missing or ambiguous"
+            target = matches[0]
+            if target.hide:
+                return None, "a mirrored region counterpart is hidden"
+            if target.index in seen_targets:
                 return None, "cap faces do not bijectively match the reconstructed deleted faces"
-            matched = matches[0]
-            unmatched.remove(matched)
+            seen_targets.add(target.index)
+            targets.append(target)
             if kind == "EXTRUDE_FACES_INDIV":
                 for copy in cap.verts:
                     if copy in copy_source_cycles:
                         return None, "an individual-face copy belongs to multiple cap faces"
-                    copy_source_cycles[copy] = matched
-        if unmatched or len(caps) != len(deleted_face_targets):
-            return None, "the reconstructed deleted face set is incomplete"
+                    copy_source_cycles[copy] = source_cycle
+        deleted_face_targets = tuple(targets)
+        region_edges = {edge for face in deleted_face_targets for edge in face.edges}
+        deleted_edges: list[bmesh.types.BMEdge] = []
+        for edge in region_edges:
+            first = vertex_partner.get(edge.verts[0])
+            second = vertex_partner.get(edge.verts[1])
+            if first is None or second is None:
+                return None, "the mirrored region face is missing or ambiguous"
+            source_edge = _edge_between(first, second)
+            if source_edge is None:
+                deleted_edges.append(edge)
+            else:
+                if edge.hide:
+                    return None, "a mirrored region counterpart is hidden"
+                edge_partner[source_edge] = edge
+        deleted_edge_targets = tuple(deleted_edges)
     elif mesh_select_mode.edges:
-        if deleted_edge_targets or deleted_face_targets:
-            return None, "edge-mode gizmo extrusion unexpectedly deleted topology"
         if not selected_copy_edges:
             return None, "edge-mode gizmo extrusion has no selected copy edges"
         for edge in selected_copy_edges:
             origins = tuple(copy_origin[vertex] for vertex in edge.verts)
-            if _edge_between(*origins) is None:
+            source_edge = _edge_between(*origins)
+            if source_edge is None:
                 return None, "the copy edge graph is not isomorphic to the origin graph"
+            mirror_edge = _edge_between(vertex_partner[origins[0]], vertex_partner[origins[1]])
+            if mirror_edge is None or mirror_edge.hide:
+                return None, "a mirrored counterpart edge is missing or hidden"
+            edge_partner[source_edge] = mirror_edge
             rail = set(edge.verts) | set(origins)
             quads = [face for face in new_faces if len(face.verts) == 4 and set(face.verts) == rail]
             if len(quads) != 1:
                 return None, "a selected copy edge has no unique side quad"
     elif mesh_select_mode.vertices:
-        if deleted_edge_targets or deleted_face_targets:
-            return None, "vertex-mode gizmo extrusion unexpectedly deleted topology"
+        pass
     else:
         return None, "the mesh selection mode is unsupported"
 
@@ -616,7 +602,9 @@ def _plan_from_indices(bm, data: dict, mesh_select_mode: MeshSelectionMode) -> _
     )
 
 
-def _stamp_and_snapshot(plan: _ReadPlan, axis_index: int, tolerance: float, kind: str) -> ExtrudeSnapshot:
+def _stamp_and_snapshot(
+    plan: _ReadPlan, axis_index: int, tolerance: float, kind: str, history_token: int
+) -> ExtrudeSnapshot:
     # Creating custom-data layers invalidates every held element reference,
     # so the plan round-trips through indices across all layer creation.
     bm = plan.bm
@@ -626,6 +614,11 @@ def _stamp_and_snapshot(plan: _ReadPlan, axis_index: int, tolerance: float, kind
     vertex_layer = _new_int_layer(bm.verts, layer_names.VERT_SESSION_ID_LAYER)
     edge_layer = _new_int_layer(bm.edges, layer_names.EDGE_ORIGINAL_LAYER)
     face_layer = _new_int_layer(bm.faces, layer_names.FACE_ID_LAYER)
+    # Baked into the native undo step, the token lets the undo_post repair
+    # remirror this record exactly like a KMI extrude (double-undo parity).
+    token_layer = _new_int_layer(bm.faces, layer_names.HISTORY_TOKEN_LAYER)
+    for face in bm.faces:
+        face[token_layer] = history_token
     selection.snapshot_live_hidden(bm)
     for sequence in (bm.verts, bm.edges, bm.faces):
         sequence.ensure_lookup_table()
@@ -665,7 +658,7 @@ def _stamp_and_snapshot(plan: _ReadPlan, axis_index: int, tolerance: float, kind
         (vertex_ids[vertex], Coordinate3D(float(vertex.co.x), float(vertex.co.y), float(vertex.co.z)))
         for vertex in plan.survivors
     )
-    vertex_pairs = tuple((vertex_ids[vertex], vertex_ids[plan.vertex_partner[vertex]]) for vertex in plan.survivors)
+    vertex_pairs = tuple((vertex_ids[vertex], vertex_ids[partner]) for vertex, partner in plan.vertex_partner.items())
 
     edge_pairs = [(edge_ids[edge], edge_ids[partner]) for edge, partner in plan.edge_partner.items()]
     edge_endpoints = [
@@ -765,7 +758,7 @@ def _commit_adoption(context, obj, operator, kind: str, axis_index: int, plan: _
     remembered = False
     completed = False
     try:
-        extrude_snapshot = _stamp_and_snapshot(plan, axis_index, float(settings.tolerance), kind)
+        extrude_snapshot = _stamp_and_snapshot(plan, axis_index, float(settings.tolerance), kind, history_token)
         bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
         face_layer = plan.bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
         hidden = {

@@ -321,7 +321,12 @@ def _finish_extrude_session(
             reason = "the pre-extrude snapshot was lost"
             write_decline = True
         else:
-            intervening = extrude.intervening_operator_reason(session, context)
+            # A repair refinish is authorized by its unique baked token; the
+            # confirmed operator is long gone after undo/redo by definition.
+            if session_state._HISTORY_REPAIR_BUSY:
+                intervening = None
+            else:
+                intervening = extrude.intervening_operator_reason(session, context)
             if intervening is not None:
                 reason = intervening
                 write_decline = True
