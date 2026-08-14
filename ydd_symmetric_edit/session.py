@@ -380,6 +380,26 @@ def _single_edit_mesh_poll(context) -> bool:
     return len(context.objects_in_mode_unique_data) == 1
 
 
+def gizmo_session_is_modal(context) -> bool:
+    from . import watcher
+
+    obj = context.edit_object
+    if obj is None or obj.type != "MESH":
+        return False
+    adopted = next(
+        (
+            active
+            for active in session_state._SESSIONS.values()
+            if active.mesh_name == obj.data.name and active.route == "GIZMO_ADOPTED"
+        ),
+        None,
+    )
+    if adopted is None:
+        return False
+    window = _find_window(adopted.window_pointer)
+    return window is not None and watcher._native_tool_is_active(window, adopted.tool_kind)
+
+
 def _prepare_session(
     context,
     report,
@@ -395,6 +415,39 @@ def _prepare_session(
     settings = context.scene.ydd_symmetric_edit
     obj = context.edit_object
     window_pointer = _window_key(context)
+
+    adopted_session = next(
+        (
+            active
+            for active in session_state._SESSIONS.values()
+            if active.mesh_name == obj.data.name and active.route == "GIZMO_ADOPTED"
+        ),
+        None,
+    )
+    if adopted_session is not None:
+        from . import operators, watcher
+
+        adopted_window = _find_window(adopted_session.window_pointer)
+        if adopted_window is not None and watcher._native_tool_is_active(adopted_window, adopted_session.tool_kind):
+            return False
+        if not watcher._capture_confirmed_extrude_result(adopted_session):
+            return False
+        saved_window, saved_area, saved_region = _find_saved_view(adopted_session)
+        if saved_window is None or saved_area is None or saved_region is None:
+            return False
+        try:
+            with bpy.context.temp_override(window=saved_window, area=saved_area, region=saved_region):
+                result = operators._invoke_finish_operator()
+        except Exception:
+            traceback.print_exc()
+            return False
+        record = session_state._HISTORY_RECORDS.get(adopted_session.history_token)
+        if record is not None:
+            record.status = "COMMITTED" if "FINISHED" in result else "FAILED"
+        if "FINISHED" not in result or any(
+            active.mesh_name == obj.data.name for active in session_state._SESSIONS.values()
+        ):
+            return False
 
     conflicting_session = next(
         (

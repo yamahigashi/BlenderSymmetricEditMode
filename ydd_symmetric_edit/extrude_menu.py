@@ -11,7 +11,7 @@ import bmesh
 import bpy
 from bpy.props import StringProperty
 
-from . import matching, session_state
+from . import gizmo_adopt, matching, session_state
 from .session import (
     EXTRUDE_TOOL_KINDS,
     _find_saved_view,
@@ -133,6 +133,9 @@ def _resolve_conflict(prior) -> bool:
 
 
 def _invoke_extrude_wrapper(context, report, *, tool_kind: str, native_idname: str) -> set[str]:
+    # The wildcard ticket must precede every branch, including BYPASS, so a
+    # sessionless native launch can never be mistaken for a gizmo drag.
+    gizmo_adopt.issue_exclusion_ticket(context)
     prior = _find_prior_session_same_mesh(context)
     if prior is not None:
         if not _resolve_conflict(prior):
@@ -188,6 +191,10 @@ class MESH_OT_ydd_symmetric_edit_extrude_menu(bpy.types.Operator):
         del event
         from . import keymaps
 
+        # Even a stale-route PASS_THROUGH reaches the native menu, whose
+        # extrudes must never read as gizmo drags; humans hold menus open far
+        # longer than the modal-start grace.
+        gizmo_adopt.issue_exclusion_ticket(context, grace=gizmo_adopt.MENU_TICKET_GRACE)
         if not keymaps.extrude_menu_route_is_current(self.route_key):
             return {"PASS_THROUGH"}
         if getattr(bpy.types, EXTRUDE_MENU, None) is None:

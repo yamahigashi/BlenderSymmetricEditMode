@@ -13,6 +13,7 @@ from . import (
     backup,
     extrude,
     face_mapping,
+    gizmo_adopt,
     layer_names,
     rip,
     selection,
@@ -78,6 +79,7 @@ from .session import (
     _window_key,
     cleanup_all_sessions,
     cleanup_session,
+    gizmo_session_is_modal,
 )  # noqa: F401
 from .watcher import (
     _capture_native_result_options,
@@ -157,13 +159,17 @@ class MESH_OT_ydd_symmetric_edit_intercept(bpy.types.Operator):
         del event
         from . import keymaps
 
+        tool_kind = keymaps.route_tool_kind(self.route_key)
+        if tool_kind in EXTRUDE_TOOL_KINDS:
+            gizmo_adopt.issue_exclusion_ticket(context)
         if not keymaps.route_is_current(self.route_key):
             return {"PASS_THROUGH"}
-        tool_kind = keymaps.route_tool_kind(self.route_key)
         if tool_kind is None:
             return {"PASS_THROUGH"}
         if tool_kind in EXTRUDE_TOOL_KINDS and keymaps.live_route_has_dissolve_and_intersect(self.route_key):
             return {"PASS_THROUGH"}
+        if tool_kind in EXTRUDE_TOOL_KINDS and gizmo_session_is_modal(context):
+            return {"FINISHED"}
         try:
             _prepare_session(
                 context,
@@ -289,6 +295,26 @@ def _finish_extrude_session(
     selection_state = None
     write_decline = False
     mesh_select_mode = session.mesh_select_mode
+    gizmo_route = session.route == gizmo_adopt.GIZMO_ROUTE
+    live_snapshot = session.extrude
+
+    def classify(edit_bm):
+        if live_snapshot is None:
+            return None, "the pre-extrude snapshot was lost"
+        if gizmo_route:
+            if session.extrude_freeze is not None:
+                return gizmo_adopt.reconnect_freeze(edit_bm, live_snapshot, session.extrude_freeze)
+            return gizmo_adopt.classify_live(edit_bm, live_snapshot)
+        if session.extrude_freeze is not None:
+            return extrude.reconnect_freeze(edit_bm, live_snapshot, session.extrude_freeze)
+        return extrude.classify_live(edit_bm, live_snapshot)
+
+    def describe(edit_bm, classified):
+        if live_snapshot is None:
+            return None, "the pre-extrude snapshot was lost"
+        if gizmo_route:
+            return gizmo_adopt.describe_source(edit_bm, live_snapshot, classified)
+        return extrude.describe_source(edit_bm, live_snapshot, classified)
 
     try:
         if session.extrude is None:
@@ -305,27 +331,21 @@ def _finish_extrude_session(
                 reason = "native extrude options could not be captured"
             else:
                 bm = bmesh.from_edit_mesh(obj.data)
-                if session.extrude_freeze is not None:
-                    classified, classify_reason = extrude.reconnect_freeze(
-                        bm,
-                        session.extrude,
-                        session.extrude_freeze,
-                    )
-                else:
-                    classified, classify_reason = extrude.classify_live(bm, session.extrude)
+                classified, classify_reason = classify(bm)
                 if classified is None:
                     reason = classify_reason or "the native extrude result could not be classified"
                     write_decline = True
                 else:
                     if session.extrude_freeze is None:
                         _write_extrude_freeze(session, classified.freeze)
-                    description, describe_reason = extrude.describe_source(bm, session.extrude, classified)
+                    description, describe_reason = describe(bm, classified)
                     if description is None:
                         reason = describe_reason or "the native extrude could not be described"
                         write_decline = True
                     else:
                         selection_state = selection.add_selection_layers(bm)
-                        selection.snapshot_live_hidden(bm)
+                        if not gizmo_route:
+                            selection.snapshot_live_hidden(bm)
                         try:
                             backup_mesh = backup.create_topology_backup(bm)
                         except Exception as exc:
@@ -335,23 +355,12 @@ def _finish_extrude_session(
                             del exc
                         if backup_mesh is not None:
                             bm = bmesh.from_edit_mesh(obj.data)
-                            if session.extrude_freeze is not None:
-                                classified, classify_reason = extrude.reconnect_freeze(
-                                    bm,
-                                    session.extrude,
-                                    session.extrude_freeze,
-                                )
-                            else:
-                                classified, classify_reason = extrude.classify_live(bm, session.extrude)
+                            classified, classify_reason = classify(bm)
                             if classified is None or classify_reason is not None:
                                 reason = classify_reason or "classification was lost after backup"
                                 write_decline = True
                             else:
-                                description, describe_reason = extrude.describe_source(
-                                    bm,
-                                    session.extrude,
-                                    classified,
-                                )
+                                description, describe_reason = describe(bm, classified)
                                 if description is None:
                                     reason = describe_reason or "source description was lost after backup"
                                     write_decline = True

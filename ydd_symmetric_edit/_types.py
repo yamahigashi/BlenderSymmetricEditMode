@@ -171,6 +171,14 @@ class ExtrudeSnapshot:
     vertex_count: int
     edge_count: int
     face_count: int
+    route: str = "KMI"
+    region_vertex_ids: frozenset[int] = frozenset()
+    region_edge_markers: frozenset[int] = frozenset()
+    region_face_ids: frozenset[int] = frozenset()
+    expected_created: tuple[int, int, int] | None = None
+    expected_deleted: tuple[int, int, int] | None = None
+    expected_net: tuple[int, int, int] | None = None
+    gizmo_copy_keys: tuple[tuple[int, tuple[int, ...]], ...] = ()
 
     def vertex_preop_map(self) -> dict[int, Coordinate3D]:
         return dict(self.vertex_preop)
@@ -386,6 +394,17 @@ class KnifeSession:
     confirmed_operator_idname: str = ""
     confirmed_operator_pointer: int = 0
     confirmed_selection_signature: tuple[tuple[int, bool], ...] = ()
+    route: str = "KMI"
+    gizmo_operator_pointer: int = 0
+
+
+@dataclass(slots=True)
+class GizmoExclusionTicket:
+    window_pointer: int
+    mesh_name: str
+    created_at: float
+    operator_pointer: int = 0
+    grace: float = 0.5
 
 
 @dataclass

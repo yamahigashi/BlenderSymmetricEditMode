@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 import bpy
 
+from . import gizmo_adopt, session_state
 from ._types import KeymapEvent, KeymapEventLike, KeymapFingerprint, KeymapIdentity, NativeRoute
 from .operators import EXTRUDE_TOOL_KINDS, TOOL_PROFILES
 
@@ -718,14 +719,46 @@ def _refresh(*, force: bool = False) -> bool:
 
 def _watch_keymaps():
     if not _RUNNING or not _ENABLED:
+        _sync_gizmo_poll()
         return None
     try:
         if not _refresh():
+            _sync_gizmo_poll()
             return _RETRY_INTERVAL
     except Exception:
         traceback.print_exc()
+        _sync_gizmo_poll()
         return _RETRY_INTERVAL
+    _sync_gizmo_poll()
     return _WATCH_INTERVAL
+
+
+def _poll_gizmo_global():
+    # The arm predicate walks every window's toolsystem, so at 20 Hz the fast
+    # tick only reads the flag the 1s watcher maintains via _sync_gizmo_poll.
+    if not _RUNNING or not _ENABLED or not session_state._GIZMO_POLL_ARMED:
+        return None
+    try:
+        gizmo_adopt.poll_global()
+    except Exception:
+        traceback.print_exc()
+    return gizmo_adopt.GIZMO_POLL_INTERVAL
+
+
+def _sync_gizmo_poll() -> None:
+    should_run = _RUNNING and _ENABLED and gizmo_adopt.arm_required()
+    session_state._GIZMO_POLL_ARMED = should_run
+    registered = bpy.app.timers.is_registered(_poll_gizmo_global)
+    if should_run and not registered:
+        gizmo_adopt.prime_onset_state()
+        bpy.app.timers.register(
+            _poll_gizmo_global,
+            first_interval=gizmo_adopt.GIZMO_POLL_INTERVAL,
+            persistent=True,
+        )
+    elif not should_run and registered:
+        bpy.app.timers.unregister(_poll_gizmo_global)
+        session_state._GIZMO_MODAL_POINTERS_BY_WINDOW.clear()
 
 
 def _ensure_watcher() -> None:
@@ -894,6 +927,8 @@ def sync(enabled: bool) -> None:
 
     window_manager = _window_manager()
     if not _ENABLED:
+        _sync_gizmo_poll()
+        gizmo_adopt.clear_runtime_state()
         for _keymap, item in tuple(_REGISTERED_ITEMS):
             try:
                 item.active = False
@@ -908,6 +943,7 @@ def sync(enabled: bool) -> None:
     except Exception:
         traceback.print_exc()
     _ensure_watcher()
+    _sync_gizmo_poll()
 
 
 def register(*, enabled: bool = False) -> None:
@@ -940,6 +976,7 @@ def register(*, enabled: bool = False) -> None:
         except Exception:
             traceback.print_exc()
         _ensure_watcher()
+        _sync_gizmo_poll()
 
 
 def unregister() -> None:
@@ -950,6 +987,9 @@ def unregister() -> None:
     _ENABLED = False
     if bpy.app.timers.is_registered(_watch_keymaps):
         bpy.app.timers.unregister(_watch_keymaps)
+    if bpy.app.timers.is_registered(_poll_gizmo_global):
+        bpy.app.timers.unregister(_poll_gizmo_global)
+    gizmo_adopt.clear_runtime_state()
 
     window_manager = _window_manager()
     if window_manager is not None:

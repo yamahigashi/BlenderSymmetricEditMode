@@ -4,6 +4,7 @@ import time
 from collections import OrderedDict
 
 from ._types import (
+    GizmoExclusionTicket,
     HistoryRecord,
     KnifeSession,
 )
@@ -18,6 +19,10 @@ _HISTORY_SEQUENCE = 0
 _FINISH_REPORTS: list[tuple[str, str]] = []
 _PASSTHROUGH_POLL_INTERVAL = 0.01
 _PASSTHROUGH_START_GRACE = 0.75
+_GIZMO_TICKETS: dict[tuple[int, str], GizmoExclusionTicket] = {}
+_GIZMO_TOMBSTONES: dict[int, bool] = {}
+_GIZMO_MODAL_POINTERS_BY_WINDOW: dict[int, frozenset[int]] = {}
+_GIZMO_POLL_ARMED: bool = False
 
 
 def _new_history_token() -> int:
