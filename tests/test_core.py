@@ -782,6 +782,7 @@ def check_extrude_option_capture():
         "EXTRUDE_NORMAL": ("MESH_OT_extrude_region", "TRANSFORM_OT_translate"),
         "EXTRUDE_CONTEXT": ("MESH_OT_extrude_context", "TRANSFORM_OT_translate"),
         "EXTRUDE_SHRINK_FATTEN": ("MESH_OT_extrude_region", "TRANSFORM_OT_shrink_fatten"),
+        "EXTRUDE_FACES_INDIV": ("MESH_OT_extrude_faces_indiv", "TRANSFORM_OT_shrink_fatten"),
     }
     for tool_kind, (topology_name, transform_name) in expected_children.items():
         # Each required macro child is independently fail-closed.

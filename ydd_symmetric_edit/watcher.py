@@ -218,7 +218,7 @@ def _capture_native_result_options(session: KnifeSession, context) -> None:
 
     if session.tool_kind in EXTRUDE_TOOL_KINDS:
         options = extrude.capture_native_options(operator, session.tool_kind)
-        if options is not None and session.tool_kind == "EXTRUDE_SHRINK_FATTEN":
+        if options is not None and session.tool_kind in {"EXTRUDE_SHRINK_FATTEN", "EXTRUDE_FACES_INDIV"}:
             options = extrude.ensure_observed_shrink_value(options, session)
         captured = options is not None
         session.extrude_options = options

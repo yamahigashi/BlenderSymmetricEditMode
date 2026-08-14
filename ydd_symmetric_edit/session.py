@@ -119,8 +119,22 @@ TOOL_PROFILES: dict[str, ToolProfile] = {
         supports_nested_offset=False,
         supports_adjust_repeat=False,
     ),
+    "EXTRUDE_FACES_INDIV": ToolProfile(
+        kind="EXTRUDE_FACES_INDIV",
+        label="Extrude Individual",
+        wm_operator_names=("MESH_OT_extrude_faces_move",),
+        primary_wm_operator="MESH_OT_extrude_faces_move",
+        tool_idnames=("3D View Tool: Edit Mesh, Extrude Individual",),
+        keymap_operator="mesh.extrude_faces_move",
+        passthrough_handoff_grace=0.04,
+        passthrough_stable_ticks=3,
+        supports_nested_offset=False,
+        supports_adjust_repeat=False,
+    ),
 }
-EXTRUDE_TOOL_KINDS = frozenset({"EXTRUDE_NORMAL", "EXTRUDE_CONTEXT", "EXTRUDE_SHRINK_FATTEN"})
+EXTRUDE_TOOL_KINDS = frozenset(
+    {"EXTRUDE_NORMAL", "EXTRUDE_CONTEXT", "EXTRUDE_SHRINK_FATTEN", "EXTRUDE_FACES_INDIV"}
+)
 TOOL_LABELS = {profile.kind: profile.label for profile in TOOL_PROFILES.values()}
 MODAL_IDENTIFIER_TOKENS = {profile.kind: profile.wm_operator_names for profile in TOOL_PROFILES.values()}
 _PASSTHROUGH_HANDOFF_GRACE = {profile.kind: profile.passthrough_handoff_grace for profile in TOOL_PROFILES.values()}

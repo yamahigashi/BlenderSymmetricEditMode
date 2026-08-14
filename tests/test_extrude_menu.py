@@ -434,7 +434,7 @@ _TRAILER = (
 _FACE_ITEMS = (
     ("op", extrude_menu.WRAPPER_FACES, "Extrude Faces", None),
     ("op", extrude_menu.WRAPPER_ALONG, "Extrude Faces Along Normals", None),
-    ("op", "mesh.extrude_faces_move", "Extrude Individual Faces", None),
+    ("op", extrude_menu.WRAPPER_INDIV, "Extrude Individual Faces", None),
     ("op", "view3d.edit_mesh_extrude_manifold_normal", "Extrude Manifold", None),
 )
 
@@ -1046,65 +1046,6 @@ def invoke_wrapper_and_drag(op_idname, cursor_xyz, verify, *, drag=(0, 80)):
     return start
 
 
-def invoke_native_individual(cursor_xyz, verify):
-    def start(next_case):
-        try:
-            print("YSE_EXTRUDE_MENU_CASE=passthrough_individual", flush=True)
-            obj = build_mesh("individual")
-            bm = bmesh.from_edit_mesh(obj.data)
-            select_faces(bm, [(4, 1)])
-            bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
-            STATE["baseline"] = topology_counts(bmesh.from_edit_mesh(obj.data))
-
-            x, y = window_coordinate(cursor_xyz)
-            STATE["window"].event_simulate(type="MOUSEMOVE", value="NOTHING", x=x, y=y)
-            with override():
-                result = bpy.ops.mesh.extrude_faces_move("INVOKE_DEFAULT")
-            assert "FINISHED" in result or "RUNNING_MODAL" in result, result
-            assert not operators._SESSIONS, list(operators._SESSIONS)
-
-            def settled():
-                try:
-                    bm2 = bmesh.from_edit_mesh(STATE["object"].data)
-                    verify(bm2)
-                    next_case()
-                except BaseException:
-                    fail()
-
-            def after_modal():
-                send_events(drag_confirm_events(cursor_xyz), lambda: wait_modal_gone(settled))
-
-            def wait_modal(started=None):
-                started = time.monotonic() if started is None else started
-
-                def poll():
-                    try:
-                        if tuple(STATE["window"].modal_operators):
-                            after_modal()
-                            return None
-                        if time.monotonic() - started > 4.0:
-                            after_modal()
-                            return None
-                        return 0.05
-                    except BaseException:
-                        fail()
-                    return None
-
-                bpy.app.timers.register(poll, first_interval=0.05)
-
-            wait_modal()
-        except BaseException:
-            fail()
-
-    return start
-
-
-def verify_individual_not_mirrored(bm):
-    assert vertex_multiset(bm) != mirrored_multiset(bm), "Individual Faces must stay one-sided (not wrapped)"
-    assert_layers_removed(bm)
-    assert not operators._SESSIONS, list(operators._SESSIONS)
-
-
 def run_all(cases, index=0):
     if index >= len(cases):
         print(MARKER_OK, flush=True)
@@ -1162,7 +1103,11 @@ def start_test():
                 cursor,
                 lambda bm: verify_net_and_symmetric(bm, (8, 16, 8)),
             ),
-            invoke_native_individual(cursor, verify_individual_not_mirrored),
+            invoke_wrapper_and_drag(
+                extrude_menu.WRAPPER_INDIV,
+                cursor,
+                lambda bm: verify_net_and_symmetric(bm, (8, 16, 8)),
+            ),
             start_m2,
         ]
         run_all(cases)

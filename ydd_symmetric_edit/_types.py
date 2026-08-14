@@ -133,6 +133,8 @@ class ExtrudeFreezeEntry:
     entity_class: str
     origin_preop: Coordinate3D
     copy_post: Coordinate3D
+    # (d) keys by snapshot face-corner circulation, never the integer FACE_ID.
+    source_face_signature: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

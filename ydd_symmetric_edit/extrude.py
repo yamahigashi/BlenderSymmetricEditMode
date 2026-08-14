@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Symmetric postprocess for Blender's native region extrude macros.
+"""Symmetric postprocess for Blender's native region and individual extrude macros.
 
-Stage 1+2 cover ``EXTRUDE_NORMAL``, ``EXTRUDE_CONTEXT``, and
-``EXTRUDE_SHRINK_FATTEN``. Classification uses vertex-ID instance groups and a
-freeze table; FACE_ID set-difference and live selection are not discriminators.
+Stage 1–3b cover ``EXTRUDE_NORMAL``, ``EXTRUDE_CONTEXT``,
+``EXTRUDE_SHRINK_FATTEN``, and ``EXTRUDE_FACES_INDIV``. Classification uses
+vertex-ID instance groups and a freeze table; FACE_ID set-difference and live
+selection are not discriminators. N-copies of one vid are keyed by
+``(vertex_id, source_face_signature)``, not by vid alone.
 """
 
 from __future__ import annotations
@@ -38,11 +40,22 @@ F12_CENSUS: dict[str, tuple[tuple[int, int, int], tuple[int, int, int], tuple[in
 
 
 @dataclass
+class ExtrudeCopyInstance:
+    """One classified copy, including N copies of the same vertex ID."""
+
+    vertex_id: int
+    vertex: bmesh.types.BMVert
+    entity_class: str
+    source_face_signature: tuple[int, ...]
+
+
+@dataclass
 class ExtrudeClassification:
     """Live origin/copy assignment after classify or freeze-table reconnect."""
 
     origins: dict[int, bmesh.types.BMVert]
     copies: dict[int, bmesh.types.BMVert]
+    copy_instances: tuple[ExtrudeCopyInstance, ...]
     vanished_preop: dict[int, Coordinate3D]
     freeze: tuple[ExtrudeFreezeEntry, ...]
 
@@ -298,6 +311,7 @@ _EXPECTED_MACRO_CHILDREN = {
     "EXTRUDE_NORMAL": ("MESH_OT_extrude_region", "TRANSFORM_OT_translate"),
     "EXTRUDE_CONTEXT": ("MESH_OT_extrude_context", "TRANSFORM_OT_translate"),
     "EXTRUDE_SHRINK_FATTEN": ("MESH_OT_extrude_region", "TRANSFORM_OT_shrink_fatten"),
+    "EXTRUDE_FACES_INDIV": ("MESH_OT_extrude_faces_indiv", "TRANSFORM_OT_shrink_fatten"),
 }
 
 
@@ -312,9 +326,9 @@ def capture_native_options(operator, tool_kind: str) -> ExtrudeNativeOptions | N
     if topology is None or transform is None:
         return None
     try:
-        use_normal_flip = bool(topology.use_normal_flip)
-        use_dissolve_ortho_edges = bool(topology.use_dissolve_ortho_edges)
-        mirror = bool(topology.mirror)
+        use_normal_flip = bool(getattr(topology, "use_normal_flip", False))
+        use_dissolve_ortho_edges = bool(getattr(topology, "use_dissolve_ortho_edges", False))
+        mirror = bool(getattr(topology, "mirror", False))
     except Exception:
         traceback.print_exc()
         return None
@@ -449,6 +463,7 @@ def classify_live(
     origins: dict[int, bmesh.types.BMVert] = {}
     copies: dict[int, bmesh.types.BMVert] = {}
     vanished: dict[int, Coordinate3D] = {}
+    pending_ncopy: list[tuple[int, list[bmesh.types.BMVert]]] = []
 
     assigned: set[int] = set()
     for vertex_id, instances in groups.items():
@@ -460,13 +475,15 @@ def classify_live(
             if vertex_id not in selected:
                 assigned.add(vertex_id)
                 continue
+            if snapshot.tool_kind == "EXTRUDE_FACES_INDIV":
+                return None, "interior-copy pattern is not allowed for individual face extrude"
             copies[vertex_id] = instances[0]
             vanished[vertex_id] = pre
             assigned.add(vertex_id)
             continue
+        moved = [vertex for vertex in instances if not matching.coordinates_match(vertex.co, pre.as_tuple(), tol)]
+        stayed = [vertex for vertex in instances if matching.coordinates_match(vertex.co, pre.as_tuple(), tol)]
         if count == 2:
-            moved = [vertex for vertex in instances if not matching.coordinates_match(vertex.co, pre.as_tuple(), tol)]
-            stayed = [vertex for vertex in instances if matching.coordinates_match(vertex.co, pre.as_tuple(), tol)]
             if len(moved) == 0:
                 return None, "zero-offset extrude is not mirrored"
             if len(moved) == 1 and len(stayed) == 1:
@@ -475,24 +492,116 @@ def classify_live(
                 assigned.add(vertex_id)
                 continue
             return None, "a duplicated vertex could not be classified by movement"
-        return None, "an unsupported N-duplicate vertex group was observed"
+        if snapshot.tool_kind != "EXTRUDE_FACES_INDIV":
+            return None, "an unsupported N-duplicate vertex group was observed"
+        if len(moved) == 0:
+            return None, "zero-offset extrude is not mirrored"
+        if len(stayed) != 1 or len(moved) < 2:
+            return None, "an N-duplicate vertex group did not have a unique stationary origin"
+        origins[vertex_id] = stayed[0]
+        pending_ncopy.append((vertex_id, moved))
+        assigned.add(vertex_id)
 
     missing_targets = selected - assigned
     if missing_targets:
         return None, "a selected extrusion vertex disappeared without a remaining copy"
 
+    copy_instances, ncopy_reason = _classify_ncopy_instances(bm, snapshot, copies, vanished, pending_ncopy)
+    if ncopy_reason is not None or copy_instances is None:
+        return None, ncopy_reason
     freeze = tuple(
         ExtrudeFreezeEntry(
-            vertex_id=vertex_id,
-            entity_class="c" if vertex_id in vanished else "b",
-            origin_preop=preop[vertex_id],
-            copy_post=_as_coordinate(copy),
+            vertex_id=inst.vertex_id,
+            entity_class=inst.entity_class,
+            origin_preop=preop[inst.vertex_id],
+            copy_post=_as_coordinate(inst.vertex),
+            source_face_signature=inst.source_face_signature,
         )
-        for vertex_id, copy in sorted(copies.items())
+        for inst in sorted(copy_instances, key=lambda item: (item.vertex_id, item.source_face_signature))
     )
     if not freeze:
         return None, "the native extrude produced no classified copies"
-    return ExtrudeClassification(origins, copies, vanished, freeze), None
+    return (
+        ExtrudeClassification(
+            origins=origins,
+            copies=copies,
+            copy_instances=tuple(copy_instances),
+            vanished_preop=vanished,
+            freeze=freeze,
+        ),
+        None,
+    )
+
+
+def _classify_ncopy_instances(
+    bm: bmesh.types.BMesh,
+    snapshot: ExtrudeSnapshot,
+    copies: dict[int, bmesh.types.BMVert],
+    vanished: dict[int, Coordinate3D],
+    pending_ncopy: list[tuple[int, list[bmesh.types.BMVert]]],
+) -> tuple[list[ExtrudeCopyInstance] | None, str | None]:
+    copy_instances = [
+        ExtrudeCopyInstance(
+            vertex_id=vertex_id,
+            vertex=copy,
+            entity_class="c" if vertex_id in vanished else "b",
+            source_face_signature=(),
+        )
+        for vertex_id, copy in copies.items()
+    ]
+    if not pending_ncopy:
+        return copy_instances, None
+
+    face_layer = bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
+    if face_layer is None:
+        return None, "the face ID layer is missing"
+    copy_set = set(copies.values())
+    for _vertex_id, moved in pending_ncopy:
+        copy_set.update(moved)
+    corner_map = snapshot.face_corner_map()
+    seen_keys: set[tuple[int, tuple[int, ...]]] = set()
+    for vertex_id, moved in pending_ncopy:
+        for copy in moved:
+            source_ids = _source_face_ids_for_copy(copy, copy_set, face_layer, snapshot.selected_face_ids)
+            if len(source_ids) != 1:
+                return None, "an individual-face copy could not be attributed to a single source face"
+            face_id = next(iter(source_ids))
+            signature = corner_map.get(face_id)
+            if signature is None:
+                return None, "a source face signature is missing from the extrude snapshot"
+            key = (vertex_id, signature)
+            if key in seen_keys:
+                return None, "duplicate (vertex, source-face) copy key"
+            seen_keys.add(key)
+            copy_instances.append(
+                ExtrudeCopyInstance(
+                    vertex_id=vertex_id,
+                    vertex=copy,
+                    entity_class="d",
+                    source_face_signature=signature,
+                )
+            )
+    return copy_instances, None
+
+
+def _source_face_ids_for_copy(
+    copy: bmesh.types.BMVert,
+    copy_set: set[bmesh.types.BMVert],
+    face_layer,
+    selected_face_ids: frozenset[int],
+) -> set[int]:
+    source_ids: set[int] = set()
+    if not copy.is_valid:
+        return source_ids
+    for face in copy.link_faces:
+        if not face.is_valid:
+            continue
+        if not any(vertex in copy_set for vertex in face.verts):
+            continue
+        face_id = int(face[face_layer])
+        if face_id in selected_face_ids:
+            source_ids.add(face_id)
+    return source_ids
 
 
 def reconnect_freeze(
@@ -510,8 +619,13 @@ def reconnect_freeze(
     origins: dict[int, bmesh.types.BMVert] = {}
     copies: dict[int, bmesh.types.BMVert] = {}
     vanished: dict[int, Coordinate3D] = {}
+    copy_instances: list[ExtrudeCopyInstance] = []
+    ncopy_by_vid: dict[int, list[ExtrudeFreezeEntry]] = {}
 
     for entry in freeze:
+        if entry.entity_class == "d":
+            ncopy_by_vid.setdefault(entry.vertex_id, []).append(entry)
+            continue
         instances = groups.get(entry.vertex_id, [])
         origin_hits = [
             vertex for vertex in instances if matching.coordinates_match(vertex.co, entry.origin_preop.as_tuple(), tol)
@@ -529,16 +643,123 @@ def reconnect_freeze(
                 return None, "the frozen origin and copy resolved to the same vertex"
             origins[entry.vertex_id] = origin_hits[0]
             copies[entry.vertex_id] = copy_hits[0]
+            copy_instances.append(
+                ExtrudeCopyInstance(
+                    vertex_id=entry.vertex_id,
+                    vertex=copy_hits[0],
+                    entity_class="b",
+                    source_face_signature=(),
+                )
+            )
             continue
         if entry.entity_class == "c":
             if len(copy_hits) != 1 or len(origin_hits) != 0 or extra:
                 return None, "a frozen interior copy did not match a single copy"
             copies[entry.vertex_id] = copy_hits[0]
             vanished[entry.vertex_id] = entry.origin_preop
+            copy_instances.append(
+                ExtrudeCopyInstance(
+                    vertex_id=entry.vertex_id,
+                    vertex=copy_hits[0],
+                    entity_class="c",
+                    source_face_signature=(),
+                )
+            )
             continue
         return None, "a frozen extrude row has an unsupported class"
 
-    return ExtrudeClassification(origins, copies, vanished, freeze), None
+    ncopy_reason = _reconnect_ncopy_entries(
+        bm,
+        snapshot,
+        groups,
+        ncopy_by_vid,
+        origins,
+        copies,
+        copy_instances,
+        tol,
+    )
+    if ncopy_reason is not None:
+        return None, ncopy_reason
+
+    return (
+        ExtrudeClassification(
+            origins=origins,
+            copies=copies,
+            copy_instances=tuple(copy_instances),
+            vanished_preop=vanished,
+            freeze=freeze,
+        ),
+        None,
+    )
+
+
+def _reconnect_ncopy_entries(
+    bm: bmesh.types.BMesh,
+    snapshot: ExtrudeSnapshot,
+    groups: dict[int, list[bmesh.types.BMVert]],
+    ncopy_by_vid: dict[int, list[ExtrudeFreezeEntry]],
+    origins: dict[int, bmesh.types.BMVert],
+    copies: dict[int, bmesh.types.BMVert],
+    copy_instances: list[ExtrudeCopyInstance],
+    tol: float,
+) -> str | None:
+    if not ncopy_by_vid:
+        return None
+    face_layer = bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
+    if face_layer is None:
+        return "the face ID layer is missing"
+
+    remainders: dict[int, list[bmesh.types.BMVert]] = {}
+    tentative_copies = set(copies.values())
+    for vertex_id, entries in ncopy_by_vid.items():
+        instances = groups.get(vertex_id, [])
+        origin_preop = entries[0].origin_preop
+        origin_hits = [
+            vertex for vertex in instances if matching.coordinates_match(vertex.co, origin_preop.as_tuple(), tol)
+        ]
+        if len(origin_hits) != 1:
+            return "a frozen N-copy origin did not match a unique vertex"
+        origins[vertex_id] = origin_hits[0]
+        leftover = [vertex for vertex in instances if vertex is not origin_hits[0]]
+        remainders[vertex_id] = leftover
+        tentative_copies.update(leftover)
+
+    corner_map = snapshot.face_corner_map()
+    for vertex_id, entries in ncopy_by_vid.items():
+        leftover = list(remainders[vertex_id])
+        for entry in entries:
+            candidates = []
+            for vertex in leftover:
+                if not matching.coordinates_match(vertex.co, entry.copy_post.as_tuple(), tol):
+                    continue
+                source_ids = _source_face_ids_for_copy(
+                    vertex,
+                    tentative_copies,
+                    face_layer,
+                    snapshot.selected_face_ids,
+                )
+                if len(source_ids) != 1:
+                    continue
+                live_signature = corner_map.get(next(iter(source_ids)))
+                if live_signature is None:
+                    continue
+                if _signatures_match(live_signature, entry.source_face_signature):
+                    candidates.append(vertex)
+            if len(candidates) != 1:
+                return "a frozen N-copy row did not match a unique copy"
+            chosen = candidates[0]
+            leftover.remove(chosen)
+            copy_instances.append(
+                ExtrudeCopyInstance(
+                    vertex_id=vertex_id,
+                    vertex=chosen,
+                    entity_class="d",
+                    source_face_signature=entry.source_face_signature,
+                )
+            )
+        if leftover:
+            return "a frozen N-copy vertex has leftover instances"
+    return None
 
 
 def _origin_entity(
@@ -582,9 +803,9 @@ def describe_source(
         return None, "temporary topology markers are missing"
 
     groups = _verts_by_session_id(bm, vertex_layer)
-    copy_set = set(classified.copies.values())
+    copy_set = {inst.vertex for inst in classified.copy_instances if inst.vertex.is_valid}
     origin_set = set(classified.origins.values())
-    new_verts = list(classified.copies.values())
+    new_verts = [inst.vertex for inst in classified.copy_instances]
 
     new_edges: list[bmesh.types.BMEdge] = []
     seen_edges: set[int] = set()
@@ -719,6 +940,8 @@ def _derive_expected_census(
     selected_vertices = snapshot.selected_vertex_ids
     edge_endpoints = snapshot.edge_endpoint_map()
     face_corners = snapshot.face_corner_map()
+    if snapshot.tool_kind == "EXTRUDE_FACES_INDIV":
+        return _derive_faces_indiv_census(selected_vertices, face_corners)
     region_edges = {
         marker
         for marker, (first_id, second_id) in edge_endpoints.items()
@@ -779,28 +1002,88 @@ def _derive_expected_census(
     return created, deleted, net
 
 
+def _derive_faces_indiv_census(
+    selected_vertices: frozenset[int],
+    face_corners: dict[int, tuple[int, ...]],
+) -> tuple[tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]] | None:
+    region_faces = [
+        corners
+        for corners in face_corners.values()
+        if corners and all(vertex_id in selected_vertices for vertex_id in corners)
+    ]
+    if not region_faces:
+        return None
+    created_v = 0
+    created_e = 0
+    created_f = 0
+    for corners in region_faces:
+        count = len(corners)
+        created_v += count
+        created_e += count + count
+        created_f += 1 + count
+    created = (created_v, created_e, created_f)
+    deleted = (0, 0, len(region_faces))
+    net = (created[0] - deleted[0], created[1] - deleted[1], created[2] - deleted[2])
+    return created, deleted, net
+
+
 def _vert_role(
     vertex: bmesh.types.BMVert,
     vertex_id: int,
     snapshot: ExtrudeSnapshot,
     classified: ExtrudeClassification,
 ) -> str:
-    copy = classified.copies.get(vertex_id)
-    if copy is not None and copy.is_valid and copy is vertex:
-        return "copy"
+    for inst in classified.copy_instances:
+        if inst.vertex.is_valid and inst.vertex is vertex:
+            return "copy"
     origin = classified.origins.get(vertex_id)
     if origin is not None and origin.is_valid and origin is vertex:
         return "origin"
+    copy = classified.copies.get(vertex_id)
+    if copy is not None and copy.is_valid and copy is vertex:
+        return "copy"
     preop = snapshot.vertex_preop_map().get(vertex_id)
-    if vertex_id in classified.copies and preop is not None:
+    has_ncopy = any(inst.vertex_id == vertex_id and inst.entity_class == "d" for inst in classified.copy_instances)
+    if has_ncopy and preop is not None:
+        # After bmesh.ops.delete, Python BMVert wrappers are not the same
+        # objects as classify-time instances. (d) siblings share coordinates,
+        # so only origin-vs-copy is recovered here (enough for face signatures).
+        if matching.coordinates_match(vertex.co, preop.as_tuple(), snapshot.tolerance):
+            return "origin"
+        return "copy"
+    if copy is not None and preop is not None:
         if vertex_id in classified.vanished_preop:
             return "copy"
         if not matching.coordinates_match(vertex.co, preop.as_tuple(), snapshot.tolerance):
             return "copy"
-    if vertex_id in classified.origins and preop is not None:
+    if origin is not None and preop is not None:
         if matching.coordinates_match(vertex.co, preop.as_tuple(), snapshot.tolerance):
             return "origin"
     return "other"
+
+
+def _copy_instance_of(classified: ExtrudeClassification, vertex: bmesh.types.BMVert) -> ExtrudeCopyInstance | None:
+    for inst in classified.copy_instances:
+        if inst.vertex is vertex:
+            return inst
+    return None
+
+
+def _endpoint_spec(
+    vertex: bmesh.types.BMVert,
+    vertex_id: int,
+    snapshot: ExtrudeSnapshot,
+    classified: ExtrudeClassification,
+) -> tuple[int, str, tuple[int, ...]] | None:
+    role = _vert_role(vertex, vertex_id, snapshot, classified)
+    if role not in {"origin", "copy"}:
+        return None
+    signature = ()
+    if role == "copy":
+        inst = _copy_instance_of(classified, vertex)
+        if inst is not None:
+            signature = inst.source_face_signature
+    return (vertex_id, role, signature)
 
 
 def _face_corner_signature(
@@ -820,10 +1103,7 @@ def _face_corner_signature(
     return tuple(signature), None
 
 
-def _signatures_match(
-    first: tuple[tuple[int, str], ...],
-    second: tuple[tuple[int, str], ...],
-) -> bool:
+def _signatures_match(first: tuple, second: tuple) -> bool:
     if len(first) != len(second):
         return False
     if not first:
@@ -859,7 +1139,7 @@ def check_origin_stationarity(
     snapshot: ExtrudeSnapshot,
     classified: ExtrudeClassification,
 ) -> str | None:
-    """Decline when class (a) or (b) origins moved or disappeared."""
+    """Decline when class (a), (b), or (d) origins moved or disappeared."""
 
     vertex_layer = bm.verts.layers.int.get(layer_names.VERT_SESSION_ID_LAYER)
     if vertex_layer is None:
@@ -878,22 +1158,25 @@ def check_origin_stationarity(
         if not matching.coordinates_match(instances[0].co, pre.as_tuple(), tolerance):
             return "a non-target vertex moved during the native extrude"
 
-    boundary_ids = [entry.vertex_id for entry in classified.freeze if entry.entity_class == "b"] or list(
-        classified.origins
-    )
+    boundary_ids = [
+        entry.vertex_id for entry in classified.freeze if entry.entity_class in {"b", "d"}
+    ] or list(classified.origins)
+    copies_by_vid: dict[int, list[bmesh.types.BMVert]] = {}
+    for inst in classified.copy_instances:
+        copies_by_vid.setdefault(inst.vertex_id, []).append(inst.vertex)
+    seen_boundary: set[int] = set()
     for vertex_id in boundary_ids:
+        if vertex_id in seen_boundary:
+            continue
+        seen_boundary.add(vertex_id)
         origin = classified.origins.get(vertex_id)
         if origin is None or not origin.is_valid:
             return "a classified origin vertex is missing"
         pre = preop.get(vertex_id)
         if pre is None or not matching.coordinates_match(origin.co, pre.as_tuple(), tolerance):
             return "a classified origin vertex moved during the native extrude"
-        copy = classified.copies.get(vertex_id)
-        extras = [
-            vertex
-            for vertex in groups.get(vertex_id, [])
-            if vertex.is_valid and vertex is not origin and vertex is not copy
-        ]
+        known = {origin, *copies_by_vid.get(vertex_id, ())}
+        extras = [vertex for vertex in groups.get(vertex_id, []) if vertex.is_valid and vertex not in known]
         if extras:
             return "a classified origin vertex has extra instances"
     return None
@@ -916,7 +1199,7 @@ def apply_mirror(
     snapshot: ExtrudeSnapshot,
     classified: ExtrudeClassification,
     description: ExtrudeSourceDescription,
-) -> tuple[dict[int, bmesh.types.BMVert], str | None, ExtrudeApplyAudit | None]:
+) -> tuple[dict[tuple[int, tuple[int, ...]], bmesh.types.BMVert], str | None, ExtrudeApplyAudit | None]:
     """Delete then build the mirror. Caller owns the backup checkpoint."""
 
     vertex_layer = bm.verts.layers.int.get(layer_names.VERT_SESSION_ID_LAYER)
@@ -931,38 +1214,42 @@ def apply_mirror(
     preop = snapshot.vertex_preop_map()
 
     copy_coords = {
-        vertex_id: (float(copy.co.x), float(copy.co.y), float(copy.co.z))
-        for vertex_id, copy in classified.copies.items()
-        if copy.is_valid
+        (inst.vertex_id, inst.source_face_signature): (
+            float(inst.vertex.co.x),
+            float(inst.vertex.co.y),
+            float(inst.vertex.co.z),
+        )
+        for inst in classified.copy_instances
+        if inst.vertex.is_valid
     }
-    edge_specs: list[tuple[tuple[int, str], tuple[int, str]]] = []
+    edge_specs: list[tuple[tuple[int, str, tuple[int, ...]], tuple[int, str, tuple[int, ...]]]] = []
     for edge in description.new_edges:
         if not edge.is_valid:
             return {}, "a source new edge was lost before mirroring", None
         ends = []
         for vertex in edge.verts:
             vertex_id = int(vertex[vertex_layer])
-            role = _vert_role(vertex, vertex_id, snapshot, classified)
-            if role not in {"origin", "copy"}:
+            spec = _endpoint_spec(vertex, vertex_id, snapshot, classified)
+            if spec is None:
                 return {}, "a new edge endpoint is not a classified origin or copy", None
-            ends.append((vertex_id, role))
+            ends.append(spec)
         edge_specs.append((ends[0], ends[1]))
 
     if len(description.face_signatures) != len(description.new_faces):
         return {}, "new-face signatures are not aligned with the source faces", None
-    face_specs: list[tuple[list[tuple[int, str]], int, bool, tuple[tuple[int, str], ...]]] = []
+    face_specs: list[tuple[list[tuple[int, str, tuple[int, ...]]], int, bool, tuple[tuple[int, str], ...]]] = []
     for face, stored_signature in zip(description.new_faces, description.face_signatures, strict=True):
         if not face.is_valid:
             return {}, "a source new face was lost before mirroring", None
-        corners: list[tuple[int, str]] = []
+        corners: list[tuple[int, str, tuple[int, ...]]] = []
         for loop in face.loops:
             vertex = loop.vert
             vertex_id = int(vertex[vertex_layer])
-            role = _vert_role(vertex, vertex_id, snapshot, classified)
-            if role not in {"origin", "copy"}:
+            spec = _endpoint_spec(vertex, vertex_id, snapshot, classified)
+            if spec is None:
                 return {}, "a new face corner is not a classified origin or copy", None
-            corners.append((vertex_id, role))
-        live_signature = tuple(corners)
+            corners.append(spec)
+        live_signature = tuple((vertex_id, role) for vertex_id, role, _signature in corners)
         if not _signatures_match(live_signature, stored_signature):
             return {}, "a source new face no longer matches its stored signature", None
         face_specs.append(
@@ -1064,23 +1351,23 @@ def apply_mirror(
     if vertex_layer is None:
         return {}, "the session vertex ID layer was lost during delete", None
 
-    mirror_copies: dict[int, bmesh.types.BMVert] = {}
-    for vertex_id, coord in copy_coords.items():
+    mirror_copies: dict[tuple[int, tuple[int, ...]], bmesh.types.BMVert] = {}
+    for copy_key, coord in copy_coords.items():
         mirrored = matching.mirror_coordinate(Vector(coord), snapshot.axis_index)
         new_vert = bm.verts.new(mirrored)
         new_vert.select = False
-        mirror_copies[vertex_id] = new_vert
+        mirror_copies[copy_key] = new_vert
 
     vertex_layer = bm.verts.layers.int.get(layer_names.VERT_SESSION_ID_LAYER)
     if vertex_layer is None:
         return {}, "the session vertex ID layer was lost while creating copies", None
     verts_by_id = _verts_by_session_id(bm, vertex_layer)
 
-    def _mirror_of_spec(vertex_id: int, role: str) -> bmesh.types.BMVert | None:
+    def _mirror_of_spec(vertex_id: int, role: str, signature: tuple[int, ...] = ()) -> bmesh.types.BMVert | None:
         if role not in {"copy", "origin"}:
             return None
         if role == "copy":
-            return mirror_copies.get(vertex_id)
+            return mirror_copies.get((vertex_id, signature))
         partner = vertex_pairs.get(vertex_id)
         if partner is None:
             return None
@@ -1113,8 +1400,8 @@ def apply_mirror(
 
     for corners, material_index, smooth, stored_signature in face_specs:
         mirror_corners = []
-        for vertex_id, role in corners:
-            mapped = _mirror_of_spec(vertex_id, role)
+        for vertex_id, role, signature in corners:
+            mapped = _mirror_of_spec(vertex_id, role, signature)
             if mapped is None:
                 return {}, "a mirrored new face is missing a corner", None
             mirror_corners.append(mapped)
@@ -1207,8 +1494,8 @@ def verify_mirror(
     snapshot: ExtrudeSnapshot,
     classified: ExtrudeClassification,
     description: ExtrudeSourceDescription,
-    mirror_copies: dict[int, bmesh.types.BMVert],
-    source_copy_coords: dict[int, tuple[float, float, float]],
+    mirror_copies: dict[tuple[int, tuple[int, ...]], bmesh.types.BMVert],
+    source_copy_coords: dict[tuple[int, tuple[int, ...]], tuple[float, float, float]],
     source_origin_coords: dict[int, tuple[float, float, float]],
     audit: ExtrudeApplyAudit,
 ) -> str | None:
@@ -1233,9 +1520,16 @@ def verify_mirror(
     if vertex_layer is None:
         return "the session vertex ID layer is missing"
     live_groups = _verts_by_session_id(bm, vertex_layer)
-    for vertex_id, expected in source_copy_coords.items():
-        copy = _unique_vert_at(live_groups.get(vertex_id, ()), expected, snapshot.tolerance)
-        if copy is None:
+    for copy_key, expected in source_copy_coords.items():
+        vertex_id, _signature = copy_key
+        # N copies of one vid can share coordinates (coplanar FACES_INDIV).
+        # Require the source location still exists; do not demand uniqueness.
+        hits = [
+            vertex
+            for vertex in live_groups.get(vertex_id, ())
+            if vertex.is_valid and matching.coordinates_match(vertex.co, expected, snapshot.tolerance)
+        ]
+        if not hits:
             return "a source copy was lost during mirroring"
     for vertex_id, expected in source_origin_coords.items():
         origin = _unique_vert_at(live_groups.get(vertex_id, ()), expected, snapshot.tolerance)
@@ -1271,12 +1565,12 @@ def verify_mirror(
         if tuple(int(loop.vert[vert_token]) for loop in face.loops) != corners:
             return "a source face incidence changed during mirroring"
 
-    for vertex_id, mirror in mirror_copies.items():
+    for copy_key, mirror in mirror_copies.items():
         if not mirror.is_valid:
             return "a mirrored copy vertex is invalid"
         if not all(math.isfinite(float(mirror.co[index])) for index in range(3)):
             return "a mirrored copy coordinate is not finite"
-        expected_source = source_copy_coords.get(vertex_id)
+        expected_source = source_copy_coords.get(copy_key)
         if expected_source is None:
             return "a mirrored copy has no recorded source coordinate"
         reflected = matching.mirror_coordinate(Vector(expected_source), snapshot.axis_index)

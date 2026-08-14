@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Alt+E extrude menu clone: opener, YSE_MT_extrude, and Stage 3a wrappers."""
+"""Alt+E extrude menu clone: opener, YSE_MT_extrude, and Stage 3a/3b wrappers."""
 
 from __future__ import annotations
 
@@ -27,8 +27,10 @@ EXTRUDE_MENU = "YSE_MT_extrude"
 OPENER_IDNAME = "mesh.ydd_symmetric_edit_extrude_menu"
 WRAPPER_FACES = "mesh.ydd_symmetric_edit_extrude_faces"
 WRAPPER_ALONG = "mesh.ydd_symmetric_edit_extrude_along_normals"
+WRAPPER_INDIV = "mesh.ydd_symmetric_edit_extrude_individual_faces"
 NATIVE_FACES = "view3d.edit_mesh_extrude_move_normal"
 NATIVE_ALONG = "view3d.edit_mesh_extrude_move_shrink_fatten"
+NATIVE_INDIV = "mesh.extrude_faces_move"
 
 _PrepareStatus = Literal["PREPARED", "CONFLICT", "BYPASS"]
 
@@ -238,6 +240,27 @@ class MESH_OT_ydd_symmetric_edit_extrude_along_normals(bpy.types.Operator):
         )
 
 
+class MESH_OT_ydd_symmetric_edit_extrude_individual_faces(bpy.types.Operator):
+    """Prepare EXTRUDE_FACES_INDIV, then invoke the native Individual Faces item."""
+
+    bl_idname = WRAPPER_INDIV
+    bl_label = "Extrude Individual Faces"
+    bl_options = {"INTERNAL"}
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == "EDIT_MESH" and context.edit_object is not None
+
+    def invoke(self, context, event):
+        del event
+        return _invoke_extrude_wrapper(
+            context,
+            self.report,
+            tool_kind="EXTRUDE_FACES_INDIV",
+            native_idname=NATIVE_INDIV,
+        )
+
+
 class YSE_MT_extrude(bpy.types.Menu):
     """Source-faithful clone of VIEW3D_MT_edit_mesh_extrude (Blender 4.2 / 5.2)."""
 
@@ -258,7 +281,7 @@ class YSE_MT_extrude(bpy.types.Menu):
         if mesh.total_face_sel:
             layout.operator(WRAPPER_FACES, text="Extrude Faces")
             layout.operator(WRAPPER_ALONG, text="Extrude Faces Along Normals")
-            layout.operator("mesh.extrude_faces_move", text="Extrude Individual Faces")
+            layout.operator(WRAPPER_INDIV, text="Extrude Individual Faces")
             layout.operator("view3d.edit_mesh_extrude_manifold_normal", text="Extrude Manifold")
         if mesh.total_edge_sel and (select_mode[0] or select_mode[1]):
             layout.operator("mesh.extrude_edges_move", text="Extrude Edges")
@@ -274,5 +297,6 @@ CLASSES = (
     MESH_OT_ydd_symmetric_edit_extrude_menu,
     MESH_OT_ydd_symmetric_edit_extrude_faces,
     MESH_OT_ydd_symmetric_edit_extrude_along_normals,
+    MESH_OT_ydd_symmetric_edit_extrude_individual_faces,
     YSE_MT_extrude,
 )

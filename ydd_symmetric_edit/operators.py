@@ -366,12 +366,13 @@ def _finish_extrude_session(
                                         write_decline = True
                                     else:
                                         source_copy_coords = {
-                                            vertex_id: (
-                                                float(copy.co.x),
-                                                float(copy.co.y),
-                                                float(copy.co.z),
+                                            (inst.vertex_id, inst.source_face_signature): (
+                                                float(inst.vertex.co.x),
+                                                float(inst.vertex.co.y),
+                                                float(inst.vertex.co.z),
                                             )
-                                            for vertex_id, copy in classified.copies.items()
+                                            for inst in classified.copy_instances
+                                            if inst.vertex.is_valid
                                         }
                                         source_origin_coords = {
                                             vertex_id: (
