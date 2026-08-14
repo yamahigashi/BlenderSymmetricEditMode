@@ -435,7 +435,7 @@ _FACE_ITEMS = (
     ("op", extrude_menu.WRAPPER_FACES, "Extrude Faces", None),
     ("op", extrude_menu.WRAPPER_ALONG, "Extrude Faces Along Normals", None),
     ("op", extrude_menu.WRAPPER_INDIV, "Extrude Individual Faces", None),
-    ("op", "view3d.edit_mesh_extrude_manifold_normal", "Extrude Manifold", None),
+    ("op", extrude_menu.WRAPPER_MANIFOLD, "Extrude Manifold", None),
 )
 
 

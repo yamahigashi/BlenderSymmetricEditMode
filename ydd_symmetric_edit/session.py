@@ -155,6 +155,18 @@ TOOL_PROFILES: dict[str, ToolProfile] = {
         supports_nested_offset=False,
         supports_adjust_repeat=False,
     ),
+    "EXTRUDE_MANIFOLD": ToolProfile(
+        kind="EXTRUDE_MANIFOLD",
+        label="Extrude Manifold",
+        wm_operator_names=("MESH_OT_extrude_manifold",),
+        primary_wm_operator="MESH_OT_extrude_manifold",
+        tool_idnames=("3D View Tool: Edit Mesh, Extrude Manifold",),
+        keymap_operator="mesh.extrude_manifold",
+        passthrough_handoff_grace=0.04,
+        passthrough_stable_ticks=3,
+        supports_nested_offset=False,
+        supports_adjust_repeat=False,
+    ),
 }
 EXTRUDE_TOOL_KINDS = frozenset(
     {
@@ -164,6 +176,7 @@ EXTRUDE_TOOL_KINDS = frozenset(
         "EXTRUDE_FACES_INDIV",
         "EXTRUDE_EDGES_INDIV",
         "EXTRUDE_VERTS_INDIV",
+        "EXTRUDE_MANIFOLD",
     }
 )
 TOOL_LABELS = {profile.kind: profile.label for profile in TOOL_PROFILES.values()}

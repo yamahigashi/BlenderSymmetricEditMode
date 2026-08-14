@@ -2,13 +2,15 @@
 
 """Symmetric postprocess for Blender's native region and individual extrude macros.
 
-Stage 1–3c cover ``EXTRUDE_NORMAL``, ``EXTRUDE_CONTEXT``,
+Stage 1–4 cover ``EXTRUDE_NORMAL``, ``EXTRUDE_CONTEXT``,
 ``EXTRUDE_SHRINK_FATTEN``, ``EXTRUDE_FACES_INDIV``, ``EXTRUDE_EDGES_INDIV``,
-and ``EXTRUDE_VERTS_INDIV``. Classification uses vertex-ID instance groups and
-a freeze table; FACE_ID set-difference and live selection are not
-discriminators. N-copies of one vid (FACES_INDIV only) are keyed by
-``(vertex_id, source_face_signature)``, not by vid alone. Edges/verts indiv
-are 1:1 class-(b) only (shared-edge verts stay shared — F13).
+``EXTRUDE_VERTS_INDIV``, and ``EXTRUDE_MANIFOLD``. Classification uses
+vertex-ID instance groups and a freeze table; FACE_ID set-difference and live
+selection are not discriminators. N-copies of one vid (FACES_INDIV only) are
+keyed by ``(vertex_id, source_face_signature)``, not by vid alone. Edges/verts
+indiv are 1:1 class-(b) only (shared-edge verts stay shared — F13). Manifold
+is region-family: apply only when region-congruent; dissolve/weld decline via
+census mismatch or pattern miss (F15).
 """
 
 from __future__ import annotations
@@ -316,6 +318,7 @@ _EXPECTED_MACRO_CHILDREN = {
     "EXTRUDE_FACES_INDIV": ("MESH_OT_extrude_faces_indiv", "TRANSFORM_OT_shrink_fatten"),
     "EXTRUDE_EDGES_INDIV": ("MESH_OT_extrude_edges_indiv", "TRANSFORM_OT_translate"),
     "EXTRUDE_VERTS_INDIV": ("MESH_OT_extrude_verts_indiv", "TRANSFORM_OT_translate"),
+    "EXTRUDE_MANIFOLD": ("MESH_OT_extrude_region", "TRANSFORM_OT_translate"),
 }
 
 
@@ -848,8 +851,16 @@ def describe_source(
             deleted_face_ids.append(face_id)
             continue
         live_origins = [vertex for vertex in origin_verts if vertex is not None]
-        if len(_live_faces_with_verts(live_origins)) != 1:
+        matches = _live_faces_with_verts(live_origins)
+        if len(matches) != 1:
             deleted_face_ids.append(face_id)
+            continue
+        # A surviving face must keep its cyclic corner order and winding: a
+        # count-preserving rebuild (same vertex set, rewired loops) must
+        # decline rather than pass as "not deleted".
+        live_cycle = tuple(int(loop.vert[vertex_layer]) for loop in matches[0].loops)
+        if not _signatures_match(live_cycle, tuple(corners)):
+            return None, "a surviving source face was rebuilt with different loops"
 
     deleted_edge_markers: list[int] = []
     for marker, (first_id, second_id) in snapshot.edge_endpoint_map().items():
@@ -858,8 +869,17 @@ def describe_source(
         if first is None or second is None:
             deleted_edge_markers.append(marker)
             continue
-        if not any(edge.is_valid and edge.other_vert(first) is second for edge in first.link_edges):
+        surviving = next(
+            (edge for edge in first.link_edges if edge.is_valid and edge.other_vert(first) is second),
+            None,
+        )
+        if surviving is None:
             deleted_edge_markers.append(marker)
+            continue
+        # Marker identity, not endpoint existence: a marker-0 replacement
+        # edge on the same endpoints is a rebuild, not survival.
+        if int(surviving[edge_layer]) != marker:
+            return None, "a surviving source edge was rebuilt"
 
     deleted_vertex_ids = tuple(sorted(classified.vanished_preop))
     new_faces: list[bmesh.types.BMFace] = []
@@ -1184,9 +1204,9 @@ def check_origin_stationarity(
         if not matching.coordinates_match(instances[0].co, pre.as_tuple(), tolerance):
             return "a non-target vertex moved during the native extrude"
 
-    boundary_ids = [
-        entry.vertex_id for entry in classified.freeze if entry.entity_class in {"b", "d"}
-    ] or list(classified.origins)
+    boundary_ids = [entry.vertex_id for entry in classified.freeze if entry.entity_class in {"b", "d"}] or list(
+        classified.origins
+    )
     copies_by_vid: dict[int, list[bmesh.types.BMVert]] = {}
     for inst in classified.copy_instances:
         copies_by_vid.setdefault(inst.vertex_id, []).append(inst.vertex)
