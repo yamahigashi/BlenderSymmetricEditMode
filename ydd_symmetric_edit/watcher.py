@@ -157,6 +157,44 @@ def _capture_confirmed_extrude_operator(session: KnifeSession, window) -> None:
         record.session.confirmed_selection_signature = session.confirmed_selection_signature
 
 
+def _confirmed_extrude_fully_captured(session: KnifeSession) -> bool:
+    return bool(
+        session.confirmed_operator_idname
+        and session.confirmed_operator_pointer
+        and session.extrude_options_captured
+    )
+
+
+def _capture_confirmed_extrude_result(session: KnifeSession) -> bool:
+    """Capture confirmed macro, selection signature, and native options.
+
+    Returns True only when idname, pointer, and extrude_options_captured are set.
+    An empty selection signature is a valid snapshot.
+    """
+
+    if _confirmed_extrude_fully_captured(session):
+        return True
+
+    already_confirmed = bool(session.confirmed_operator_idname and session.confirmed_operator_pointer)
+    window, area, region = _find_saved_view(session)
+    if window is None or area is None or region is None:
+        return False
+    try:
+        with bpy.context.temp_override(window=window, area=area, region=region):
+            if not already_confirmed:
+                _capture_confirmed_extrude_operator(session, window)
+                if not (session.confirmed_operator_idname and session.confirmed_operator_pointer):
+                    session.confirmed_selection_signature = _selection_signature(session)
+                    record = session_state._HISTORY_RECORDS.get(session.history_token)
+                    if record is not None:
+                        record.session.confirmed_selection_signature = session.confirmed_selection_signature
+            _capture_native_result_options(session, bpy.context)
+    except Exception:
+        traceback.print_exc()
+        return False
+    return _confirmed_extrude_fully_captured(session)
+
+
 def _capture_native_result_options(session: KnifeSession, context) -> None:
     """Retain native macro options needed by a topology-only fallback."""
 
@@ -271,8 +309,15 @@ def _invoke_passthrough_finish(window_pointer: int, history_token: int, session:
         return None
 
     try:
+        if session.tool_kind in EXTRUDE_TOOL_KINDS:
+            if not _capture_confirmed_extrude_result(session):
+                if record is not None:
+                    record.status = "FAILED"
+                cleanup_session(window_pointer, keep_history_record=True)
+                return None
         with bpy.context.temp_override(window=window, area=area, region=region):
-            _capture_native_result_options(session, bpy.context)
+            if session.tool_kind not in EXTRUDE_TOOL_KINDS:
+                _capture_native_result_options(session, bpy.context)
             result = _invoke_finish_operator()
     except Exception:
         traceback.print_exc()

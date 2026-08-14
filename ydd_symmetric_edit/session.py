@@ -376,95 +376,109 @@ def _prepare_session(
         return False
 
     history_token = session_state._new_history_token()
-    topology = snapshot.prepare_topology(
-        bm,
-        axis_index,
-        settings.tolerance,
-        history_token,
-        mark_vertex_ids=tool_kind == "RIP" or tool_kind in EXTRUDE_TOOL_KINDS,
-        mesh_object=obj,
-    )
-
-    rip_snapshot = None
-    extrude_snapshot = None
-    prepare_disposition = "APPLY"
-    prepare_disposition_reason = ""
-    if tool_kind == "RIP":
-        # The bulk capture no longer refreshes BMesh indices, but the rip
-        # snapshot keys its region and one-ring by vertex.index.
-        bm.verts.ensure_lookup_table()
-        bm.verts.index_update()
-        rip_snapshot = rip.build_snapshot(
+    registered = False
+    layers_may_exist = False
+    try:
+        layers_may_exist = True
+        topology = snapshot.prepare_topology(
             bm,
             axis_index,
             settings.tolerance,
-            lookup=topology.topology_resolution.vertex_lookup_unresolved,
+            history_token,
+            mark_vertex_ids=tool_kind == "RIP" or tool_kind in EXTRUDE_TOOL_KINDS,
+            mesh_object=obj,
         )
-        if rip_snapshot is None:
-            snapshot.remove_temporary_layers(bm)
-            bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
-            return False
-    elif tool_kind in EXTRUDE_TOOL_KINDS:
-        extrude.stamp_all_vertex_ids(bm)
-        extrude_snapshot = extrude.build_snapshot(
-            bm,
-            axis_index,
-            settings.tolerance,
-            tool_kind=tool_kind,
-            route_kmi_properties=route_kmi_properties,
+
+        rip_snapshot = None
+        extrude_snapshot = None
+        prepare_disposition = "APPLY"
+        prepare_disposition_reason = ""
+        if tool_kind == "RIP":
+            # The bulk capture no longer refreshes BMesh indices, but the rip
+            # snapshot keys its region and one-ring by vertex.index.
+            bm.verts.ensure_lookup_table()
+            bm.verts.index_update()
+            rip_snapshot = rip.build_snapshot(
+                bm,
+                axis_index,
+                settings.tolerance,
+                lookup=topology.topology_resolution.vertex_lookup_unresolved,
+            )
+            if rip_snapshot is None:
+                snapshot.remove_temporary_layers(bm)
+                bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+                return False
+        elif tool_kind in EXTRUDE_TOOL_KINDS:
+            extrude.stamp_all_vertex_ids(bm)
+            extrude_snapshot = extrude.build_snapshot(
+                bm,
+                axis_index,
+                settings.tolerance,
+                tool_kind=tool_kind,
+                route_kmi_properties=route_kmi_properties,
+                mesh_select_mode=MeshSelectionMode(
+                    vertices=bool(context.tool_settings.mesh_select_mode[0]),
+                    edges=bool(context.tool_settings.mesh_select_mode[1]),
+                    faces=bool(context.tool_settings.mesh_select_mode[2]),
+                ),
+                mesh_object=obj,
+            )
+            if extrude_snapshot is None:
+                snapshot.remove_temporary_layers(bm)
+                bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+                return False
+            prepare_disposition, prepare_disposition_reason = extrude.evaluate_prepare_gates(extrude_snapshot)
+            if prepare_disposition == "DECLINE" and prepare_disposition_reason:
+                report(
+                    {"WARNING"},
+                    f"Extrude was not mirrored: {prepare_disposition_reason} (native kept; mirror manually or undo)",
+                )
+
+        bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+        session = KnifeSession(
+            window_pointer=window_pointer,
+            area_pointer=context.area.as_pointer(),
+            region_pointer=context.region.as_pointer(),
+            object_name=obj.name,
+            mesh_name=obj.data.name,
+            axis_index=axis_index,
+            source_side=settings.source_side,
+            tolerance=settings.tolerance,
+            mirror_face_ids={},
+            hidden_by_face_id=topology.hidden_by_face_id,
+            carrier_frames={},
             mesh_select_mode=MeshSelectionMode(
                 vertices=bool(context.tool_settings.mesh_select_mode[0]),
                 edges=bool(context.tool_settings.mesh_select_mode[1]),
                 faces=bool(context.tool_settings.mesh_select_mode[2]),
             ),
-            mesh_object=obj,
+            started_at=time.monotonic(),
+            tool_kind=tool_kind,
+            history_token=history_token,
+            symmetry_flags=SymmetryAxes(
+                x=bool(obj.use_mesh_mirror_x),
+                y=bool(obj.use_mesh_mirror_y),
+                z=bool(obj.use_mesh_mirror_z),
+            ),
+            rip=rip_snapshot,
+            topology_resolution=topology.topology_resolution,
+            extrude=extrude_snapshot,
+            prepare_disposition=prepare_disposition,
+            prepare_disposition_reason=prepare_disposition_reason,
         )
-        if extrude_snapshot is None:
-            snapshot.remove_temporary_layers(bm)
-            bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
-            return False
-        prepare_disposition, prepare_disposition_reason = extrude.evaluate_prepare_gates(extrude_snapshot)
-        if prepare_disposition == "DECLINE" and prepare_disposition_reason:
-            report(
-                {"WARNING"},
-                f"Extrude was not mirrored: {prepare_disposition_reason} (native kept; mirror manually or undo)",
-            )
-
-    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
-    session = KnifeSession(
-        window_pointer=window_pointer,
-        area_pointer=context.area.as_pointer(),
-        region_pointer=context.region.as_pointer(),
-        object_name=obj.name,
-        mesh_name=obj.data.name,
-        axis_index=axis_index,
-        source_side=settings.source_side,
-        tolerance=settings.tolerance,
-        mirror_face_ids={},
-        hidden_by_face_id=topology.hidden_by_face_id,
-        carrier_frames={},
-        mesh_select_mode=MeshSelectionMode(
-            vertices=bool(context.tool_settings.mesh_select_mode[0]),
-            edges=bool(context.tool_settings.mesh_select_mode[1]),
-            faces=bool(context.tool_settings.mesh_select_mode[2]),
-        ),
-        started_at=time.monotonic(),
-        tool_kind=tool_kind,
-        history_token=history_token,
-        symmetry_flags=SymmetryAxes(
-            x=bool(obj.use_mesh_mirror_x),
-            y=bool(obj.use_mesh_mirror_y),
-            z=bool(obj.use_mesh_mirror_z),
-        ),
-        rip=rip_snapshot,
-        topology_resolution=topology.topology_resolution,
-        extrude=extrude_snapshot,
-        prepare_disposition=prepare_disposition,
-        prepare_disposition_reason=prepare_disposition_reason,
-    )
-    session_state._SESSIONS[window_pointer] = session
-    _suspend_mesh_symmetry(session, obj)
-    _remember_history_session(session, context)
-    _schedule_passthrough_watcher(window_pointer, history_token)
-
-    return True
+        session_state._SESSIONS[window_pointer] = session
+        registered = True
+        _suspend_mesh_symmetry(session, obj)
+        _remember_history_session(session, context)
+        _schedule_passthrough_watcher(window_pointer, history_token)
+        return True
+    except Exception:
+        if registered:
+            cleanup_session(window_pointer)
+        if layers_may_exist:
+            try:
+                snapshot.remove_temporary_layers(bm)
+                bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+            except Exception:
+                traceback.print_exc()
+        raise

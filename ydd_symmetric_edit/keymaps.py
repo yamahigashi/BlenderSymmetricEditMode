@@ -16,15 +16,18 @@ from .operators import EXTRUDE_TOOL_KINDS, TOOL_PROFILES
 INTERCEPT_OPERATOR = "mesh.ydd_symmetric_edit_intercept"
 CONNECT_OPERATOR = "mesh.ydd_symmetric_edit_connect"
 DISSOLVE_MODE_OPERATOR = "mesh.ydd_symmetric_edit_dissolve_mode"
+EXTRUDE_MENU_OPENER = "mesh.ydd_symmetric_edit_extrude_menu"
 MERGE_MENU = "YSE_MT_merge"
 DELETE_MENU = "YSE_MT_delete"
+EXTRUDE_MENU = "YSE_MT_extrude"
 NATIVE_DELETE_MENU = "VIEW3D_MT_edit_mesh_delete"
+NATIVE_EXTRUDE_MENU = "VIEW3D_MT_edit_mesh_extrude"
 NATIVE_DISSOLVE_MODE = "mesh.dissolve_mode"
 TOOL_KEYMAP_NAME = TOOL_PROFILES["KNIFE"].tool_idnames[0]
 TOOL_KEYMAP_NAMES = frozenset(tool_idname for profile in TOOL_PROFILES.values() for tool_idname in profile.tool_idnames)
 OPERATOR_TOOL_KINDS = {profile.keymap_operator: profile.kind for profile in TOOL_PROFILES.values()}
 
-_OWN_OPERATOR_IDS = frozenset({INTERCEPT_OPERATOR, CONNECT_OPERATOR, DISSOLVE_MODE_OPERATOR})
+_OWN_OPERATOR_IDS = frozenset({INTERCEPT_OPERATOR, CONNECT_OPERATOR, DISSOLVE_MODE_OPERATOR, EXTRUDE_MENU_OPENER})
 _WATCH_INTERVAL = 1.0
 _RETRY_INTERVAL = 0.25
 
@@ -35,7 +38,11 @@ _FINGERPRINT: KeymapFingerprint | None = None
 _DeleteRouteFingerprint = tuple[str, str, str, KeymapEvent, bool, tuple[tuple[str, object], ...]]
 _DELETE_FINGERPRINT: tuple[_DeleteRouteFingerprint, ...] | None = None
 _DISSOLVE_FINGERPRINT: tuple[_DeleteRouteFingerprint, ...] | None = None
+_ExtrudeMenuFingerprint = tuple[str, str, str, KeymapEvent, str]
+_EXTRUDE_MENU_FINGERPRINT: tuple[_ExtrudeMenuFingerprint, ...] | None = None
+_EXTRUDE_MENU_ROUTES_BY_KEY: dict[str, ExtrudeMenuRoute] = {}
 _HAS_DELETE_ROUTES = False
+_HAS_EXTRUDE_MENU_ROUTES = False
 _ENABLED = False
 _RUNNING = False
 
@@ -51,6 +58,27 @@ class DeleteMenuRoute:
     is_tool: bool = False
     # Explicitly-set native KMI properties (dissolve_mode use_verts etc.).
     properties: tuple[tuple[str, object], ...] = ()
+
+    @property
+    def keymap_identity(self) -> KeymapIdentity:
+        return KeymapIdentity(
+            name=self.keymap_name,
+            space_type=self.space_type,
+            region_type=self.region_type,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ExtrudeMenuRoute:
+    """One scanned native extrude-menu call_menu binding to clone with an opener."""
+
+    keymap_name: str
+    space_type: str
+    region_type: str
+    event: KeymapEvent
+    menu_name: str = NATIVE_EXTRUDE_MENU
+    is_tool: bool = False
+    route_key: str = ""
 
     @property
     def keymap_identity(self) -> KeymapIdentity:
@@ -173,6 +201,20 @@ def _route_fingerprint(route: DeleteMenuRoute) -> _DeleteRouteFingerprint:
     )
 
 
+def _extrude_menu_fingerprint(route: ExtrudeMenuRoute) -> _ExtrudeMenuFingerprint:
+    return (
+        route.keymap_name,
+        route.space_type,
+        route.region_type,
+        route.event,
+        route.menu_name,
+    )
+
+
+def _is_native_extrude_call_menu(item) -> bool:
+    return item.idname == "wm.call_menu" and getattr(item.properties, "name", "") == NATIVE_EXTRUDE_MENU
+
+
 def _native_routes(window_manager) -> tuple[list[NativeRoute], KeymapFingerprint]:
     key_config = window_manager.keyconfigs.user
     active_config = window_manager.keyconfigs.active
@@ -186,10 +228,16 @@ def _native_routes(window_manager) -> tuple[list[NativeRoute], KeymapFingerprint
 
         legacy_by_event: dict[KeymapEvent, list[KeymapEventLike]] = {}
         extrude_by_event: dict[KeymapEvent, list[KeymapEventLike]] = {}
+        call_menu_events: set[KeymapEvent] = set()
         for item in keymap.keymap_items:
-            if not item.active or item.idname not in OPERATOR_TOOL_KINDS:
+            if not item.active:
                 continue
             event = _event_signature(item)
+            if _is_native_extrude_call_menu(item):
+                call_menu_events.add(event)
+                continue
+            if item.idname not in OPERATOR_TOOL_KINDS:
+                continue
             tool_kind = OPERATOR_TOOL_KINDS[item.idname]
             if tool_kind in EXTRUDE_TOOL_KINDS:
                 extrude_by_event.setdefault(event, []).append(item)
@@ -197,6 +245,8 @@ def _native_routes(window_manager) -> tuple[list[NativeRoute], KeymapFingerprint
                 legacy_by_event.setdefault(event, []).append(item)
 
         for event, matching_items in legacy_by_event.items():
+            if event in call_menu_events:
+                continue
             native_operators = tuple(dict.fromkeys(item.idname for item in matching_items))
             # Two different supported operators on the exact same physical
             # event cannot be identified by a PASS_THROUGH pre-hook.  Skipping
@@ -226,6 +276,8 @@ def _native_routes(window_manager) -> tuple[list[NativeRoute], KeymapFingerprint
 
         for event, matching_items in extrude_by_event.items():
             if event in legacy_by_event:
+                continue
+            if event in call_menu_events:
                 continue
             native_operators = tuple(dict.fromkeys(item.idname for item in matching_items))
             if len(native_operators) != 1:
@@ -303,6 +355,59 @@ def _delete_menu_routes(
     return routes, fingerprint
 
 
+def _extrude_menu_routes(
+    window_manager,
+) -> tuple[list[ExtrudeMenuRoute], tuple[_ExtrudeMenuFingerprint, ...]]:
+    """Scan user keymaps for active extrude-menu call_menu bindings.
+
+    Fail-closed with intercept: a keymap+event that also has any
+    ``OPERATOR_TOOL_KINDS`` KMI yields neither an opener nor an intercept.
+    Uniqueness is per keymap identity + event (not global).
+    """
+
+    key_config = window_manager.keyconfigs.user
+    if key_config is None:
+        return [], ()
+
+    routes: list[ExtrudeMenuRoute] = []
+    seen: set[_ExtrudeMenuFingerprint] = set()
+    for keymap in key_config.keymaps:
+        if keymap.is_modal:
+            continue
+        for item in keymap.keymap_items:
+            if not item.active:
+                continue
+            if not _is_native_extrude_call_menu(item):
+                continue
+            event = _event_signature(item)
+            native, _opener, other, supported = _extrude_menu_event_census(keymap, event)
+            if native != 1 or other != 0 or supported != 0:
+                continue
+            route = ExtrudeMenuRoute(
+                keymap_name=keymap.name,
+                space_type=keymap.space_type,
+                region_type=keymap.region_type,
+                event=event,
+                menu_name=NATIVE_EXTRUDE_MENU,
+                is_tool=keymap.name in TOOL_KEYMAP_NAMES,
+                route_key=_make_route_key(
+                    keymap.name,
+                    keymap.space_type,
+                    keymap.region_type,
+                    NATIVE_EXTRUDE_MENU,
+                    event,
+                ),
+            )
+            identity = _extrude_menu_fingerprint(route)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            routes.append(route)
+
+    fingerprint = tuple(_extrude_menu_fingerprint(route) for route in routes)
+    return routes, fingerprint
+
+
 def _dissolve_mode_routes(
     window_manager,
 ) -> tuple[list[DeleteMenuRoute], tuple[_DeleteRouteFingerprint, ...]]:
@@ -348,7 +453,7 @@ def _is_owned_item(item) -> bool:
     if item.idname != "wm.call_menu":
         return False
     menu_name = getattr(item.properties, "name", "")
-    return menu_name in {MERGE_MENU, DELETE_MENU}
+    return menu_name in {MERGE_MENU, DELETE_MENU, EXTRUDE_MENU}
 
 
 def _remove_owned_items(key_config) -> None:
@@ -501,13 +606,49 @@ def _register_dissolve_mode_keymaps(window_manager, routes: list[DeleteMenuRoute
         _REGISTERED_ITEMS.append((keymap, item))
 
 
+def _register_extrude_menu_keymaps(window_manager, routes: list[ExtrudeMenuRoute]) -> None:
+    """Register head=True opener operators for every scanned native extrude menu."""
+
+    addon_config = window_manager.keyconfigs.addon
+    if addon_config is None:
+        raise RuntimeError("Blender's add-on key configuration is unavailable")
+
+    addon_keymaps = {}
+    for route in routes:
+        cache_key = (route.keymap_identity, route.is_tool)
+        keymap = addon_keymaps.get(cache_key)
+        if keymap is None:
+            keymap = addon_config.keymaps.new(
+                name=route.keymap_name,
+                space_type=route.space_type,
+                region_type=route.region_type,
+                modal=False,
+                tool=route.is_tool,
+            )
+            addon_keymaps[cache_key] = keymap
+
+        item = keymap.keymap_items.new(
+            EXTRUDE_MENU_OPENER,
+            head=True,
+            **_event_arguments(route.event),
+        )
+        try:
+            item.properties.route_key = route.route_key
+        except Exception:
+            keymap.keymap_items.remove(item)
+            raise
+        item.active = _ENABLED
+        _REGISTERED_ITEMS.append((keymap, item))
+
+
 def _rebuild(
     window_manager,
     routes: list[NativeRoute],
     delete_routes: list[DeleteMenuRoute],
     dissolve_routes: list[DeleteMenuRoute],
+    extrude_menu_routes: list[ExtrudeMenuRoute],
 ) -> None:
-    global _HAS_DELETE_ROUTES
+    global _HAS_DELETE_ROUTES, _HAS_EXTRUDE_MENU_ROUTES
 
     addon_config = window_manager.keyconfigs.addon
     if addon_config is None:
@@ -516,27 +657,34 @@ def _rebuild(
     _remove_owned_items(addon_config)
     _REGISTERED_ITEMS.clear()
     _ROUTES_BY_KEY.clear()
+    _EXTRUDE_MENU_ROUTES_BY_KEY.clear()
     _HAS_DELETE_ROUTES = False
+    _HAS_EXTRUDE_MENU_ROUTES = False
 
     try:
         _register_routes(window_manager, routes)
         _register_replay_keymaps(window_manager)
         _register_delete_menu_keymaps(window_manager, delete_routes)
         _register_dissolve_mode_keymaps(window_manager, dissolve_routes)
+        _register_extrude_menu_keymaps(window_manager, extrude_menu_routes)
     except Exception:
         _remove_owned_items(addon_config)
         _REGISTERED_ITEMS.clear()
         _HAS_DELETE_ROUTES = False
+        _HAS_EXTRUDE_MENU_ROUTES = False
+        _EXTRUDE_MENU_ROUTES_BY_KEY.clear()
         window_manager.keyconfigs.update()
         raise
 
     _ROUTES_BY_KEY.update((route.route_key, route) for route in routes)
+    _EXTRUDE_MENU_ROUTES_BY_KEY.update((route.route_key, route) for route in extrude_menu_routes)
     _HAS_DELETE_ROUTES = bool(delete_routes)
+    _HAS_EXTRUDE_MENU_ROUTES = bool(extrude_menu_routes)
     window_manager.keyconfigs.update()
 
 
 def _refresh(*, force: bool = False) -> bool:
-    global _FINGERPRINT, _DELETE_FINGERPRINT, _DISSOLVE_FINGERPRINT
+    global _FINGERPRINT, _DELETE_FINGERPRINT, _DISSOLVE_FINGERPRINT, _EXTRUDE_MENU_FINGERPRINT
 
     window_manager = _window_manager()
     if window_manager is None:
@@ -552,16 +700,19 @@ def _refresh(*, force: bool = False) -> bool:
     routes, fingerprint = _native_routes(window_manager)
     delete_routes, delete_fingerprint = _delete_menu_routes(window_manager)
     dissolve_routes, dissolve_fingerprint = _dissolve_mode_routes(window_manager)
+    extrude_menu_routes, extrude_menu_fingerprint = _extrude_menu_routes(window_manager)
     if (
         force
         or fingerprint != _FINGERPRINT
         or delete_fingerprint != _DELETE_FINGERPRINT
         or dissolve_fingerprint != _DISSOLVE_FINGERPRINT
+        or extrude_menu_fingerprint != _EXTRUDE_MENU_FINGERPRINT
     ):
-        _rebuild(window_manager, routes, delete_routes, dissolve_routes)
+        _rebuild(window_manager, routes, delete_routes, dissolve_routes, extrude_menu_routes)
         _FINGERPRINT = fingerprint
         _DELETE_FINGERPRINT = delete_fingerprint
         _DISSOLVE_FINGERPRINT = dissolve_fingerprint
+        _EXTRUDE_MENU_FINGERPRINT = extrude_menu_fingerprint
     return True
 
 
@@ -677,6 +828,61 @@ def has_delete_routes() -> bool:
     return _HAS_DELETE_ROUTES
 
 
+def has_extrude_menu_routes() -> bool:
+    """Return whether the latest scan registered one or more extrude-menu openers."""
+
+    return _HAS_EXTRUDE_MENU_ROUTES
+
+
+def _extrude_menu_event_census(keymap, event: KeymapEvent) -> tuple[int, int, int, int]:
+    """Return (target_native, opener, other_call_menu, supported) on keymap+event."""
+
+    native = opener = other = supported = 0
+    for item in keymap.keymap_items:
+        if not item.active or _event_signature(item) != event:
+            continue
+        if item.idname in OPERATOR_TOOL_KINDS:
+            supported += 1
+        elif item.idname == EXTRUDE_MENU_OPENER:
+            opener += 1
+        elif item.idname == "wm.call_menu":
+            if getattr(item.properties, "name", "") == NATIVE_EXTRUDE_MENU:
+                native += 1
+            else:
+                other += 1
+    return native, opener, other, supported
+
+
+def extrude_menu_route_is_current(route_key: str) -> bool:
+    """Live verify: user native 1 + addon opener 1, no other call-menu or supported ops."""
+
+    if not _RUNNING or not _ENABLED:
+        return False
+    route = _EXTRUDE_MENU_ROUTES_BY_KEY.get(route_key)
+    if route is None:
+        return False
+
+    window_manager = _window_manager()
+    if window_manager is None or window_manager.keyconfigs.user is None:
+        return False
+    if window_manager.keyconfigs.addon is None:
+        return False
+
+    user_keymap = _find_keymap(window_manager.keyconfigs.user, route.keymap_identity)
+    addon_keymap = _find_keymap(window_manager.keyconfigs.addon, route.keymap_identity)
+    if user_keymap is None or addon_keymap is None:
+        return False
+
+    user_native, _user_opener, user_other, user_supported = _extrude_menu_event_census(user_keymap, route.event)
+    _addon_native, addon_opener, addon_other, addon_supported = _extrude_menu_event_census(addon_keymap, route.event)
+    return (
+        user_native == 1
+        and addon_opener == 1
+        and user_other + addon_other == 0
+        and user_supported + addon_supported == 0
+    )
+
+
 def sync(enabled: bool) -> None:
     """Apply the persistent toggle without changing Blender's native KMI."""
 
@@ -705,16 +911,20 @@ def sync(enabled: bool) -> None:
 
 
 def register(*, enabled: bool = False) -> None:
-    global _ENABLED, _FINGERPRINT, _DELETE_FINGERPRINT, _DISSOLVE_FINGERPRINT, _HAS_DELETE_ROUTES, _RUNNING
+    global _ENABLED, _FINGERPRINT, _DELETE_FINGERPRINT, _DISSOLVE_FINGERPRINT, _EXTRUDE_MENU_FINGERPRINT
+    global _HAS_DELETE_ROUTES, _HAS_EXTRUDE_MENU_ROUTES, _RUNNING
 
     _RUNNING = True
     _ENABLED = bool(enabled)
     _FINGERPRINT = None
     _DELETE_FINGERPRINT = None
     _DISSOLVE_FINGERPRINT = None
+    _EXTRUDE_MENU_FINGERPRINT = None
     _HAS_DELETE_ROUTES = False
+    _HAS_EXTRUDE_MENU_ROUTES = False
     _REGISTERED_ITEMS.clear()
     _ROUTES_BY_KEY.clear()
+    _EXTRUDE_MENU_ROUTES_BY_KEY.clear()
 
     window_manager = _window_manager()
     if window_manager is not None:
@@ -733,7 +943,8 @@ def register(*, enabled: bool = False) -> None:
 
 
 def unregister() -> None:
-    global _ENABLED, _FINGERPRINT, _DELETE_FINGERPRINT, _DISSOLVE_FINGERPRINT, _HAS_DELETE_ROUTES, _RUNNING
+    global _ENABLED, _FINGERPRINT, _DELETE_FINGERPRINT, _DISSOLVE_FINGERPRINT, _EXTRUDE_MENU_FINGERPRINT
+    global _HAS_DELETE_ROUTES, _HAS_EXTRUDE_MENU_ROUTES, _RUNNING
 
     _RUNNING = False
     _ENABLED = False
@@ -750,7 +961,10 @@ def unregister() -> None:
 
     _REGISTERED_ITEMS.clear()
     _ROUTES_BY_KEY.clear()
+    _EXTRUDE_MENU_ROUTES_BY_KEY.clear()
     _FINGERPRINT = None
     _DELETE_FINGERPRINT = None
     _DISSOLVE_FINGERPRINT = None
+    _EXTRUDE_MENU_FINGERPRINT = None
     _HAS_DELETE_ROUTES = False
+    _HAS_EXTRUDE_MENU_ROUTES = False

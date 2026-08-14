@@ -14,7 +14,7 @@ bl_info = {
 import bpy  # noqa: E402
 from bpy.props import PointerProperty  # noqa: E402
 
-from . import delete_dissolve, keymaps, operators, replay, ui  # noqa: E402
+from . import delete_dissolve, extrude_menu, keymaps, operators, replay, ui  # noqa: E402
 
 
 def sync_persistent_keymap(enabled: bool) -> None:
@@ -24,7 +24,13 @@ def sync_persistent_keymap(enabled: bool) -> None:
 
 
 def register():
-    for cls in (*ui.CLASSES, *operators.CLASSES, *replay.CLASSES, *delete_dissolve.CLASSES):
+    for cls in (
+        *ui.CLASSES,
+        *operators.CLASSES,
+        *replay.CLASSES,
+        *delete_dissolve.CLASSES,
+        *extrude_menu.CLASSES,
+    ):
         bpy.utils.register_class(cls)
 
     setattr(
@@ -53,7 +59,15 @@ def unregister():
         bpy.app.handlers.load_post.remove(operators.cleanup_after_load)
 
     delattr(bpy.types.Scene, "ydd_symmetric_edit")
-    for cls in reversed((*ui.CLASSES, *operators.CLASSES, *replay.CLASSES, *delete_dissolve.CLASSES)):
+    for cls in reversed(
+        (
+            *ui.CLASSES,
+            *operators.CLASSES,
+            *replay.CLASSES,
+            *delete_dissolve.CLASSES,
+            *extrude_menu.CLASSES,
+        )
+    ):
         bpy.utils.unregister_class(cls)
 
 

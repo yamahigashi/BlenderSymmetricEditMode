@@ -636,6 +636,7 @@ def check_edge_side_tol_boundary_classification():
 
 class _FakeKeymapProps:
     bl_rna = type("RNA", (), {"properties": ()})()
+    name = ""
 
     def is_property_set(self, identifier):
         return False
@@ -669,16 +670,19 @@ class _FakeKeymap:
 
 
 class _FakeWindowManager:
-    def __init__(self, items):
+    def __init__(self, items, addon_items=None):
         keymap = _FakeKeymap(items)
-        self.keyconfigs = type(
-            "KeyConfigs",
-            (),
-            {
-                "user": type("User", (), {"keymaps": [keymap]})(),
-                "active": type("Active", (), {"name": "Blender"})(),
-            },
-        )()
+        configs = {
+            "user": type("User", (), {"keymaps": [keymap]})(),
+            "active": type("Active", (), {"name": "Blender"})(),
+        }
+        if addon_items is not None:
+            configs["addon"] = type("Addon", (), {"keymaps": [_FakeKeymap(addon_items)]})()
+        self.keyconfigs = type("KeyConfigs", (), configs)()
+
+
+def _fake_window_manager_with_addon(user_items, addon_items):
+    return _FakeWindowManager(user_items, addon_items=addon_items)
 
 
 def check_extrude_keymap_layers():
@@ -920,6 +924,68 @@ def check_extrude_keymap_regressions():
         keymaps._window_manager = original_window_manager
 
 
+def check_extrude_menu_fail_closed():
+    """Call-menu + supported operator on the same event hooks neither route."""
+
+    menu = _FakeKeymapItem("wm.call_menu", type="E")
+    menu.properties.name = "VIEW3D_MT_edit_mesh_extrude"
+    extrude_e = _FakeKeymapItem("view3d.edit_mesh_extrude_move_normal", type="E")
+
+    routes, _fingerprint = keymaps._native_routes(_FakeWindowManager([menu, extrude_e]))
+    assert all(route.tool_kind != "EXTRUDE_NORMAL" for route in routes), routes
+    menu_routes, _menu_fp = keymaps._extrude_menu_routes(_FakeWindowManager([menu, extrude_e]))
+    assert menu_routes == [], menu_routes
+
+    only_menu, _only_fp = keymaps._extrude_menu_routes(_FakeWindowManager([menu]))
+    assert len(only_menu) == 1, only_menu
+    assert only_menu[0].menu_name == "VIEW3D_MT_edit_mesh_extrude"
+
+    alias = _FakeKeymapItem("wm.call_menu", type="E")
+    alias.properties.name = "VIEW3D_MT_view"
+    alias_routes, _alias_fp = keymaps._extrude_menu_routes(_FakeWindowManager([menu, alias]))
+    assert alias_routes == [], alias_routes
+
+    second_native = _FakeKeymapItem("wm.call_menu", type="E")
+    second_native.properties.name = "VIEW3D_MT_edit_mesh_extrude"
+    two_native, _two_fp = keymaps._extrude_menu_routes(_FakeWindowManager([menu, second_native]))
+    assert two_native == [], two_native
+
+    original_menu_routes = dict(keymaps._EXTRUDE_MENU_ROUTES_BY_KEY)
+    original_running = keymaps._RUNNING
+    original_enabled = keymaps._ENABLED
+    original_window_manager = keymaps._window_manager
+    try:
+        opener = _FakeKeymapItem(keymaps.EXTRUDE_MENU_OPENER, type="E")
+        live_wm = _fake_window_manager_with_addon([menu], [opener])
+        live_routes, _live_fp = keymaps._extrude_menu_routes(live_wm)
+        assert len(live_routes) == 1, live_routes
+        route = live_routes[0]
+        keymaps._EXTRUDE_MENU_ROUTES_BY_KEY.clear()
+        keymaps._EXTRUDE_MENU_ROUTES_BY_KEY[route.route_key] = route
+        keymaps._RUNNING = True
+        keymaps._ENABLED = True
+        keymaps._window_manager = lambda: live_wm
+        assert keymaps.extrude_menu_route_is_current(route.route_key) is True
+        print("YSE_CORE_CASE=t4_route_is_current_false", flush=True)
+        assert keymaps.extrude_menu_route_is_current("yse:stale-route") is False
+        live_wm.keyconfigs.addon.keymaps[0].keymap_items.append(
+            _FakeKeymapItem(keymaps.EXTRUDE_MENU_OPENER, type="E")
+        )
+        assert keymaps.extrude_menu_route_is_current(route.route_key) is False
+        live_wm.keyconfigs.addon.keymaps[0].keymap_items.pop()
+        assert keymaps.extrude_menu_route_is_current(route.route_key) is True
+        live_alias = _FakeKeymapItem("wm.call_menu", type="E")
+        live_alias.properties.name = "VIEW3D_MT_view"
+        live_wm.keyconfigs.user.keymaps[0].keymap_items.append(live_alias)
+        assert keymaps.extrude_menu_route_is_current(route.route_key) is False
+    finally:
+        keymaps._EXTRUDE_MENU_ROUTES_BY_KEY.clear()
+        keymaps._EXTRUDE_MENU_ROUTES_BY_KEY.update(original_menu_routes)
+        keymaps._RUNNING = original_running
+        keymaps._ENABLED = original_enabled
+        keymaps._window_manager = original_window_manager
+
+
 def run():
     bm = build_two_symmetric_quads()
     topology = snapshot.prepare_topology(bm, matching.AXIS_INDEX["X"], 1.0e-5)
@@ -1107,6 +1173,7 @@ def run():
     check_kmi_scalar_capture()
     check_extrude_option_capture()
     check_extrude_keymap_regressions()
+    check_extrude_menu_fail_closed()
     print("YSE_CORE_TEST_OK", flush=True)
 
 
