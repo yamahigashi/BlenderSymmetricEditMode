@@ -809,6 +809,9 @@ def case_e2_gate_decline_rollback(window, area, region) -> None:
     assert any(
         "the mirrored cut cannot be rebuilt directly on the opposite side" in message for message in warnings
     ), operators._FINISH_REPORTS
+    assert any("native cut kept; mirror manually or undo" in message for message in warnings), (
+        operators._FINISH_REPORTS,
+    )
     assert not error_messages(), operators._FINISH_REPORTS
     assert not operators._SESSIONS
     print("YSE_KNIFE_BOTH_SIDES_CASE_E2=OK", flush=True)
@@ -894,6 +897,9 @@ def case_i_rollback_exception_error(window, area, region) -> None:
         assert finished == {"FINISHED"}, finished
 
     assert error_messages(), operators._FINISH_REPORTS
+    # ERROR cannot promise the mirror side is untouched, so the disposition
+    # hint must stay off this branch.
+    assert not any("native cut kept" in message for message in error_messages()), operators._FINISH_REPORTS
     assert not warning_messages(), operators._FINISH_REPORTS
     assert not operators._SESSIONS
     print("YSE_KNIFE_BOTH_SIDES_CASE_O16_I=OK", flush=True)

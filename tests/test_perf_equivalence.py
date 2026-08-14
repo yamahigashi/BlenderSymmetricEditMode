@@ -2489,7 +2489,10 @@ def _check_finish_scope_warning_matrix():
             assert result == {"FINISHED"}, label
             warnings = [message for level, message in reports if level == {"WARNING"}]
             if expect_warning:
-                assert warnings == ["ydd Symmetric Edit: 1 cut face(s) have no exact mirrored counterpart"], label
+                assert warnings == [
+                    "ydd Symmetric Edit: 1 cut face(s) have no exact mirrored counterpart"
+                    " (native cut kept; mirror manually or undo)"
+                ], label
             else:
                 assert warnings == [], label
             assert bool(apply_calls) is expect_apply, label
@@ -2617,7 +2620,8 @@ def _check_finish_zero_match_decline():
         assert reports == [
             (
                 {"WARNING"},
-                "ydd Symmetric Edit: 1 cut face(s) have no exact mirrored counterpart",
+                "ydd Symmetric Edit: 1 cut face(s) have no exact mirrored counterpart"
+                " (native cut kept; mirror manually or undo)",
             )
         ]
         restored = bmesh.from_edit_mesh(mesh)

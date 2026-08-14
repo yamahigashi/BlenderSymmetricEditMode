@@ -893,10 +893,12 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                     f"ydd Symmetric Edit: {mirror_failure}",
                 )
             else:
+                # The disposition hint holds only here: the ERROR branch cannot
+                # promise the mirror side was left untouched.
                 _finish_report(
                     self,
                     {"WARNING"},
-                    f"ydd Symmetric Edit: {mirror_failure}",
+                    f"ydd Symmetric Edit: {mirror_failure} (native cut kept; mirror manually or undo)",
                 )
             result = {"FINISHED"}
 
