@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Alt+E extrude menu clone: opener, YSE_MT_extrude, and Stage 3a/3b wrappers."""
+"""Alt+E extrude menu clone: opener, YSE_MT_extrude, and Stage 3a–3c wrappers."""
 
 from __future__ import annotations
 
@@ -28,9 +28,13 @@ OPENER_IDNAME = "mesh.ydd_symmetric_edit_extrude_menu"
 WRAPPER_FACES = "mesh.ydd_symmetric_edit_extrude_faces"
 WRAPPER_ALONG = "mesh.ydd_symmetric_edit_extrude_along_normals"
 WRAPPER_INDIV = "mesh.ydd_symmetric_edit_extrude_individual_faces"
+WRAPPER_EDGES = "mesh.ydd_symmetric_edit_extrude_edges"
+WRAPPER_VERTS = "mesh.ydd_symmetric_edit_extrude_vertices"
 NATIVE_FACES = "view3d.edit_mesh_extrude_move_normal"
 NATIVE_ALONG = "view3d.edit_mesh_extrude_move_shrink_fatten"
 NATIVE_INDIV = "mesh.extrude_faces_move"
+NATIVE_EDGES = "mesh.extrude_edges_move"
+NATIVE_VERTS = "mesh.extrude_vertices_move"
 
 _PrepareStatus = Literal["PREPARED", "CONFLICT", "BYPASS"]
 
@@ -261,6 +265,48 @@ class MESH_OT_ydd_symmetric_edit_extrude_individual_faces(bpy.types.Operator):
         )
 
 
+class MESH_OT_ydd_symmetric_edit_extrude_edges(bpy.types.Operator):
+    """Prepare EXTRUDE_EDGES_INDIV, then invoke the native Extrude Edges item."""
+
+    bl_idname = WRAPPER_EDGES
+    bl_label = "Extrude Edges"
+    bl_options = {"INTERNAL"}
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == "EDIT_MESH" and context.edit_object is not None
+
+    def invoke(self, context, event):
+        del event
+        return _invoke_extrude_wrapper(
+            context,
+            self.report,
+            tool_kind="EXTRUDE_EDGES_INDIV",
+            native_idname=NATIVE_EDGES,
+        )
+
+
+class MESH_OT_ydd_symmetric_edit_extrude_vertices(bpy.types.Operator):
+    """Prepare EXTRUDE_VERTS_INDIV, then invoke the native Extrude Vertices item."""
+
+    bl_idname = WRAPPER_VERTS
+    bl_label = "Extrude Vertices"
+    bl_options = {"INTERNAL"}
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == "EDIT_MESH" and context.edit_object is not None
+
+    def invoke(self, context, event):
+        del event
+        return _invoke_extrude_wrapper(
+            context,
+            self.report,
+            tool_kind="EXTRUDE_VERTS_INDIV",
+            native_idname=NATIVE_VERTS,
+        )
+
+
 class YSE_MT_extrude(bpy.types.Menu):
     """Source-faithful clone of VIEW3D_MT_edit_mesh_extrude (Blender 4.2 / 5.2)."""
 
@@ -284,9 +330,9 @@ class YSE_MT_extrude(bpy.types.Menu):
             layout.operator(WRAPPER_INDIV, text="Extrude Individual Faces")
             layout.operator("view3d.edit_mesh_extrude_manifold_normal", text="Extrude Manifold")
         if mesh.total_edge_sel and (select_mode[0] or select_mode[1]):
-            layout.operator("mesh.extrude_edges_move", text="Extrude Edges")
+            layout.operator(WRAPPER_EDGES, text="Extrude Edges")
         if mesh.total_vert_sel and select_mode[0]:
-            layout.operator("mesh.extrude_vertices_move", text="Extrude Vertices")
+            layout.operator(WRAPPER_VERTS, text="Extrude Vertices")
         layout.separator()
         layout.operator("mesh.extrude_repeat")
         layout.operator("mesh.spin").angle = pi * 2
@@ -298,5 +344,7 @@ CLASSES = (
     MESH_OT_ydd_symmetric_edit_extrude_faces,
     MESH_OT_ydd_symmetric_edit_extrude_along_normals,
     MESH_OT_ydd_symmetric_edit_extrude_individual_faces,
+    MESH_OT_ydd_symmetric_edit_extrude_edges,
+    MESH_OT_ydd_symmetric_edit_extrude_vertices,
     YSE_MT_extrude,
 )

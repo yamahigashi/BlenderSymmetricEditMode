@@ -528,6 +528,43 @@ def prepare_single(bm, _obj):
     select_faces(bm, [(4, 1)])
 
 
+def prepare_edge_only(bm, _obj):
+    """Edge selection leaves F_r empty under the FACES_INDIV census formula."""
+
+    bpy.context.tool_settings.mesh_select_mode = (False, True, False)
+    clear_selection(bm)
+    a = grid_vert(bm, 4, 1)
+    b = grid_vert(bm, 4, 2)
+    for edge in a.link_edges:
+        if edge.other_vert(a) is b:
+            edge.select = True
+            break
+    else:
+        raise AssertionError("boundary edge (4,1)-(4,2) not found")
+    bm.select_flush_mode()
+
+
+def prepare_vert_only(bm, _obj):
+    bpy.context.tool_settings.mesh_select_mode = (True, False, False)
+    clear_selection(bm)
+    grid_vert(bm, 4, 2).select = True
+    bm.select_flush_mode()
+
+
+def verify_faces_indiv_empty_fr_decline(bm):
+    """Edge/vert selection + FACES_INDIV → empty F_r → mirror declined (native kept or no-op)."""
+
+    got = topology_counts(bm)
+    if got != STATE["baseline"]:
+        assert vertex_multiset(bm) != mirrored_multiset(bm), "empty F_r must not mirror a changed mesh"
+    record = unique_indiv_record(STATE["object"].name)
+    assert record.session.prepare_disposition == "DECLINE", record.session
+    freeze = getattr(record.session, "extrude_freeze", None)
+    assert freeze in (None, ()), freeze
+    assert_layers_removed(bm)
+    print(f"YSE_EXTRUDE_INDIV_EMPTY_FR_REASON={record.session.prepare_disposition_reason!r}", flush=True)
+
+
 def run_all(cases, index=0):
     if index >= len(cases):
         print(MARKER_OK, flush=True)
@@ -580,6 +617,18 @@ def start_test():
                 (2.0, -0.5, 0.0),
                 lambda bm: verify_zero_offset(bm, [(4, 1), (5, 1)], ADJACENT_NATIVE),
                 drag=(0, 0),
+            ),
+            run_tool_case(
+                "edge_sel_empty_fr",
+                prepare_edge_only,
+                (1.0, -0.5, 0.0),
+                verify_faces_indiv_empty_fr_decline,
+            ),
+            run_tool_case(
+                "vert_sel_empty_fr",
+                prepare_vert_only,
+                (1.0, 0.0, 0.0),
+                verify_faces_indiv_empty_fr_decline,
             ),
         ]
         run_all(cases)

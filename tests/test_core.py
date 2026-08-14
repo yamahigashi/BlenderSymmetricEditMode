@@ -26,6 +26,7 @@ from ydd_symmetric_edit import (  # noqa: E402
     stitch_pathedges,
     stitch_reflect,
 )
+from ydd_symmetric_edit._types import ExtrudeSnapshot, MeshSelectionMode  # noqa: E402
 
 
 def build_two_symmetric_quads():
@@ -783,6 +784,8 @@ def check_extrude_option_capture():
         "EXTRUDE_CONTEXT": ("MESH_OT_extrude_context", "TRANSFORM_OT_translate"),
         "EXTRUDE_SHRINK_FATTEN": ("MESH_OT_extrude_region", "TRANSFORM_OT_shrink_fatten"),
         "EXTRUDE_FACES_INDIV": ("MESH_OT_extrude_faces_indiv", "TRANSFORM_OT_shrink_fatten"),
+        "EXTRUDE_EDGES_INDIV": ("MESH_OT_extrude_edges_indiv", "TRANSFORM_OT_translate"),
+        "EXTRUDE_VERTS_INDIV": ("MESH_OT_extrude_verts_indiv", "TRANSFORM_OT_translate"),
     }
     for tool_kind, (topology_name, transform_name) in expected_children.items():
         # Each required macro child is independently fail-closed.
@@ -987,6 +990,63 @@ def check_extrude_menu_fail_closed():
         keymaps._window_manager = original_window_manager
 
 
+def _dummy_extrude_snapshot(tool_kind, selected_vertex_ids, face_corners, edge_endpoints):
+    return ExtrudeSnapshot(
+        axis_index=0,
+        tolerance=1e-4,
+        tool_kind=tool_kind,
+        route_kmi_properties=(),
+        mesh_select_mode=MeshSelectionMode(False, False, False),
+        selected_vertex_ids=frozenset(selected_vertex_ids),
+        selected_edge_markers=frozenset(),
+        selected_face_ids=frozenset(),
+        vertex_preop=(),
+        vertex_pairs=(),
+        edge_pairs=(),
+        face_pairs=(),
+        hidden_vertex_ids=frozenset(),
+        hidden_edge_markers=frozenset(),
+        hidden_face_ids=frozenset(),
+        face_corners=tuple(face_corners),
+        edge_endpoints=tuple(edge_endpoints),
+        vertex_count=0,
+        edge_count=0,
+        face_count=0,
+    )
+
+
+def check_derive_expected_census_stage3c():
+    """Empty F_r FACES_INDIV, non-empty F_r EDGES/VERTS_INDIV, and F12 edge."""
+
+    face_corners = ((1, (10, 11, 12, 13)),)
+    uncovered = _dummy_extrude_snapshot(
+        "EXTRUDE_FACES_INDIV",
+        {10, 11},
+        face_corners,
+        ((100, (10, 11)),),
+    )
+    assert extrude._derive_expected_census(uncovered) is None
+
+    covering_vids = {10, 11, 12, 13}
+    covering_edges = (
+        (100, (10, 11)),
+        (101, (11, 12)),
+        (102, (12, 13)),
+        (103, (13, 10)),
+    )
+    for kind in ("EXTRUDE_EDGES_INDIV", "EXTRUDE_VERTS_INDIV"):
+        covered = _dummy_extrude_snapshot(kind, covering_vids, face_corners, covering_edges)
+        assert extrude._derive_expected_census(covered) is None, kind
+
+    edge_only = _dummy_extrude_snapshot(
+        "EXTRUDE_EDGES_INDIV",
+        {10, 11},
+        face_corners,
+        ((100, (10, 11)),),
+    )
+    assert extrude._derive_expected_census(edge_only) == ((2, 3, 1), (0, 0, 0), (2, 3, 1))
+
+
 def run():
     bm = build_two_symmetric_quads()
     topology = snapshot.prepare_topology(bm, matching.AXIS_INDEX["X"], 1.0e-5)
@@ -1175,6 +1235,7 @@ def run():
     check_extrude_option_capture()
     check_extrude_keymap_regressions()
     check_extrude_menu_fail_closed()
+    check_derive_expected_census_stage3c()
     print("YSE_CORE_TEST_OK", flush=True)
 
 

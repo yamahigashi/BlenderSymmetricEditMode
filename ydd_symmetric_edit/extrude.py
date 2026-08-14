@@ -2,11 +2,13 @@
 
 """Symmetric postprocess for Blender's native region and individual extrude macros.
 
-Stage 1–3b cover ``EXTRUDE_NORMAL``, ``EXTRUDE_CONTEXT``,
-``EXTRUDE_SHRINK_FATTEN``, and ``EXTRUDE_FACES_INDIV``. Classification uses
-vertex-ID instance groups and a freeze table; FACE_ID set-difference and live
-selection are not discriminators. N-copies of one vid are keyed by
-``(vertex_id, source_face_signature)``, not by vid alone.
+Stage 1–3c cover ``EXTRUDE_NORMAL``, ``EXTRUDE_CONTEXT``,
+``EXTRUDE_SHRINK_FATTEN``, ``EXTRUDE_FACES_INDIV``, ``EXTRUDE_EDGES_INDIV``,
+and ``EXTRUDE_VERTS_INDIV``. Classification uses vertex-ID instance groups and
+a freeze table; FACE_ID set-difference and live selection are not
+discriminators. N-copies of one vid (FACES_INDIV only) are keyed by
+``(vertex_id, source_face_signature)``, not by vid alone. Edges/verts indiv
+are 1:1 class-(b) only (shared-edge verts stay shared — F13).
 """
 
 from __future__ import annotations
@@ -312,6 +314,8 @@ _EXPECTED_MACRO_CHILDREN = {
     "EXTRUDE_CONTEXT": ("MESH_OT_extrude_context", "TRANSFORM_OT_translate"),
     "EXTRUDE_SHRINK_FATTEN": ("MESH_OT_extrude_region", "TRANSFORM_OT_shrink_fatten"),
     "EXTRUDE_FACES_INDIV": ("MESH_OT_extrude_faces_indiv", "TRANSFORM_OT_shrink_fatten"),
+    "EXTRUDE_EDGES_INDIV": ("MESH_OT_extrude_edges_indiv", "TRANSFORM_OT_translate"),
+    "EXTRUDE_VERTS_INDIV": ("MESH_OT_extrude_verts_indiv", "TRANSFORM_OT_translate"),
 }
 
 
@@ -326,6 +330,8 @@ def capture_native_options(operator, tool_kind: str) -> ExtrudeNativeOptions | N
     if topology is None or transform is None:
         return None
     try:
+        # All kinds share this capture shape: topology children that lack
+        # flip/dissolve/mirror RNA (faces/edges/verts indiv) fall back to False.
         use_normal_flip = bool(getattr(topology, "use_normal_flip", False))
         use_dissolve_ortho_edges = bool(getattr(topology, "use_dissolve_ortho_edges", False))
         mirror = bool(getattr(topology, "mirror", False))
@@ -420,6 +426,9 @@ def _capture_operator_properties(operator) -> tuple[tuple[str, object], ...] | N
             value = getattr(operator, identifier)
             if isinstance(value, (bool, int, float, str)):
                 captured.append((identifier, value))
+            elif identifier == "value":
+                vector = _as_numeric_tuple(value)
+                captured.append((identifier, vector if vector is not None else str(value)))
             else:
                 captured.append((identifier, str(value)))
         if not any(name == "value" for name, _unused in captured):
@@ -427,11 +436,22 @@ def _capture_operator_properties(operator) -> tuple[tuple[str, object], ...] | N
             if isinstance(raw, (bool, int, float, str)):
                 captured.append(("value", raw))
             else:
-                captured.append(("value", float(raw)))
+                vector = _as_numeric_tuple(raw)
+                captured.append(("value", vector if vector is not None else float(raw)))
     except Exception:
         traceback.print_exc()
         return None
     return tuple(captured)
+
+
+def _as_numeric_tuple(value) -> tuple[float, ...] | None:
+    try:
+        items = tuple(float(item) for item in value)
+    except (TypeError, ValueError):
+        return None
+    if not items or not all(math.isfinite(item) for item in items):
+        return None
+    return items
 
 
 def _verts_by_session_id(bm: bmesh.types.BMesh, vertex_layer) -> dict[int, list[bmesh.types.BMVert]]:
@@ -475,8 +495,13 @@ def classify_live(
             if vertex_id not in selected:
                 assigned.add(vertex_id)
                 continue
-            if snapshot.tool_kind == "EXTRUDE_FACES_INDIV":
-                return None, "interior-copy pattern is not allowed for individual face extrude"
+            # Class (c) is region-family only; indiv kinds allow (b) or (b)+(d).
+            if snapshot.tool_kind in {
+                "EXTRUDE_FACES_INDIV",
+                "EXTRUDE_EDGES_INDIV",
+                "EXTRUDE_VERTS_INDIV",
+            }:
+                return None, "interior-copy pattern is not allowed for this extrude kind"
             copies[vertex_id] = instances[0]
             vanished[vertex_id] = pre
             assigned.add(vertex_id)
@@ -555,14 +580,11 @@ def _classify_ncopy_instances(
     face_layer = bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
     if face_layer is None:
         return None, "the face ID layer is missing"
-    copy_set = set(copies.values())
-    for _vertex_id, moved in pending_ncopy:
-        copy_set.update(moved)
     corner_map = snapshot.face_corner_map()
     seen_keys: set[tuple[int, tuple[int, ...]]] = set()
     for vertex_id, moved in pending_ncopy:
         for copy in moved:
-            source_ids = _source_face_ids_for_copy(copy, copy_set, face_layer, snapshot.selected_face_ids)
+            source_ids = _source_face_ids_for_copy(copy, face_layer, snapshot.selected_face_ids)
             if len(source_ids) != 1:
                 return None, "an individual-face copy could not be attributed to a single source face"
             face_id = next(iter(source_ids))
@@ -586,17 +608,15 @@ def _classify_ncopy_instances(
 
 def _source_face_ids_for_copy(
     copy: bmesh.types.BMVert,
-    copy_set: set[bmesh.types.BMVert],
     face_layer,
     selected_face_ids: frozenset[int],
 ) -> set[int]:
+    # S(copy) = incident inherited FACE_IDs ∩ snapshot selection.
     source_ids: set[int] = set()
     if not copy.is_valid:
         return source_ids
     for face in copy.link_faces:
         if not face.is_valid:
-            continue
-        if not any(vertex in copy_set for vertex in face.verts):
             continue
         face_id = int(face[face_layer])
         if face_id in selected_face_ids:
@@ -710,7 +730,6 @@ def _reconnect_ncopy_entries(
         return "the face ID layer is missing"
 
     remainders: dict[int, list[bmesh.types.BMVert]] = {}
-    tentative_copies = set(copies.values())
     for vertex_id, entries in ncopy_by_vid.items():
         instances = groups.get(vertex_id, [])
         origin_preop = entries[0].origin_preop
@@ -722,7 +741,6 @@ def _reconnect_ncopy_entries(
         origins[vertex_id] = origin_hits[0]
         leftover = [vertex for vertex in instances if vertex is not origin_hits[0]]
         remainders[vertex_id] = leftover
-        tentative_copies.update(leftover)
 
     corner_map = snapshot.face_corner_map()
     for vertex_id, entries in ncopy_by_vid.items():
@@ -734,7 +752,6 @@ def _reconnect_ncopy_entries(
                     continue
                 source_ids = _source_face_ids_for_copy(
                     vertex,
-                    tentative_copies,
                     face_layer,
                     snapshot.selected_face_ids,
                 )
@@ -869,7 +886,7 @@ def describe_source(
     net = (created[0] - deleted[0], created[1] - deleted[1], created[2] - deleted[2])
     expected = _derive_expected_census(snapshot)
     if expected is None:
-        return None, "the extrusion region contains a wire or non-manifold edge"
+        return None, "the expected extrusion census is undefined"
     expected_created, expected_deleted, expected_net = expected
     if created != expected_created or deleted != expected_deleted or net != expected_net:
         return None, (
@@ -952,6 +969,15 @@ def _derive_expected_census(
         for face_id, corners in face_corners.items()
         if corners and all(vertex_id in selected_vertices for vertex_id in corners)
     }
+    if snapshot.tool_kind in {"EXTRUDE_EDGES_INDIV", "EXTRUDE_VERTS_INDIV"} and region_faces:
+        return None
+    if snapshot.tool_kind == "EXTRUDE_VERTS_INDIV":
+        # Vertices extrude individually: rails only, never a cap edge, even
+        # when selected vertices are adjacent (measured: native net (2,2,0)
+        # for two adjacent verts where the region formula expects (2,3,1)).
+        count = len(selected_vertices)
+        created = (count, count, 0)
+        return created, (0, 0, 0), created
 
     pair_to_markers: dict[frozenset[int], list[int]] = {}
     for marker, (first_id, second_id) in edge_endpoints.items():

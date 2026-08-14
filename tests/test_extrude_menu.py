@@ -454,8 +454,8 @@ def case_mixed_draw() -> None:
     assert context_value == "INVOKE_REGION_WIN", context_value
     expected = (
         *_FACE_ITEMS,
-        ("op", "mesh.extrude_edges_move", "Extrude Edges", None),
-        ("op", "mesh.extrude_vertices_move", "Extrude Vertices", None),
+        ("op", extrude_menu.WRAPPER_EDGES, "Extrude Edges", None),
+        ("op", extrude_menu.WRAPPER_VERTS, "Extrude Vertices", None),
         *_TRAILER,
     )
     assert sequence == expected, sequence
@@ -489,7 +489,7 @@ def case_t3_edge_selected_draw() -> None:
     bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
     context_value, sequence = _draw_menu(obj)
     assert context_value == "INVOKE_REGION_WIN", context_value
-    expected = (("op", "mesh.extrude_edges_move", "Extrude Edges", None), *_TRAILER)
+    expected = (("op", extrude_menu.WRAPPER_EDGES, "Extrude Edges", None), *_TRAILER)
     assert sequence == expected, sequence
     print("YSE_EXTRUDE_MENU_T3_EDGE_OK", flush=True)
 
@@ -505,7 +505,7 @@ def case_t3_vert_selected_draw() -> None:
     bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
     context_value, sequence = _draw_menu(obj)
     assert context_value == "INVOKE_REGION_WIN", context_value
-    expected = (("op", "mesh.extrude_vertices_move", "Extrude Vertices", None), *_TRAILER)
+    expected = (("op", extrude_menu.WRAPPER_VERTS, "Extrude Vertices", None), *_TRAILER)
     assert sequence == expected, sequence
     print("YSE_EXTRUDE_MENU_T3_VERT_OK", flush=True)
 

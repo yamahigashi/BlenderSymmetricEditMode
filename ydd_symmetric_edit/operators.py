@@ -509,6 +509,7 @@ def _finish_extrude_session(
 
     if write_decline and reason is not None and reason != "native extrude options could not be captured":
         _write_session_disposition(session, "DECLINE", reason)
+        _write_extrude_freeze(session, None)
 
     kept_hint = " (native kept; mirror manually or undo)"
     if reason is not None:

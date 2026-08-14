@@ -83,6 +83,32 @@ def _session_new_path_signature(session: KnifeSession) -> PathSignature | RipSig
     return None
 
 
+def _decline_faces_indiv_noop(session: KnifeSession, window_pointer: int) -> None:
+    """Keep a DECLINE history row when FACES_INDIV native no-ops (empty F_r)."""
+
+    reason = "the native extrude result could not be classified"
+    snapshot = session.extrude
+    obj = bpy.data.objects.get(session.object_name)
+    if snapshot is not None and obj is not None and obj.mode == "EDIT":
+        try:
+            bm = bmesh.from_edit_mesh(obj.data)
+            _classified, classify_reason = extrude.classify_live(bm, snapshot)
+            if classify_reason:
+                reason = classify_reason
+        except Exception:
+            traceback.print_exc()
+    session.prepare_disposition = "DECLINE"
+    session.prepare_disposition_reason = reason
+    session.extrude_freeze = None
+    record = session_state._HISTORY_RECORDS.get(session.history_token)
+    if record is not None:
+        record.session.prepare_disposition = "DECLINE"
+        record.session.prepare_disposition_reason = reason
+        record.session.extrude_freeze = None
+        record.status = "COMMITTED"
+    cleanup_session(window_pointer, keep_history_record=True)
+
+
 def _session_has_new_path(session: KnifeSession) -> bool:
     """Return as soon as one edge created by the native tool is found."""
 
@@ -258,6 +284,9 @@ def _watch_passthrough_session(window_pointer: int, history_token: int):
     if not session.saw_modal and not _session_has_new_path(session):
         if now - session.started_at < session_state._PASSTHROUGH_START_GRACE:
             return session_state._PASSTHROUGH_POLL_INTERVAL
+        if session.tool_kind == "EXTRUDE_FACES_INDIV":
+            _decline_faces_indiv_noop(session, window_pointer)
+            return None
         cleanup_session(window_pointer)
         return None
 
@@ -291,6 +320,10 @@ def _watch_passthrough_session(window_pointer: int, history_token: int):
 
     if path_signature is None:
         # Knife/Loop Cut cancellation and confirmed no-ops leave no topology.
+        # FACES_INDIV empty F_r is a native no-op that must still DECLINE.
+        if session.tool_kind == "EXTRUDE_FACES_INDIV":
+            _decline_faces_indiv_noop(session, window_pointer)
+            return None
         cleanup_session(window_pointer)
         return None
 
