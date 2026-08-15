@@ -408,7 +408,7 @@ def _prepare_session(
     route_kmi_properties: tuple[tuple[str, object], ...] = (),
 ) -> bool:
     from .history import _remember_history_session
-    from .watcher import _schedule_passthrough_watcher
+    from .watcher import _schedule_passthrough_watcher, modal_operator_pairs
 
     if tool_kind not in TOOL_LABELS:
         raise ValueError(f"Unsupported native tool kind: {tool_kind!r}")
@@ -576,6 +576,7 @@ def _prepare_session(
             extrude=extrude_snapshot,
             prepare_disposition=prepare_disposition,
             prepare_disposition_reason=prepare_disposition_reason,
+            preexisting_modal_operators=modal_operator_pairs(context.window),
         )
         session_state._SESSIONS[window_pointer] = session
         registered = True

@@ -396,6 +396,10 @@ class KnifeSession:
     confirmed_selection_signature: tuple[tuple[int, bool], ...] = ()
     route: str = "KMI"
     gizmo_operator_pointer: int = 0
+    # (pointer, idname) pairs of modal operators alive at session creation.
+    # Resident pass-through modals (screencast-style addons) live here; the
+    # intervening-modal decline fires only for modals NOT in this set.
+    preexisting_modal_operators: tuple[tuple[int, str], ...] = ()
 
 
 @dataclass(slots=True)

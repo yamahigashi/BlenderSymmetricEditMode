@@ -26,6 +26,23 @@ from .session import (
 )
 
 
+def modal_operator_pairs(window) -> tuple[tuple[int, str], ...]:
+    """(pointer, idname) for every live modal operator in *window*."""
+
+    pairs = []
+    for operator in window.modal_operators:
+        idname = getattr(operator, "bl_idname", "") or getattr(getattr(operator, "bl_rna", None), "identifier", "")
+        pairs.append((operator.as_pointer(), str(idname)))
+    return tuple(pairs)
+
+
+def _new_modal_operators(window, session: KnifeSession) -> tuple[tuple[int, str], ...]:
+    """Modal operators that were not alive when the session was created."""
+
+    known = set(session.preexisting_modal_operators)
+    return tuple(pair for pair in modal_operator_pairs(window) if pair not in known)
+
+
 def _modal_operator_identifiers(window) -> set[str]:
     identifiers = set()
     for operator in window.modal_operators:
@@ -300,10 +317,10 @@ def _watch_passthrough_session(window_pointer: int, history_token: int):
         session.modal_absent_since = now
         session.path_signature = path_signature
         session.stable_path_ticks = 1
-        if session.tool_kind in EXTRUDE_TOOL_KINDS and tuple(window.modal_operators):
+        if session.tool_kind in EXTRUDE_TOOL_KINDS and _new_modal_operators(window, session):
             return _invoke_passthrough_finish(window_pointer, history_token, session)
         return session_state._PASSTHROUGH_POLL_INTERVAL
-    if session.tool_kind in EXTRUDE_TOOL_KINDS and tuple(window.modal_operators):
+    if session.tool_kind in EXTRUDE_TOOL_KINDS and _new_modal_operators(window, session):
         # Grab/other modal during grace keeps moving verts, so the signature
         # never stabilizes. Finish immediately as an intervening-operator decline.
         return _invoke_passthrough_finish(window_pointer, history_token, session)

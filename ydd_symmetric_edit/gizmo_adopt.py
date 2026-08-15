@@ -895,6 +895,7 @@ def _commit_adoption(context, obj, operator, kind: str, axis_index: int, plan: _
             extrude=extrude_snapshot,
             route=GIZMO_ROUTE,
             gizmo_operator_pointer=_operator_pointer(operator),
+            preexisting_modal_operators=watcher.modal_operator_pairs(context.window),
         )
         session_state._SESSIONS[adopted.window_pointer] = adopted
         registered = True

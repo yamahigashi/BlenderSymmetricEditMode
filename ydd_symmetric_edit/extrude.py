@@ -2114,8 +2114,18 @@ def intervening_operator_reason(session, context) -> str | None:
             (candidate for candidate in window_manager.windows if candidate.as_pointer() == session.window_pointer),
             None,
         )
-    if window is not None and tuple(window.modal_operators):
-        return "another modal operator started before the extrude could be mirrored"
+    if window is not None:
+        known = set(session.preexisting_modal_operators)
+        newcomers = []
+        for operator in window.modal_operators:
+            idname = getattr(operator, "bl_idname", "") or getattr(
+                getattr(operator, "bl_rna", None), "identifier", ""
+            )
+            if (operator.as_pointer(), str(idname)) not in known:
+                newcomers.append(str(idname))
+        if newcomers:
+            names = ", ".join(sorted(set(newcomers)))
+            return f"another modal operator started before the extrude could be mirrored ({names})"
     if not session.confirmed_operator_pointer or not session.confirmed_operator_idname:
         return "the confirmed extrude operator could not be captured"
 
