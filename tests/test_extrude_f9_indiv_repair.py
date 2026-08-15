@@ -1,0 +1,499 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+"""GUI representative: faces_indiv undo→redo→repair reuses (d) freeze + loops.
+
+Plan: .agents/doc/f9_extrude_plan_2026-08-15.md v3.1 §4-2 row 11 / §3 (b)+(c).
+Adjacent two faces with distinct material/UV. No ed.undo_redo.
+
+Run::
+
+    cmd.exe /c "tmp\\run_menu_reg.bat 42 test_extrude_f9_indiv_repair.py"
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import time
+import traceback
+from collections import Counter
+from pathlib import Path
+
+import bmesh
+import bpy
+from bpy_extras import view3d_utils
+from mathutils import Quaternion, Vector
+
+bpy.context.preferences.view.show_splash = False
+bpy.context.preferences.view.smooth_view = 0
+bpy.context.preferences.view.use_save_prompt = False
+bpy.context.preferences.filepaths.use_auto_save_temporary_files = False
+
+PACKAGE_PARENT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PACKAGE_PARENT))
+
+import ydd_symmetric_edit as addon  # noqa: E402
+from ydd_symmetric_edit import keymaps, layer_names, operators  # noqa: E402
+
+OBJECT_NAME = "YSE_F9IndivRepair"
+MESH_NAME = "YSE_F9IndivRepairMesh"
+MARKER_OK = "YSE_EXTRUDE_F9_INDIV_REPAIR_OK"
+MARKER_FAILED = "YSE_EXTRUDE_F9_INDIV_REPAIR_FAILED"
+TOOL_KIND = "EXTRUDE_FACES_INDIV"
+TOOL_ID = "builtin.extrude_individual"
+TOOL_KEYMAP_NAME = "3D View Tool: Edit Mesh, Extrude Individual"
+NX, NY = 6, 4
+PRECISION = 5
+ADJACENT_MIRROR = (16, 32, 16)
+FAILSAFE_S = 90.0
+STATE: dict = {"phase": "startup", "finished": False}
+
+
+def fail(message=""):
+    if message:
+        print(f"YSE_EXTRUDE_F9_INDIV_REPAIR_ERROR={message}", flush=True)
+    traceback.print_exc()
+    print(f"YSE_EXTRUDE_F9_INDIV_REPAIR_PHASE={STATE.get('phase')}", flush=True)
+    print(MARKER_FAILED, flush=True)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(1)
+
+
+def test_object():
+    return bpy.data.objects[OBJECT_NAME]
+
+
+def override():
+    return bpy.context.temp_override(window=STATE["window"], area=STATE["area"], region=STATE["region"])
+
+
+def click_drag_threshold_px():
+    inputs = bpy.context.preferences.inputs
+    if hasattr(inputs, "drag_threshold_mouse"):
+        base = int(inputs.drag_threshold_mouse)
+    elif hasattr(inputs, "drag_threshold"):
+        base = int(inputs.drag_threshold)
+    else:
+        raise RuntimeError("preferences.inputs exposes neither drag_threshold_mouse nor drag_threshold")
+    scale = float(getattr(bpy.context.preferences.system, "ui_scale", 1.0))
+    return max(1, int(round(base * scale)) + 1)
+
+
+def configure_view(area):
+    space = area.spaces.active
+    space.show_gizmo = False
+    space.show_gizmo_tool = False
+    region_3d = space.region_3d
+    region_3d.view_perspective = "ORTHO"
+    region_3d.view_rotation = Quaternion((1.0, 0.0, 0.0, 0.0))
+    region_3d.view_location = (0.0, 0.0, 0.0)
+    region_3d.view_distance = 14.0
+    region_3d.update()
+
+
+def window_coordinate(coordinate):
+    region = STATE["region"]
+    region_3d = STATE["area"].spaces.active.region_3d
+    local = view3d_utils.location_3d_to_region_2d(region, region_3d, Vector(coordinate))
+    if local is None:
+        raise RuntimeError(f"could not project {coordinate}")
+    return int(round(region.x + local.x)), int(round(region.y + local.y))
+
+
+def grid_xy(i, j):
+    return (i - NX / 2, j - NY / 2)
+
+
+def build_mesh():
+    for old in tuple(bpy.data.objects):
+        bpy.data.objects.remove(old, do_unlink=True)
+    for old_mesh in tuple(bpy.data.meshes):
+        if old_mesh.users == 0:
+            bpy.data.meshes.remove(old_mesh)
+    mesh = bpy.data.meshes.new(MESH_NAME)
+    coords, faces = [], []
+    for j in range(NY + 1):
+        for i in range(NX + 1):
+            coords.append((i - NX / 2, j - NY / 2, 0.0))
+    stride = NX + 1
+    for j in range(NY):
+        for i in range(NX):
+            a = j * stride + i
+            faces.append((a, a + 1, a + stride + 1, a + stride))
+    mesh.from_pydata(coords, [], faces)
+    mesh.update()
+    obj = bpy.data.objects.new(OBJECT_NAME, mesh)
+    bpy.context.scene.collection.objects.link(obj)
+    obj.use_mesh_mirror_x = True
+    obj.use_mesh_mirror_y = False
+    obj.use_mesh_mirror_z = False
+    bpy.context.view_layer.objects.active = obj
+    obj.select_set(True)
+    with override():
+        bpy.ops.object.mode_set(mode="EDIT")
+        bpy.context.tool_settings.mesh_select_mode = (False, False, True)
+        bpy.ops.ed.undo_push(message="YSE F9 indiv repair baseline")
+    return obj
+
+
+def grid_vert(bm, i, j):
+    x, y = grid_xy(i, j)
+    for vertex in bm.verts:
+        if abs(vertex.co.x - x) < 1e-4 and abs(vertex.co.y - y) < 1e-4 and abs(vertex.co.z) < 1e-4:
+            return vertex
+    raise AssertionError(f"grid vert {i},{j} not found")
+
+
+def grid_face(bm, i, j):
+    wanted = {
+        grid_xy(i, j),
+        grid_xy(i + 1, j),
+        grid_xy(i + 1, j + 1),
+        grid_xy(i, j + 1),
+    }
+    for face in bm.faces:
+        have = {(round(float(vertex.co.x), 6), round(float(vertex.co.y), 6)) for vertex in face.verts}
+        expect = {(round(x, 6), round(y, 6)) for x, y in wanted}
+        if have == expect:
+            return face
+    raise AssertionError(f"grid face {i},{j} not found")
+
+
+def prepare_adjacent_uv(bm, obj):
+    mesh = obj.data
+    while len(mesh.materials) < 2:
+        material = bpy.data.materials.new(f"YSE_F9IndivMat{len(mesh.materials)}")
+        mesh.materials.append(material)
+    uv_layer = bm.loops.layers.uv.active
+    if uv_layer is None:
+        uv_layer = bm.loops.layers.uv.new("UVMap")
+    left = grid_face(bm, 4, 1)
+    right = grid_face(bm, 5, 1)
+    left.material_index = 0
+    right.material_index = 1
+    left_uvs = ((0.0, 0.0), (0.4, 0.0), (0.4, 0.4), (0.0, 0.4))
+    right_uvs = ((0.6, 0.6), (1.0, 0.6), (1.0, 1.0), (0.6, 1.0))
+    for loop, uv in zip(left.loops, left_uvs, strict=True):
+        loop[uv_layer].uv = uv
+    for loop, uv in zip(right.loops, right_uvs, strict=True):
+        loop[uv_layer].uv = uv
+    bpy.context.tool_settings.mesh_select_mode = (False, False, True)
+    for face in bm.faces:
+        face.select = False
+    for edge in bm.edges:
+        edge.select = False
+    for vertex in bm.verts:
+        vertex.select = False
+    bm.select_history.clear()
+    left.select = True
+    right.select = True
+    bm.select_flush_mode()
+
+
+def coordinate_key(co):
+    return tuple(round(float(value), PRECISION) for value in co)
+
+
+def assert_x_symmetric(bm):
+    live = Counter(coordinate_key(vertex.co) for vertex in bm.verts)
+    mirrored = Counter((-x, y, z) for x, y, z in live.elements())
+    assert live == mirrored, "vertex coordinates are not X-symmetric"
+
+
+def assert_layers_removed(bm):
+    for name in layer_names.TEMP_LAYER_NAMES:
+        for sequence in (bm.verts, bm.edges, bm.faces):
+            assert sequence.layers.int.get(name) is None, f"temporary layer leaked: {name}"
+
+
+def topology_counts(bm):
+    return len(bm.verts), len(bm.edges), len(bm.faces)
+
+
+def live_net(bm):
+    base = STATE["baseline"]
+    return (
+        len(bm.verts) - base[0],
+        len(bm.edges) - base[1],
+        len(bm.faces) - base[2],
+    )
+
+
+def latest_record():
+    records = [
+        record
+        for record in operators._HISTORY_RECORDS.values()
+        if record.session.object_name == OBJECT_NAME and record.session.tool_kind == TOOL_KIND
+    ]
+    return max(records, key=lambda record: record.sequence) if records else None
+
+
+def snapshot_vid_at(snapshot, i, j):
+    x, y = grid_xy(i, j)
+    matches = [
+        vertex_id
+        for vertex_id, coord in snapshot.vertex_preop
+        if abs(coord.x - x) < 1e-4 and abs(coord.y - y) < 1e-4 and abs(coord.z) < 1e-4
+    ]
+    assert len(matches) == 1, f"grid ({i},{j}) vids={matches}"
+    return matches[0]
+
+
+def assert_adjacent_d_freeze(record):
+    snapshot = record.session.extrude
+    freeze = record.session.extrude_freeze
+    assert snapshot is not None, "missing extrude snapshot"
+    assert freeze, "missing extrude freeze table"
+    assert any(entry.entity_class == "d" for entry in freeze), freeze
+    for i, j in ((5, 1), (5, 2)):
+        vertex_id = snapshot_vid_at(snapshot, i, j)
+        rows = [entry for entry in freeze if entry.vertex_id == vertex_id]
+        assert rows, f"no freeze rows for shared grid ({i},{j}) vid={vertex_id}"
+        assert all(entry.entity_class == "d" for entry in rows), rows
+        signatures = [entry.source_face_signature for entry in rows]
+        assert all(signature for signature in signatures), signatures
+        assert len(set(signatures)) == len(signatures), signatures
+
+
+def _uv_tuple(face, uv_layer):
+    return tuple(tuple(round(float(loop[uv_layer].uv[index]), 5) for index in (0, 1)) for loop in face.loops)
+
+
+def assert_uv_material_pairs(bm):
+    uv_layer = bm.loops.layers.uv.active
+    assert uv_layer is not None, "UV layer missing after repair"
+    new_faces = [face for face in bm.faces if any(abs(vertex.co.z) > 1e-4 for vertex in face.verts)]
+    assert new_faces, "no extruded faces after repair"
+    grouped: dict[tuple[int, frozenset], list] = {}
+    for face in new_faces:
+        grouped.setdefault((face.material_index, frozenset(_uv_tuple(face, uv_layer))), []).append(face)
+    for key, group in grouped.items():
+        positive_faces = [face for face in group if face.calc_center_median().x > 0]
+        negative_faces = [face for face in group if face.calc_center_median().x < 0]
+        assert len(positive_faces) == len(negative_faces), f"unpaired new faces for {key}"
+        remaining = list(negative_faces)
+        for source_face in positive_faces:
+            expected = tuple(reversed(_uv_tuple(source_face, uv_layer)))
+            match = next((face for face in remaining if _uv_tuple(face, uv_layer) == expected), None)
+            assert match is not None, f"mirror loop UVs are not reversed source for {key}"
+            remaining.remove(match)
+
+
+def toolbar_route_ready():
+    tool_items = [
+        item
+        for keymap, item in keymaps._REGISTERED_ITEMS
+        if keymap.name == TOOL_KEYMAP_NAME
+        and item.idname == keymaps.INTERCEPT_OPERATOR
+        and item.type == "LEFTMOUSE"
+        and item.value == "CLICK_DRAG"
+    ]
+    return bool(tool_items) and all(item.active for item in tool_items)
+
+
+def send_events(events, done, index=0, interval=0.09, done_delay=0.2):
+    def step():
+        try:
+            if index < len(events):
+                STATE["window"].event_simulate(**events[index])
+                send_events(events, done, index + 1, interval=interval, done_delay=done_delay)
+            else:
+                bpy.app.timers.register(done, first_interval=done_delay)
+        except BaseException:
+            fail()
+        return None
+
+    bpy.app.timers.register(step, first_interval=interval)
+
+
+def wait_settled(done, started=None):
+    started = time.monotonic() if started is None else started
+
+    def poll():
+        try:
+            busy = bool(STATE["window"].modal_operators) or bool(operators._SESSIONS) or bool(operators._HISTORY_REPAIR_QUEUED) or bool(operators._HISTORY_REPAIR_BUSY)
+            if busy:
+                if time.monotonic() - started > 12.0:
+                    raise RuntimeError(
+                        f"flow never settled; modal={[op.bl_idname for op in STATE['window'].modal_operators]} "
+                        f"sessions={list(operators._SESSIONS)}"
+                    )
+                return 0.1
+            bpy.app.timers.register(done, first_interval=0.25)
+        except BaseException:
+            fail()
+        return None
+
+    bpy.app.timers.register(poll, first_interval=0.1)
+
+
+def wait_for_toolbar_route(done, started=None):
+    started = time.monotonic() if started is None else started
+
+    def poll():
+        try:
+            if toolbar_route_ready():
+                bpy.app.timers.register(done, first_interval=0.15)
+                return None
+            if time.monotonic() - started > 8.0:
+                raise RuntimeError("Extrude Individual intercept was not registered")
+            return 0.05
+        except BaseException:
+            fail()
+        return None
+
+    bpy.app.timers.register(poll, first_interval=0.05)
+
+
+def tool_drag_events(cursor_xyz, drag=(0, 80)):
+    x, y = window_coordinate(cursor_xyz)
+    tx, ty = x + drag[0], y + drag[1]
+    return [
+        {"type": "MOUSEMOVE", "value": "NOTHING", "x": x, "y": y},
+        {"type": "LEFTMOUSE", "value": "PRESS", "x": x, "y": y},
+        {"type": "MOUSEMOVE", "value": "NOTHING", "x": x + drag[0] // 2, "y": y + drag[1] // 2},
+        {"type": "MOUSEMOVE", "value": "NOTHING", "x": tx, "y": ty},
+        {"type": "LEFTMOUSE", "value": "RELEASE", "x": tx, "y": ty},
+    ]
+
+
+def after_extrude():
+    try:
+        STATE["phase"] = "after_extrude"
+        obj = test_object()
+        bm = bmesh.from_edit_mesh(obj.data)
+        got = live_net(bm)
+        print(f"YSE_EXTRUDE_F9_INDIV_REPAIR_NET_AFTER_EXTRUDE={got}", flush=True)
+        assert got == ADJACENT_MIRROR, f"net {got} != {ADJACENT_MIRROR}"
+        assert_x_symmetric(bm)
+        assert_layers_removed(bm)
+        record = latest_record()
+        assert record is not None, "missing COMMITTED faces_indiv record"
+        assert_adjacent_d_freeze(record)
+        STATE["freeze_token"] = record.session.history_token
+        STATE["freeze_id"] = id(record.session.extrude_freeze)
+        assert_uv_material_pairs(bm)
+        bpy.app.timers.register(do_undo, first_interval=0.4)
+    except BaseException:
+        fail()
+    return None
+
+
+def do_undo():
+    try:
+        STATE["phase"] = "undo"
+        with override():
+            result = bpy.ops.ed.undo()
+        print(f"YSE_EXTRUDE_F9_INDIV_REPAIR_UNDO={result}", flush=True)
+        assert result == {"FINISHED"}, result
+        wait_settled(after_undo)
+    except BaseException:
+        fail()
+    return None
+
+
+def after_undo():
+    try:
+        STATE["phase"] = "after_undo"
+        obj = test_object()
+        bm = bmesh.from_edit_mesh(obj.data)
+        counts = topology_counts(bm)
+        assert counts == STATE["baseline"], f"undo did not restore baseline: {counts}"
+        assert_x_symmetric(bm)
+        assert_layers_removed(bm)
+        bpy.app.timers.register(do_redo, first_interval=0.5)
+    except BaseException:
+        fail()
+    return None
+
+
+def do_redo():
+    try:
+        STATE["phase"] = "redo"
+        with override():
+            result = bpy.ops.ed.redo()
+        print(f"YSE_EXTRUDE_F9_INDIV_REPAIR_REDO={result}", flush=True)
+        assert result == {"FINISHED"}, result
+        wait_settled(after_repair)
+    except BaseException:
+        fail()
+    return None
+
+
+def after_repair():
+    try:
+        STATE["phase"] = "after_repair"
+        obj = test_object()
+        bm = bmesh.from_edit_mesh(obj.data)
+        got = live_net(bm)
+        print(f"YSE_EXTRUDE_F9_INDIV_REPAIR_NET_AFTER_REPAIR={got}", flush=True)
+        assert got == ADJACENT_MIRROR, f"repair remirror net {got} != {ADJACENT_MIRROR}"
+        assert_x_symmetric(bm)
+        assert_layers_removed(bm)
+        record = latest_record()
+        assert record is not None, "missing record after redo repair"
+        assert record.session.history_token == STATE["freeze_token"], "repair must reuse the committed token"
+        assert_adjacent_d_freeze(record)
+        assert_uv_material_pairs(bm)
+        STATE["finished"] = True
+        print(MARKER_OK, flush=True)
+        sys.stdout.flush()
+        addon.unregister()
+        bpy.ops.wm.quit_blender()
+    except BaseException:
+        fail()
+    return None
+
+
+def failsafe():
+    if STATE.get("finished"):
+        return None
+    fail(f"failsafe quit timer expired in phase={STATE.get('phase')}")
+    return None
+
+
+def start_drag():
+    try:
+        events = tool_drag_events((2.0, -0.5, 0.0), drag=(0, max(80, click_drag_threshold_px() + 16)))
+        send_events(events, lambda: wait_settled(after_extrude))
+    except BaseException:
+        fail()
+    return None
+
+
+def start():
+    try:
+        addon.register()
+        addon.sync_persistent_keymap(True)
+        window = bpy.context.window_manager.windows[0]
+        area = next(item for item in window.screen.areas if item.type == "VIEW_3D")
+        region = next(item for item in area.regions if item.type == "WINDOW")
+        STATE.update(window=window, area=area, region=region)
+        configure_view(area)
+        build_mesh()
+        obj = test_object()
+        bm = bmesh.from_edit_mesh(obj.data)
+        prepare_adjacent_uv(bm, obj)
+        bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+        with override():
+            push = bpy.ops.ed.undo_push(message="YSE F9 indiv repair prepared")
+        assert push == {"FINISHED"}, push
+        STATE["baseline"] = topology_counts(bmesh.from_edit_mesh(obj.data))
+        print(
+            f"YSE_EXTRUDE_F9_INDIV_REPAIR_BASELINE={STATE['baseline']} "
+            f"drag_threshold={click_drag_threshold_px()}",
+            flush=True,
+        )
+        with override():
+            bpy.context.tool_settings.workspace_tool_type = "DEFAULT"
+            result = bpy.ops.wm.tool_set_by_id(name=TOOL_ID)
+        assert result == {"FINISHED"}, result
+        wait_for_toolbar_route(start_drag)
+    except BaseException:
+        fail()
+    return None
+
+
+bpy.app.timers.register(failsafe, first_interval=FAILSAFE_S)
+bpy.app.timers.register(start, first_interval=0.4)

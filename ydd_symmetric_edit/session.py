@@ -93,7 +93,7 @@ TOOL_PROFILES: dict[str, ToolProfile] = {
         passthrough_handoff_grace=0.04,
         passthrough_stable_ticks=3,
         supports_nested_offset=False,
-        supports_adjust_repeat=False,
+        supports_adjust_repeat=True,
     ),
     "EXTRUDE_CONTEXT": ToolProfile(
         kind="EXTRUDE_CONTEXT",
@@ -105,7 +105,7 @@ TOOL_PROFILES: dict[str, ToolProfile] = {
         passthrough_handoff_grace=0.04,
         passthrough_stable_ticks=3,
         supports_nested_offset=False,
-        supports_adjust_repeat=False,
+        supports_adjust_repeat=True,
     ),
     "EXTRUDE_SHRINK_FATTEN": ToolProfile(
         kind="EXTRUDE_SHRINK_FATTEN",
@@ -117,7 +117,7 @@ TOOL_PROFILES: dict[str, ToolProfile] = {
         passthrough_handoff_grace=0.04,
         passthrough_stable_ticks=3,
         supports_nested_offset=False,
-        supports_adjust_repeat=False,
+        supports_adjust_repeat=True,
     ),
     "EXTRUDE_FACES_INDIV": ToolProfile(
         kind="EXTRUDE_FACES_INDIV",
@@ -129,7 +129,7 @@ TOOL_PROFILES: dict[str, ToolProfile] = {
         passthrough_handoff_grace=0.04,
         passthrough_stable_ticks=3,
         supports_nested_offset=False,
-        supports_adjust_repeat=False,
+        supports_adjust_repeat=True,
     ),
     "EXTRUDE_EDGES_INDIV": ToolProfile(
         kind="EXTRUDE_EDGES_INDIV",
@@ -141,7 +141,7 @@ TOOL_PROFILES: dict[str, ToolProfile] = {
         passthrough_handoff_grace=0.04,
         passthrough_stable_ticks=3,
         supports_nested_offset=False,
-        supports_adjust_repeat=False,
+        supports_adjust_repeat=True,
     ),
     "EXTRUDE_VERTS_INDIV": ToolProfile(
         kind="EXTRUDE_VERTS_INDIV",
@@ -153,7 +153,7 @@ TOOL_PROFILES: dict[str, ToolProfile] = {
         passthrough_handoff_grace=0.04,
         passthrough_stable_ticks=3,
         supports_nested_offset=False,
-        supports_adjust_repeat=False,
+        supports_adjust_repeat=True,
     ),
     "EXTRUDE_MANIFOLD": ToolProfile(
         kind="EXTRUDE_MANIFOLD",
@@ -184,7 +184,9 @@ MODAL_IDENTIFIER_TOKENS = {profile.kind: profile.wm_operator_names for profile i
 _PASSTHROUGH_HANDOFF_GRACE = {profile.kind: profile.passthrough_handoff_grace for profile in TOOL_PROFILES.values()}
 _PASSTHROUGH_STABLE_TICKS = {profile.kind: profile.passthrough_stable_ticks for profile in TOOL_PROFILES.values()}
 _WM_OPERATOR_TO_TOOL = {
-    profile.primary_wm_operator: profile.kind for profile in TOOL_PROFILES.values() if profile.supports_adjust_repeat
+    profile.primary_wm_operator.upper(): profile.kind
+    for profile in TOOL_PROFILES.values()
+    if profile.supports_adjust_repeat or profile.kind in EXTRUDE_TOOL_KINDS
 }
 
 

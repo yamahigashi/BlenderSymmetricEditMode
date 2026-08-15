@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import math
 import traceback
+from collections import Counter
 from dataclasses import dataclass
+from itertools import permutations
 
 import bmesh
 import bpy
@@ -196,6 +198,252 @@ def build_snapshot(
         edge_count=len(bm.edges),
         face_count=len(bm.faces),
     )
+
+
+def _canonical_coordinate_cycle(
+    cycle: tuple[tuple[float, float, float], ...],
+) -> tuple[tuple[float, float, float], ...]:
+    """Canonicalize a face cycle by rotation, preserving winding."""
+
+    if not cycle:
+        return ()
+    return min(cycle[index:] + cycle[:index] for index in range(len(cycle)))
+
+
+def _canonical_id_cycle(cycle: tuple[int, ...]) -> tuple[int, ...]:
+    if not cycle:
+        return ()
+    return min(cycle[index:] + cycle[:index] for index in range(len(cycle)))
+
+
+def _snapshot_coordinate_domains(snapshot: ExtrudeSnapshot):
+    preop = snapshot.vertex_preop_map()
+    vertices = tuple(coordinate.as_tuple() for _vertex_id, coordinate in snapshot.vertex_preop)
+    edges = []
+    for first, second in snapshot.edge_endpoint_map().values():
+        first_co = preop.get(first)
+        second_co = preop.get(second)
+        if first_co is None or second_co is None:
+            return None
+        edges.append(tuple(sorted((first_co.as_tuple(), second_co.as_tuple()))))
+    faces = []
+    for corners in snapshot.face_corner_map().values():
+        try:
+            coordinates = tuple(preop[vertex_id].as_tuple() for vertex_id in corners)
+        except KeyError:
+            return None
+        faces.append(_canonical_coordinate_cycle(coordinates))
+    return tuple(vertices), tuple(edges), tuple(faces)
+
+
+_EXACT_MAPPING_STEP_LIMIT = 2_000
+
+
+def _exact_coordinate_mapping(
+    snapshot: ExtrudeSnapshot,
+    bm: bmesh.types.BMesh,
+    mesh_select_mode: MeshSelectionMode,
+) -> dict[int, int] | None:
+    """Find the unique topology-valid bijection among exactly equal coordinates."""
+
+    snapshot_by_coordinate: dict[tuple[float, float, float], list[int]] = {}
+    for vertex_id, coordinate in snapshot.vertex_preop:
+        snapshot_by_coordinate.setdefault(coordinate.as_tuple(), []).append(vertex_id)
+    live_by_coordinate: dict[tuple[float, float, float], list[int]] = {}
+    for vertex in bm.verts:
+        coordinate = (float(vertex.co.x), float(vertex.co.y), float(vertex.co.z))
+        live_by_coordinate.setdefault(coordinate, []).append(int(vertex.index))
+    if set(snapshot_by_coordinate) != set(live_by_coordinate) or any(
+        len(snapshot_by_coordinate[coordinate]) != len(live_by_coordinate[coordinate])
+        for coordinate in snapshot_by_coordinate
+    ):
+        return None
+
+    mapping: dict[int, int] = {}
+    duplicate_groups: list[tuple[list[int], list[int]]] = []
+    for coordinate, snapshot_ids in snapshot_by_coordinate.items():
+        live_indices = live_by_coordinate[coordinate]
+        if len(snapshot_ids) == 1:
+            mapping[snapshot_ids[0]] = live_indices[0]
+        else:
+            duplicate_groups.append((snapshot_ids, live_indices))
+    if not duplicate_groups:
+        return mapping
+
+    solutions: list[dict[int, int]] = []
+    leaves = 0
+
+    def search(group_index: int) -> None:
+        nonlocal leaves
+        if len(solutions) > 1 or leaves >= _EXACT_MAPPING_STEP_LIMIT:
+            return
+        if group_index == len(duplicate_groups):
+            leaves += 1
+            if _mapped_domains_match(snapshot, bm, mapping, mesh_select_mode, include_selection=False):
+                solutions.append(dict(mapping))
+            return
+        snapshot_ids, live_indices = duplicate_groups[group_index]
+        for assignment in permutations(live_indices):
+            mapping.update(zip(snapshot_ids, assignment, strict=True))
+            search(group_index + 1)
+            if len(solutions) > 1 or leaves >= _EXACT_MAPPING_STEP_LIMIT:
+                return
+
+    search(0)
+    if leaves >= _EXACT_MAPPING_STEP_LIMIT or len(solutions) != 1:
+        return None
+    return solutions[0]
+
+
+def _solver_vertex_mapping(snapshot: ExtrudeSnapshot, live_vertices) -> dict[int, int] | None:
+    live_coordinates = [(float(vertex.co.x), float(vertex.co.y), float(vertex.co.z)) for vertex in live_vertices]
+    lookup = matching.build_vertex_mirror_lookup(live_coordinates, snapshot.axis_index, snapshot.tolerance)
+    resolved = lookup.find_all_direct(
+        [Vector(coordinate.as_tuple()) for _vertex_id, coordinate in snapshot.vertex_preop]
+    )
+    if len(resolved) != len(snapshot.vertex_preop) or any(index is None for index in resolved):
+        return None
+    return {
+        vertex_id: int(live_index)
+        for (vertex_id, _coordinate), live_index in zip(snapshot.vertex_preop, resolved, strict=True)
+    }
+
+
+def _mapped_domains_match(
+    snapshot: ExtrudeSnapshot,
+    bm: bmesh.types.BMesh,
+    mapping: dict[int, int],
+    mesh_select_mode: MeshSelectionMode,
+    *,
+    include_selection: bool = True,
+) -> bool:
+    """Validate every topology and selection domain through one vertex map."""
+
+    live_to_snapshot = {live_index: vertex_id for vertex_id, live_index in mapping.items()}
+    if len(live_to_snapshot) != len(bm.verts):
+        return False
+    expected_edges = Counter(tuple(sorted(endpoints)) for endpoints in snapshot.edge_endpoint_map().values())
+    live_edges = Counter()
+    for edge in bm.edges:
+        endpoints = tuple(sorted(live_to_snapshot.get(int(vertex.index), -1) for vertex in edge.verts))
+        if -1 in endpoints:
+            return False
+        live_edges[endpoints] += 1
+    if live_edges != expected_edges:
+        return False
+
+    expected_faces = Counter(_canonical_id_cycle(corners) for corners in snapshot.face_corner_map().values())
+    live_faces = Counter()
+    for face in bm.faces:
+        corners = tuple(live_to_snapshot.get(int(loop.vert.index), -1) for loop in face.loops)
+        if -1 in corners:
+            return False
+        live_faces[_canonical_id_cycle(corners)] += 1
+    if live_faces != expected_faces:
+        return False
+    if not include_selection:
+        return True
+    if mesh_select_mode != snapshot.mesh_select_mode:
+        return False
+
+    selected_vertices = {live_to_snapshot[int(vertex.index)] for vertex in bm.verts if vertex.select}
+    if selected_vertices != set(snapshot.selected_vertex_ids):
+        return False
+    edge_by_marker = snapshot.edge_endpoint_map()
+    expected_selected_edges = Counter(
+        tuple(sorted(edge_by_marker[marker])) for marker in snapshot.selected_edge_markers if marker in edge_by_marker
+    )
+    if expected_selected_edges.total() != len(snapshot.selected_edge_markers):
+        return False
+    live_selected_edges = Counter()
+    for edge in bm.edges:
+        if not edge.select:
+            continue
+        endpoints = tuple(sorted(live_to_snapshot.get(int(vertex.index), -1) for vertex in edge.verts))
+        if -1 in endpoints:
+            return False
+        live_selected_edges[endpoints] += 1
+    if live_selected_edges != expected_selected_edges:
+        return False
+
+    face_by_id = snapshot.face_corner_map()
+    expected_selected_faces = Counter(
+        _canonical_id_cycle(face_by_id[face_id]) for face_id in snapshot.selected_face_ids if face_id in face_by_id
+    )
+    if expected_selected_faces.total() != len(snapshot.selected_face_ids):
+        return False
+    live_selected_faces = Counter()
+    for face in bm.faces:
+        if not face.select:
+            continue
+        corners = tuple(live_to_snapshot.get(int(loop.vert.index), -1) for loop in face.loops)
+        if -1 in corners:
+            return False
+        live_selected_faces[_canonical_id_cycle(corners)] += 1
+    return live_selected_faces == expected_selected_faces
+
+
+def repeat_baseline_matches(
+    bm: bmesh.types.BMesh,
+    snapshot: ExtrudeSnapshot,
+    *,
+    mesh_select_mode: MeshSelectionMode,
+) -> bool:
+    """Validate the pre-stamp mesh before an extrude F9 re-execution.
+
+    The fast path compares exact float coordinate/topology multisets.  Only a
+    mismatch enters the existing minimum-total-Chebyshev injective solver;
+    the resulting single vertex mapping is then the sole basis for all
+    incidence and selection checks.
+    """
+
+    if (len(bm.verts), len(bm.edges), len(bm.faces)) != (
+        snapshot.vertex_count,
+        snapshot.edge_count,
+        snapshot.face_count,
+    ):
+        return False
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    bm.verts.index_update()
+    bm.edges.index_update()
+    bm.faces.index_update()
+    live_vertices = list(bm.verts)
+    live_domains = (
+        tuple((float(vertex.co.x), float(vertex.co.y), float(vertex.co.z)) for vertex in live_vertices),
+        tuple(
+            tuple(
+                sorted(
+                    (
+                        (float(edge.verts[0].co.x), float(edge.verts[0].co.y), float(edge.verts[0].co.z)),
+                        (float(edge.verts[1].co.x), float(edge.verts[1].co.y), float(edge.verts[1].co.z)),
+                    )
+                )
+            )
+            for edge in bm.edges
+        ),
+        tuple(
+            _canonical_coordinate_cycle(
+                tuple((float(loop.vert.co.x), float(loop.vert.co.y), float(loop.vert.co.z)) for loop in face.loops)
+            )
+            for face in bm.faces
+        ),
+    )
+    snapshot_domains = _snapshot_coordinate_domains(snapshot)
+    if snapshot_domains is None:
+        return False
+    raw_equal = all(
+        Counter(live_domain) == Counter(snapshot_domain)
+        for live_domain, snapshot_domain in zip(live_domains, snapshot_domains, strict=True)
+    )
+    if raw_equal:
+        mapping = _exact_coordinate_mapping(snapshot, bm, mesh_select_mode)
+        return mapping is not None and _mapped_domains_match(snapshot, bm, mapping, mesh_select_mode)
+    mapping = _solver_vertex_mapping(snapshot, live_vertices)
+    if mapping is None or len(mapping) != len(live_vertices):
+        return False
+    return _mapped_domains_match(snapshot, bm, mapping, mesh_select_mode)
 
 
 def evaluate_prepare_gates(snapshot: ExtrudeSnapshot) -> tuple[str, str]:
@@ -723,8 +971,18 @@ def _reconnect_ncopy_entries(
 ) -> str | None:
     if not ncopy_by_vid:
         return None
-    face_layer = bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
-    if face_layer is None:
+    # Frozen-table FACE_ID translation is a plain Undo/Redo repair concern.
+    # During the first finish (including its backup re-classification), the
+    # original FACE_ID attribution remains authoritative; only repair runs
+    # against a re-numbered live table and uses complete face circulation.
+    from . import session_state
+
+    repair_translation = bool(session_state._HISTORY_REPAIR_BUSY)
+    vertex_layer = bm.verts.layers.int.get(layer_names.VERT_SESSION_ID_LAYER) if repair_translation else None
+    if repair_translation and vertex_layer is None:
+        return "the session vertex ID layer is missing"
+    face_layer = bm.faces.layers.int.get(layer_names.FACE_ID_LAYER) if not repair_translation else None
+    if not repair_translation and face_layer is None:
         return "the face ID layer is missing"
 
     remainders: dict[int, list[bmesh.types.BMVert]] = {}
@@ -748,17 +1006,28 @@ def _reconnect_ncopy_entries(
             for vertex in leftover:
                 if not matching.coordinates_match(vertex.co, entry.copy_post.as_tuple(), tol):
                     continue
-                source_ids = _source_face_ids_for_copy(
-                    vertex,
-                    face_layer,
-                    snapshot.selected_face_ids,
-                )
-                if len(source_ids) != 1:
-                    continue
-                live_signature = corner_map.get(next(iter(source_ids)))
-                if live_signature is None:
-                    continue
-                if _signatures_match(live_signature, entry.source_face_signature):
+                if repair_translation:
+                    incident_matches = [
+                        face
+                        for face in vertex.link_faces
+                        if face.is_valid
+                        and _signatures_match(
+                            tuple(int(loop.vert[vertex_layer]) for loop in face.loops),
+                            entry.source_face_signature,
+                        )
+                    ]
+                    # (d) reconnect is keyed by the complete incident face
+                    # circulation and frozen source attribution.  FACE_ID is
+                    # a re-numberable repair marker and is intentionally
+                    # ignored in this repair-only branch.
+                    source_match = len(incident_matches) == 1
+                else:
+                    source_ids = _source_face_ids_for_copy(vertex, face_layer, snapshot.selected_face_ids)
+                    source_match = len(source_ids) == 1 and _signatures_match(
+                        corner_map.get(next(iter(source_ids)), ()),
+                        entry.source_face_signature,
+                    )
+                if source_match:
                     candidates.append(vertex)
             if len(candidates) != 1:
                 return "a frozen N-copy row did not match a unique copy"
@@ -2118,9 +2387,7 @@ def intervening_operator_reason(session, context) -> str | None:
         known = set(session.preexisting_modal_operators)
         newcomers = []
         for operator in window.modal_operators:
-            idname = getattr(operator, "bl_idname", "") or getattr(
-                getattr(operator, "bl_rna", None), "identifier", ""
-            )
+            idname = getattr(operator, "bl_idname", "") or getattr(getattr(operator, "bl_rna", None), "identifier", "")
             if (operator.as_pointer(), str(idname)) not in known:
                 newcomers.append(str(idname))
         if newcomers:

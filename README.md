@@ -63,6 +63,41 @@ operation. Loop Cut and Offset changes made through **Adjust Last Operation
 (F9)** receive the same mirrored post-process; the redo panel itself remains
 the native operator.
 
+## Extrude (E / toolbar Extrude tools / Alt+E)
+
+With the add-on enabled and one symmetry axis active, the extrude family is
+mirrored right after the native confirmation:
+
+- **E** (Extrude Region and Move), the **Extrude Region**, **Extrude Along
+  Normals**, and **Extrude Individual** toolbar tools (both their drag
+  gesture and their on-screen gizmo handle), and the **Alt+E** menu entries
+  (Extrude Faces, Along Normals, Individual Faces, Edges, Vertices) are all
+  supported. Faces, edge paths, and vertices extruded on one side are
+  reproduced on the opposite side with the reflected offset, including cap
+  and side-face materials, smoothing, and UVs.
+- **Selections that touch or lie on the symmetry plane extrude
+  symmetrically.** When the native offset stays in the plane, the mirrored
+  half shares the seam vertices with the native result instead of splitting
+  them, so the seam stays welded. Dragging off-axis opens a symmetric V at
+  the seam. A face standing in the plane itself (a fin) extrudes into a
+  two-sided symmetric block. Loop Cut rings that land entirely on the plane
+  are recognized as already symmetric and finish without a redundant mirror
+  pass.
+- **Adjust Last Operation (F9)** re-runs the native extrude with the edited
+  properties and mirrors the new result again. This works for all supported
+  extrude kinds except **Extrude Manifold**, whose offset-dependent dissolve
+  and weld behavior cannot be safely repeated; its redo panel stays native
+  and one-sided (undo and redo the operation instead).
+- **Extrude Manifold** is mirrored only while its result is congruent with a
+  plain region extrude (no dissolve or weld triggered). Otherwise the native
+  result is kept and the mirror is declined with a warning.
+- Zero-offset extrudes (click or Esc without moving) keep the native result
+  unmirrored; a warning explains that the mirror was skipped.
+- The whole native-plus-mirrored result is one undo step. If the mirror side
+  cannot be built (asymmetric topology, missing counterparts), the native
+  extrude is kept, the mirror is rolled back completely, and a warning is
+  reported.
+
 ## Rip (V / Alt+V)
 
 With the add-on enabled and one symmetry axis active, **Rip** and **Rip Fill**

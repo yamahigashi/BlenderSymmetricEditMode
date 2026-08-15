@@ -9,6 +9,7 @@ import bpy
 from bpy.app.handlers import persistent
 
 from . import (
+    extrude,
     layer_names,
     matching,
     session_state,
@@ -21,6 +22,7 @@ from ._types import (
     HiddenFaceMap,
     HistoryRecord,
     KnifeSession,
+    MeshSelectionMode,
     MirrorFaceMap,
     SymmetryAxes,
 )
@@ -38,7 +40,6 @@ from .session import (
 
 
 def _remember_history_session(session: KnifeSession, context) -> None:
-
     session_state._HISTORY_SEQUENCE += 1
     history_session = copy.copy(session)
     # Native Offset temporarily suspends Mesh Symmetry only while its Edge
@@ -581,7 +582,6 @@ def _repair_history_state():
 
 
 def _queue_history_repair(_dummy=None) -> None:
-
     if session_state._HISTORY_REPAIR_BUSY or session_state._HISTORY_REPAIR_QUEUED:
         return
     session_state._HISTORY_REPAIR_QUEUED = True  # type: ignore
@@ -616,7 +616,10 @@ def _prepare_adjust_last_operation_repeat() -> bool:
         return False
     identifier = getattr(active_operator, "bl_idname", "").upper()
     tool_kind = _WM_OPERATOR_TO_TOOL.get(identifier)
-    if tool_kind is None or not _single_edit_mesh_poll(context):
+    profile = TOOL_PROFILES.get(tool_kind) if tool_kind is not None else None
+    if profile is None or not profile.supports_adjust_repeat:
+        return False
+    if not _single_edit_mesh_poll(context):
         return False
 
     obj = context.edit_object
@@ -638,29 +641,41 @@ def _prepare_adjust_last_operation_repeat() -> bool:
     )
     if prior_record is None:
         return False
-    # Token presence alone cannot separate a raw snapshot from a baseline
-    # poisoned by lazy undo encoding; only path-edge evidence can.  Read
-    # failures and indeterminate layer states must stay on the repair side.
-    try:
-        tokens = _read_history_tokens(obj)
-    except Exception:
-        return False
-    if tokens:
+    if tool_kind not in EXTRUDE_TOOL_KINDS:
+        # Loop Cut / Offset keep the marker-based poisoned-baseline gate:
+        # token presence alone cannot separate a raw snapshot from a baseline
+        # poisoned by lazy undo encoding; only path-edge evidence can.
         try:
-            if prior_record.session.tool_kind in EXTRUDE_TOOL_KINDS:
-                # Do not run the loopcut marker predicate on extrude records.
-                # Full extrude PRESENT is deferred; UNKNOWN keeps this helper off.
-                path_state = "UNKNOWN"
-            else:
-                bm = bmesh.from_edit_mesh(obj.data)
-                path_state = stitch_pathedges.native_path_edge_state(bm)
+            tokens = _read_history_tokens(obj)
         except Exception:
             return False
-        if path_state != "ABSENT":
+        if tokens:
+            try:
+                bm = bmesh.from_edit_mesh(obj.data)
+                path_state = stitch_pathedges.native_path_edge_state(bm)
+            except Exception:
+                return False
+            if path_state != "ABSENT":
+                return False
+            _queue_history_repair()
+    if tool_kind in EXTRUDE_TOOL_KINDS:
+        try:
+            bm = bmesh.from_edit_mesh(obj.data)
+            current_mode = context.tool_settings.mesh_select_mode
+            mesh_select_mode = MeshSelectionMode(
+                vertices=bool(current_mode[0]),
+                edges=bool(current_mode[1]),
+                faces=bool(current_mode[2]),
+            )
+            if prior_record.session.extrude is None or not extrude.repeat_baseline_matches(
+                bm,
+                prior_record.session.extrude,
+                mesh_select_mode=mesh_select_mode,
+            ):
+                return False
+        except Exception:
             return False
-        _queue_history_repair()
 
-    profile = TOOL_PROFILES.get(tool_kind)
     if profile is not None and profile.supports_nested_offset:
         for attribute, enabled in zip(
             ("use_mesh_mirror_x", "use_mesh_mirror_y", "use_mesh_mirror_z"),
@@ -691,7 +706,6 @@ def register_history_handlers() -> None:
 
 
 def unregister_history_handlers() -> None:
-
     for handlers, callback in (
         (bpy.app.handlers.undo_post, repair_after_undo),
         (bpy.app.handlers.redo_post, repair_after_redo),
