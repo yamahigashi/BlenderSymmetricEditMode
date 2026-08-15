@@ -581,11 +581,15 @@ def start_test():
                 verify_decline_native_kept,
                 confirm="ESC",
             ),
+            # Midplane contract v3.1: on-plane origins are adopted. E constrains
+            # the translate to the +Z face normal, so the seam copies stay
+            # on-plane and the mirror reuses them: it adds 2/5/4 and deletes the
+            # partner face (contract §2-4), on top of the native 4/8/4.
             run_case(
-                "g4_on_plane",
+                "on_plane_adopted",
                 prepare_g4_on_plane,
                 (0.5, -0.5, 0.0),
-                lambda bm: verify_decline_native_kept(bm, (4, 8, 4)),
+                lambda bm: verify_net_and_symmetric(bm, (6, 13, 7)),
             ),
             run_case(
                 "g5_asymmetric",

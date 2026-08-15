@@ -293,13 +293,18 @@ def _adjust_last_operation_repair_plan(obj, prior_record: HistoryRecord):
         if marker_layer is None:
             return None
         prior_edges = [edge for edge in bm.edges if int(edge[marker_layer]) == 0 and not edge.select]
-        adjusted_edges, _side, total_path_edges, _crossing_count = stitch_pathedges.collect_source_path_edges(
+        collected = stitch_pathedges.collect_source_path_edges(
             bm,
             adjusted_record.session.axis_index,
             adjusted_record.session.tolerance,
             adjusted_record.session.source_side,
             selected_only=True,
         )
+        if collected.status == stitch_pathedges.ALREADY_SYMMETRIC:
+            adjusted_edges = list(collected.path_edges)
+        else:
+            adjusted_edges = collected.source_edges
+        total_path_edges = collected.total_path_edges
     except (AttributeError, ReferenceError, RuntimeError):
         return None
     if not prior_edges or not adjusted_edges or total_path_edges == 0:
@@ -317,13 +322,20 @@ def _live_adjusted_path_face_map(bm, session: KnifeSession):
     face_layer = bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
     if face_layer is None:
         return None
-    source_edges, _side, total_path_edges, _crossing_count = stitch_pathedges.collect_source_path_edges(
+    collected = stitch_pathedges.collect_source_path_edges(
         bm,
         session.axis_index,
         session.tolerance,
         session.source_side,
         selected_only=True,
     )
+    if collected.status == stitch_pathedges.ALREADY_SYMMETRIC:
+        # On-plane edges mirror onto themselves, so both flanking faces tie the
+        # unique-target test; stage 2's finish takes the all-PLANE early
+        # success and never consults carrier maps.
+        return {}
+    source_edges = collected.source_edges
+    total_path_edges = collected.total_path_edges
     if not source_edges or total_path_edges == 0:
         return None
 

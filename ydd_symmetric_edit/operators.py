@@ -961,44 +961,58 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                 # Straddling rings symmetrize through the ordinary reflection
                 # only because their carrier faces map to themselves or their
                 # pairs; when pairing fails the counterpart check declines.
-                source_edges, side, total_path_edges, crossing_count = stitch_pathedges.collect_source_path_edges(
-                    bm,
-                    session.axis_index,
-                    session.tolerance,
-                    session.source_side,
-                    selected_only=session.tool_kind
-                    in {
-                        "LOOP_CUT",
-                        "OFFSET_LOOP_CUT",
-                    },
-                )
+                def _collect_loop_source_path_edges(edit_bm):
+                    return stitch_pathedges.collect_source_path_edges(
+                        edit_bm,
+                        session.axis_index,
+                        session.tolerance,
+                        session.source_side,
+                        selected_only=session.tool_kind
+                        in {
+                            "LOOP_CUT",
+                            "OFFSET_LOOP_CUT",
+                        },
+                    )
+
+                def _finish_already_symmetric_loopcut():
+                    nonlocal mirror_committed
+                    if backup_mesh is not None:
+                        # No further mutation; drop the unused backup cleanly.
+                        mirror_committed = True
+                    result = {"FINISHED"}
+                    _finish_report(
+                        self,
+                        {"INFO"},
+                        f"{tool_label} cut lies on the mirror plane",
+                    )
+                    return result
+
+                collected = _collect_loop_source_path_edges(bm)
+                source_edges, side, total_path_edges, crossing_count = collected
                 if total_path_edges == 0:
                     result = {"FINISHED"}
                     self.report({"INFO"}, f"{tool_label} made no new cut")
                     return result
+                # Native loopcut skips hidden ring edges, leaving an open
+                # partial ring whose mirror is not well-defined.  This guard
+                # must precede the already-symmetric success: an all-PLANE
+                # partial ring is a partial ring first.
+                if stitch_pathedges.path_ring_includes_pre_hidden_edges(bm):
+                    raise SymmetricKnifeError("the cut ring includes hidden edges; partial ring cuts are not mirrored")
+
+                if collected.status == stitch_pathedges.ALREADY_SYMMETRIC:
+                    return _finish_already_symmetric_loopcut()
                 if side is None or not source_edges:
                     raise SymmetricKnifeError(
                         "Could not determine the source side; keep the new topology on one side of the mirror plane"
                     )
 
-                # Native loopcut skips hidden ring edges, leaving an open
-                # partial ring whose mirror is not well-defined.
-                if stitch_pathedges.path_ring_includes_pre_hidden_edges(bm):
-                    raise SymmetricKnifeError("the cut ring includes hidden edges; partial ring cuts are not mirrored")
-
                 live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, source_edges)
                 _edge_layer, face_layer = snapshot.get_required_layers(bm)
-                source_edges, side, total_path_edges, crossing_count = stitch_pathedges.collect_source_path_edges(
-                    bm,
-                    session.axis_index,
-                    session.tolerance,
-                    session.source_side,
-                    selected_only=session.tool_kind
-                    in {
-                        "LOOP_CUT",
-                        "OFFSET_LOOP_CUT",
-                    },
-                )
+                collected = _collect_loop_source_path_edges(bm)
+                source_edges, side, total_path_edges, crossing_count = collected
+                if collected.status == stitch_pathedges.ALREADY_SYMMETRIC:
+                    return _finish_already_symmetric_loopcut()
                 if side is None or not source_edges:
                     raise SymmetricKnifeError("The native cut path was lost before mirroring")
                 live_mirror_face_ids = _resolve_scope_overlay_and_materialize(bm, source_edges)
@@ -1050,17 +1064,10 @@ class MESH_OT_ydd_symmetric_edit_finish(bpy.types.Operator):
                 selection_state = selection.add_selection_layers(bm)
                 backup_mesh = _create_backup(bm)
                 bm = bmesh.from_edit_mesh(obj.data)
-                source_edges, side, total_path_edges, crossing_count = stitch_pathedges.collect_source_path_edges(
-                    bm,
-                    session.axis_index,
-                    session.tolerance,
-                    session.source_side,
-                    selected_only=session.tool_kind
-                    in {
-                        "LOOP_CUT",
-                        "OFFSET_LOOP_CUT",
-                    },
-                )
+                collected = _collect_loop_source_path_edges(bm)
+                source_edges, side, total_path_edges, crossing_count = collected
+                if collected.status == stitch_pathedges.ALREADY_SYMMETRIC:
+                    return _finish_already_symmetric_loopcut()
                 if side is None or not source_edges:
                     raise SymmetricKnifeError("The native cut path was lost before mirroring")
                 created, already_present, direct_reason = stitch_reflect.apply_reflected_path_topology(

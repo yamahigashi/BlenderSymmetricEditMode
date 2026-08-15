@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Literal
 
 import bmesh
@@ -490,6 +491,48 @@ def patch_knife_path_edges_by_side(
     return patched, len(all_edges)
 
 
+ALREADY_SYMMETRIC: Literal["ALREADY_SYMMETRIC"] = "ALREADY_SYMMETRIC"
+
+SourcePathStatus = Literal["OK", "ALREADY_SYMMETRIC", "UNDETERMINED"]
+
+
+@dataclass(slots=True)
+class SourcePathEdges:
+    """Loop Cut / Offset source-path collection (contract §4).
+
+    Unpacks as ``(source_edges, side, total_path_edges, crossing_count)``.
+    ``status`` is the explicit discriminator: callers must branch on
+    ``ALREADY_SYMMETRIC`` before treating an empty source list as failure.
+    ``path_edges`` is the full discovered path (on-plane edges included).
+    """
+
+    source_edges: list[bmesh.types.BMEdge]
+    side: str | None
+    total_path_edges: int
+    crossing_count: int
+    status: SourcePathStatus
+    path_edges: list[bmesh.types.BMEdge]
+
+    def __iter__(self) -> Iterator[object]:
+        yield self.source_edges
+        yield self.side
+        yield self.total_path_edges
+        yield self.crossing_count
+
+
+def _path_edges_already_symmetric(
+    by_side: Mapping[str, Sequence[bmesh.types.BMEdge]],
+) -> bool:
+    """True when every path edge lies on the mirror plane (contract §4)."""
+
+    return (
+        len(by_side["PLANE"]) > 0
+        and len(by_side["POSITIVE"]) == 0
+        and len(by_side["NEGATIVE"]) == 0
+        and len(by_side["CROSSES"]) == 0
+    )
+
+
 def collect_source_path_edges(
     bm: bmesh.types.BMesh,
     axis_index: int,
@@ -497,24 +540,51 @@ def collect_source_path_edges(
     requested_side: str,
     *,
     selected_only: bool = False,
-) -> tuple[list[bmesh.types.BMEdge], str | None, int, int]:
+) -> SourcePathEdges:
     """Return path edges on one source half (Loop Cut / Offset; one-side).
 
     Knife uses :func:`collect_knife_path_edges_by_side` instead. The two final
     integers are the total number of new path edges and the number that cross
     the mirror plane.
+
+    All-PLANE paths return ``status=ALREADY_SYMMETRIC`` before source-side
+    resolution, independent of the requested AUTO / POSITIVE / NEGATIVE side.
     """
 
     all_path_edges = _discover_path_edges(bm, selected_only=selected_only)
     if not all_path_edges and bm.edges.layers.int.get(EDGE_ORIGINAL_LAYER) is None:
-        return [], None, 0, 0
+        return SourcePathEdges([], None, 0, 0, status="OK", path_edges=[])
+
+    by_side = classify_path_edges_by_side(all_path_edges, axis_index, tolerance)
+    if _path_edges_already_symmetric(by_side):
+        return SourcePathEdges(
+            [],
+            None,
+            len(all_path_edges),
+            0,
+            status=ALREADY_SYMMETRIC,
+            path_edges=list(all_path_edges),
+        )
 
     side, crossing = choose_source_side(all_path_edges, axis_index, tolerance, requested_side)
     if side is None:
-        return [], None, len(all_path_edges), crossing
+        return SourcePathEdges(
+            [],
+            None,
+            len(all_path_edges),
+            crossing,
+            status="UNDETERMINED",
+            path_edges=list(all_path_edges),
+        )
 
-    source_edges = [edge for edge in all_path_edges if _edge_side(edge, axis_index, tolerance) == side]
-    return source_edges, side, len(all_path_edges), crossing
+    return SourcePathEdges(
+        list(by_side[side]),
+        side,
+        len(all_path_edges),
+        crossing,
+        status="OK",
+        path_edges=list(all_path_edges),
+    )
 
 
 def target_face_ids_for_edges(

@@ -81,7 +81,9 @@ CASES = (
     Case("vertex", "EXTRUDE_CONTEXT", "vertex", True, angled_view=True),
     Case("manifold_decline", "EXTRUDE_MANIFOLD", "face", False, "DECLINE"),
     Case("proportional_decline", "EXTRUDE_CONTEXT", "face", False, "DECLINE", proportional=True),
-    Case("plane_origin_decline", "EXTRUDE_CONTEXT", "plane_face", False, "DECLINE"),
+    # Midplane contract v3.1: on-plane origins are adopted; the in-plane drag
+    # exercises the copy-reuse path (mirror shares the seam copies).
+    Case("plane_origin_adopted", "EXTRUDE_CONTEXT", "plane_face", True, "APPLY"),
     Case("hidden_partner_abort", "EXTRUDE_CONTEXT", "face", False, "DECLINE", hidden_partner=True),
     Case("asymmetric_far_adopted", "EXTRUDE_CONTEXT", "face", False, "APPLY", asymmetric="far"),
     Case("asymmetric_partner_decline", "EXTRUDE_CONTEXT", "face", False, "DECLINE", asymmetric="partner"),
@@ -98,6 +100,19 @@ CASES = (
     Case("kmi_exclusion", "EXTRUDE_CONTEXT", "face", True, intercept=True),
     Case("gizmo_then_kmi_grace", "EXTRUDE_CONTEXT", "face", True),
     Case("double_extrude_undo", "EXTRUDE_CONTEXT", "face", None, None),
+    # Midplane contract v3.1: a YZ fin on x=0 is adopted through the
+    # self-deleted region path (F_r includes the consumed face; delete
+    # targets do not). Drag along +X, the face normal.
+    Case(
+        "fin_face",
+        "EXTRUDE_CONTEXT",
+        "fin_face",
+        True,
+        "APPLY",
+        drag=(80, 0),
+        angled_view=True,
+        undo_redo=True,
+    ),
     # The wire fixture stays last: rebuilding a faced grid after the faceless
     # native extrude crashes Blender in the next case's undo sync.
     Case("faceless_bypass_not_adopted", "EXTRUDE_CONTEXT", "wire_edge", False, None, intercept=True),
@@ -230,19 +245,93 @@ def clear_selection(bm):
     bm.select_history.clear()
 
 
+def _native_extrude_z(delta_z):
+    with override():
+        result = bpy.ops.mesh.extrude_region_move(
+            "EXEC_DEFAULT",
+            TRANSFORM_OT_translate={
+                "value": (0.0, 0.0, float(delta_z)),
+                "orient_type": "GLOBAL",
+                "orient_matrix": (
+                    (1.0, 0.0, 0.0),
+                    (0.0, 1.0, 0.0),
+                    (0.0, 0.0, 1.0),
+                ),
+                "orient_matrix_type": "GLOBAL",
+                "constraint_axis": (False, False, True),
+            },
+        )
+    if result != {"FINISHED"}:
+        fail(f"native fin extrude failed: {result}")
+
+
+def add_native_fin_face(obj):
+    """One YZ quad on x=0, raised above a short native stem.
+
+    Isolated bmesh faces plus a later native extrude crash Blender in
+    blender::draw::extract_tris (EXCEPTION_ACCESS_VIOLATION). A disconnected
+    primitive plane keeps the source face (addon declines). A face glued to
+    the x=0 floor seam is 3-manifold (census undefined). Stem + fin keeps
+    the selected face 2-manifold so the self-consumed path can apply.
+    """
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    bpy.context.tool_settings.mesh_select_mode = (False, True, False)
+    clear_selection(bm)
+    grid_edge(bm, (3, 1), (3, 2)).select = True
+    bm.select_flush_mode()
+    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+    _native_extrude_z(0.5)
+    bm = bmesh.from_edit_mesh(obj.data)
+    clear_selection(bm)
+    matches = []
+    for edge in bm.edges:
+        first, second = edge.verts
+        if abs(first.co.x) > 1e-4 or abs(second.co.x) > 1e-4:
+            continue
+        if abs(first.co.z - 0.5) > 1e-4 or abs(second.co.z - 0.5) > 1e-4:
+            continue
+        if abs(first.co.y - second.co.y) < 1e-4:
+            continue
+        ys = (float(first.co.y), float(second.co.y))
+        if min(ys) >= -1.0 - 1e-4 and max(ys) <= 1e-4:
+            matches.append(edge)
+    assert len(matches) == 1, matches
+    matches[0].select = True
+    bm.select_flush_mode()
+    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+    _native_extrude_z(1.0)
+    bm = bmesh.from_edit_mesh(obj.data)
+    for sequence in (bm.verts, bm.edges, bm.faces):
+        sequence.ensure_lookup_table()
+        sequence.index_update()
+    bm.normal_update()
+    return bm
+
+
 def prepare_selection(bm, name):
     clear_selection(bm)
-    if name in {"face", "plane_face", "two_faces", "four_faces", "indiv_faces"}:
+    if name in {"face", "plane_face", "two_faces", "four_faces", "indiv_faces", "fin_face"}:
         bpy.context.tool_settings.mesh_select_mode = (False, False, True)
-        cells = {
-            "face": ((4, 1),),
-            "plane_face": ((3, 1),),
-            "two_faces": ((4, 1), (5, 1)),
-            "four_faces": ((4, 1), (5, 1), (4, 2), (5, 2)),
-            "indiv_faces": ((4, 1), (4, 2)),
-        }[name]
-        for cell in cells:
-            grid_face(bm, *cell).select = True
+        if name == "fin_face":
+            matches = [
+                face
+                for face in bm.faces
+                if all(abs(float(vertex.co.x)) < 1.0e-5 for vertex in face.verts)
+                and max(float(vertex.co.z) for vertex in face.verts) > 0.5
+            ]
+            assert len(matches) == 1, matches
+            matches[0].select = True
+        else:
+            cells = {
+                "face": ((4, 1),),
+                "plane_face": ((3, 1),),
+                "two_faces": ((4, 1), (5, 1)),
+                "four_faces": ((4, 1), (5, 1), (4, 2), (5, 2)),
+                "indiv_faces": ((4, 1), (4, 2)),
+            }[name]
+            for cell in cells:
+                grid_face(bm, *cell).select = True
         bm.select_flush_mode()
     elif name in {"edge_open", "edge_closed"}:
         bpy.context.tool_settings.mesh_select_mode = (False, True, False)
@@ -365,6 +454,8 @@ def build_mesh(case: Case):
     for sequence in (bm.verts, bm.edges, bm.faces):
         sequence.ensure_lookup_table()
         sequence.index_update()
+    if case.selection == "fin_face":
+        bm = add_native_fin_face(obj)
     prepare_selection(bm, case.selection)
     if case.hidden_partner:
         for vertex in bm.verts:
@@ -374,6 +465,7 @@ def build_mesh(case: Case):
         grid_vert(bm, 1, 0).co.y += 0.125
     elif case.asymmetric == "partner":
         grid_vert(bm, 2, 1).co.y += 0.125
+    bm.normal_update()
     bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
     with override():
         result = bpy.ops.ed.undo_push(message=f"YSE gizmo baseline {case.name}")

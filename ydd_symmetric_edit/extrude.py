@@ -208,11 +208,6 @@ def evaluate_prepare_gates(snapshot: ExtrudeSnapshot) -> tuple[str, str]:
     axis = snapshot.axis_index
     tol = snapshot.tolerance
 
-    for vertex_id in snapshot.selected_vertex_ids:
-        coord = preop.get(vertex_id)
-        if coord is not None and abs(coord.component(axis)) <= tol:
-            return "DECLINE", "the extrusion selection includes a vertex on the mirror plane"
-
     selected_vertices = snapshot.selected_vertex_ids
     off_plane = set()
     for vertex_id in selected_vertices:
@@ -1238,6 +1233,157 @@ class ExtrudeApplyAudit:
     source_vert_select: dict[int, bool]
     source_edge_ends: dict[int, frozenset[int]]
     source_face_corners: dict[int, tuple[int, ...]]
+    expected_created: tuple[int, int, int]
+    expected_deleted: tuple[int, int, int]
+    mirror_plan: MirrorActionPlan
+
+
+@dataclass(frozen=True)
+class OriginRef:
+    """Stable-key endpoint referring to an origin vertex."""
+
+    vertex_id: int
+
+
+@dataclass(frozen=True)
+class CopyKey:
+    """Stable-key endpoint referring to one native copy instance."""
+
+    vertex_id: int
+    source_face_signature: tuple[int, ...]
+
+
+@dataclass
+class _CopyPlanEntry:
+    key: CopyKey
+    coordinate: tuple[float, float, float]
+    reuse: bool
+
+
+@dataclass
+class _ElementPlanEntry:
+    """A stable-key edge/face action and its apply-local identity witness."""
+
+    endpoints: tuple[OriginRef | CopyKey, ...]
+    self_witness: bool
+    witness_index: int | None = None
+    face_signature: tuple[tuple[int, str], ...] = ()
+    material_index: int = 0
+    smooth: bool = False
+
+
+@dataclass
+class _DeletePlanEntry:
+    domain: str
+    element_id: int
+    partner: int
+    self_partner: bool
+
+
+@dataclass
+class _MirrorRuntime:
+    """BMesh identity cache paired with one apply-scoped stable-key plan."""
+
+    copy_sources: dict[CopyKey, bmesh.types.BMVert]
+    copy_mirrors: dict[CopyKey, bmesh.types.BMVert]
+    element_sources: dict[int, bmesh.types.BMEdge | bmesh.types.BMFace]
+    witness_tokens: dict[int, int]
+    created: dict[int, bmesh.types.BMEdge | bmesh.types.BMFace]
+    delete_origins: dict[int, object | tuple[object, ...] | None]
+    delete_live: dict[int, object]
+    delete_tokens: dict[int, int]
+    # These are stable rehydration records.  Wrapper caches are rebuilt after
+    # APPLY-layer stamping because layer remove/new invalidates pre-stamp wrappers.
+    copy_source_coords: dict[CopyKey, tuple[float, float, float]]
+    delete_origin_keys: dict[int, tuple[int, ...] | None]
+
+
+@dataclass
+class MirrorActionPlan:
+    """Apply-scoped stable-key plan; BMesh references are only local caches."""
+
+    copies: dict[CopyKey, _CopyPlanEntry]
+    edges: tuple[_ElementPlanEntry, ...]
+    faces: tuple[_ElementPlanEntry, ...]
+    deletes: tuple[_DeletePlanEntry, ...]
+
+    @property
+    def self_witness_edges(self) -> int:
+        return sum(entry.self_witness for entry in self.edges)
+
+    @property
+    def self_witness_faces(self) -> int:
+        return sum(entry.self_witness for entry in self.faces)
+
+    @property
+    def expected_created(self) -> tuple[int, int, int]:
+        return (
+            sum(not entry.reuse for entry in self.copies.values()),
+            len(self.edges) - self.self_witness_edges,
+            len(self.faces) - self.self_witness_faces,
+        )
+
+    @property
+    def expected_deleted(self) -> tuple[int, int, int]:
+        return tuple(
+            sum(entry.domain == domain and not entry.self_partner for entry in self.deletes)
+            for domain in ("VERT", "EDGE", "FACE")
+        )
+
+
+def _self_delete_consumed(bm: bmesh.types.BMesh, entry: _DeletePlanEntry, runtime: _MirrorRuntime) -> bool:
+    """Check native consumption using origin entities, never session-ID liveness."""
+
+    origin_value = runtime.delete_origins.get(id(entry))
+    if entry.domain == "VERT":
+        origin = origin_value
+        return (
+            origin is None or not getattr(origin, "is_valid", False) or not any(vertex is origin for vertex in bm.verts)
+        )
+    if entry.domain == "EDGE":
+        origins = origin_value
+        if not isinstance(origins, tuple) or len(origins) != 2 or any(origin is None for origin in origins):
+            return True
+        first, second = origins
+        if not getattr(first, "is_valid", False) or not getattr(second, "is_valid", False):
+            return True
+        return _edge_between(first, second) is None
+    origins = origin_value
+    if not isinstance(origins, tuple) or not origins or any(origin is None for origin in origins):
+        return True
+    if not all(getattr(origin, "is_valid", False) for origin in origins):
+        return True
+    wanted = tuple(origins)
+    return not any(
+        face.is_valid
+        and len(face.loops) == len(wanted)
+        and _cycle_identity(tuple(loop.vert for loop in face.loops), wanted)
+        for face in bm.faces
+    )
+
+
+def _edge_between(first: bmesh.types.BMVert, second: bmesh.types.BMVert) -> bmesh.types.BMEdge | None:
+    return next((edge for edge in first.link_edges if edge.is_valid and edge.other_vert(first) is second), None)
+
+
+def _edge_identity(edge: bmesh.types.BMEdge, expected: tuple[bmesh.types.BMVert, ...]) -> bool:
+    return len(expected) == 2 and (
+        (edge.verts[0] is expected[0] and edge.verts[1] is expected[1])
+        or (edge.verts[0] is expected[1] and edge.verts[1] is expected[0])
+    )
+
+
+def _cycle_identity(actual: tuple[bmesh.types.BMVert, ...], expected: tuple[bmesh.types.BMVert, ...]) -> bool:
+    """Compare a face cycle by wrapper identity, allowing rotation only."""
+
+    if len(actual) != len(expected):
+        return False
+    if not expected:
+        return not actual
+    return any(
+        all(actual[index] is expected[(index + offset) % len(expected)] for index in range(len(expected)))
+        for offset in range(len(expected))
+    )
 
 
 def apply_mirror(
@@ -1246,7 +1392,7 @@ def apply_mirror(
     classified: ExtrudeClassification,
     description: ExtrudeSourceDescription,
 ) -> tuple[dict[tuple[int, tuple[int, ...]], bmesh.types.BMVert], str | None, ExtrudeApplyAudit | None]:
-    """Delete then build the mirror. Caller owns the backup checkpoint."""
+    """Apply an apply-scoped stable-key plan in the contract's fixed order."""
 
     vertex_layer = bm.verts.layers.int.get(layer_names.VERT_SESSION_ID_LAYER)
     edge_layer = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
@@ -1258,63 +1404,145 @@ def apply_mirror(
     edge_pairs = snapshot.edge_pair_map()
     face_pairs = snapshot.face_pair_map()
     preop = snapshot.vertex_preop_map()
+    snapshot_face_corners = snapshot.face_corner_map()
+    snapshot_edge_endpoints = snapshot.edge_endpoint_map()
 
-    copy_coords = {
-        (inst.vertex_id, inst.source_face_signature): (
-            float(inst.vertex.co.x),
-            float(inst.vertex.co.y),
-            float(inst.vertex.co.z),
+    # 1. Build the stable-key plan before stamping or invalidating wrappers.
+    copy_entries: dict[CopyKey, _CopyPlanEntry] = {}
+    runtime = _MirrorRuntime({}, {}, {}, {}, {}, {}, {}, {}, {}, {})
+    for instance in classified.copy_instances:
+        if not instance.vertex.is_valid:
+            return {}, "a source copy was lost before mirroring", None
+        key = CopyKey(instance.vertex_id, instance.source_face_signature)
+        if key in copy_entries:
+            return {}, "the source copy key is ambiguous", None
+        coordinate = (float(instance.vertex.co.x), float(instance.vertex.co.y), float(instance.vertex.co.z))
+        copy_entries[key] = _CopyPlanEntry(
+            key=key,
+            coordinate=coordinate,
+            reuse=abs(coordinate[snapshot.axis_index]) <= snapshot.tolerance,
         )
-        for inst in classified.copy_instances
-        if inst.vertex.is_valid
-    }
-    edge_specs: list[tuple[tuple[int, str, tuple[int, ...]], tuple[int, str, tuple[int, ...]]]] = []
+        runtime.copy_sources[key] = instance.vertex
+        runtime.copy_source_coords[key] = coordinate
+
+    def _stable_spec(vertex: bmesh.types.BMVert) -> OriginRef | CopyKey | None:
+        vertex_id = int(vertex[vertex_layer])
+        role = _vert_role(vertex, vertex_id, snapshot, classified)
+        if role == "origin":
+            return OriginRef(vertex_id)
+        if role == "copy":
+            instance = _copy_instance_of(classified, vertex)
+            if instance is None:
+                return None
+            return CopyKey(vertex_id, instance.source_face_signature)
+        return None
+
+    def _pre_mapped(spec: OriginRef | CopyKey) -> bmesh.types.BMVert | None:
+        if isinstance(spec, CopyKey):
+            entry = copy_entries.get(spec)
+            return runtime.copy_sources.get(spec) if entry is not None and entry.reuse else None
+        partner = vertex_pairs.get(spec.vertex_id)
+        if partner is None:
+            return None
+        return classified.origins.get(partner)
+
+    bm.edges.index_update()
+    bm.faces.index_update()
+    edge_entries: list[_ElementPlanEntry] = []
     for edge in description.new_edges:
-        if not edge.is_valid:
+        if not edge.is_valid or len(edge.verts) != 2:
             return {}, "a source new edge was lost before mirroring", None
-        ends = []
-        for vertex in edge.verts:
-            vertex_id = int(vertex[vertex_layer])
-            spec = _endpoint_spec(vertex, vertex_id, snapshot, classified)
-            if spec is None:
-                return {}, "a new edge endpoint is not a classified origin or copy", None
-            ends.append(spec)
-        edge_specs.append((ends[0], ends[1]))
+        specs = tuple(_stable_spec(vertex) for vertex in edge.verts)
+        if any(spec is None for spec in specs):
+            return {}, "a new edge endpoint is not a classified origin or copy", None
+        mapped = tuple(_pre_mapped(spec) for spec in specs if spec is not None)
+        witness = (
+            len(mapped) == 2 and all(vertex is not None for vertex in mapped) and _edge_identity(edge, tuple(mapped))  # type: ignore[arg-type]
+        )
+        edge_entry = _ElementPlanEntry(
+            endpoints=specs,  # type: ignore[arg-type]
+            self_witness=witness,
+            witness_index=int(edge.index) if witness else None,
+        )
+        edge_entries.append(edge_entry)
+        runtime.element_sources[id(edge_entry)] = edge
 
     if len(description.face_signatures) != len(description.new_faces):
         return {}, "new-face signatures are not aligned with the source faces", None
-    face_specs: list[tuple[list[tuple[int, str, tuple[int, ...]]], int, bool, tuple[tuple[int, str], ...]]] = []
+    face_entries: list[_ElementPlanEntry] = []
     for face, stored_signature in zip(description.new_faces, description.face_signatures, strict=True):
         if not face.is_valid:
             return {}, "a source new face was lost before mirroring", None
-        corners: list[tuple[int, str, tuple[int, ...]]] = []
-        for loop in face.loops:
-            vertex = loop.vert
-            vertex_id = int(vertex[vertex_layer])
-            spec = _endpoint_spec(vertex, vertex_id, snapshot, classified)
-            if spec is None:
-                return {}, "a new face corner is not a classified origin or copy", None
-            corners.append(spec)
-        live_signature = tuple((vertex_id, role) for vertex_id, role, _signature in corners)
+        specs = tuple(_stable_spec(loop.vert) for loop in face.loops)
+        if any(spec is None for spec in specs):
+            return {}, "a new face corner is not a classified origin or copy", None
+        live_signature = tuple(
+            (spec.vertex_id, "origin") if isinstance(spec, OriginRef) else (spec.vertex_id, "copy")
+            for spec in specs
+            if spec is not None
+        )
         if not _signatures_match(live_signature, stored_signature):
             return {}, "a source new face no longer matches its stored signature", None
-        face_specs.append(
-            (
-                corners,
-                int(face.material_index),
-                bool(face.smooth),
-                stored_signature,
+        mapped = tuple(_pre_mapped(spec) for spec in specs if spec is not None)
+        witness = (
+            len(mapped) == len(face.verts)
+            and all(vertex is not None for vertex in mapped)
+            and _cycle_identity(
+                tuple(loop.vert for loop in face.loops),
+                tuple(mapped),  # type: ignore[arg-type]
             )
         )
+        face_entry = _ElementPlanEntry(
+            endpoints=specs,  # type: ignore[arg-type]
+            self_witness=witness,
+            witness_index=int(face.index) if witness else None,
+            face_signature=stored_signature,
+            material_index=int(face.material_index),
+            smooth=bool(face.smooth),
+        )
+        face_entries.append(face_entry)
+        runtime.element_sources[id(face_entry)] = face
 
+    delete_entries: list[_DeletePlanEntry] = []
+    for face_id in description.deleted_face_ids:
+        partner = face_pairs.get(face_id)
+        if partner is None:
+            continue
+        corners = snapshot.face_corner_map().get(face_id, ())
+        delete_entry = _DeletePlanEntry("FACE", face_id, partner, partner == face_id)
+        delete_entries.append(delete_entry)
+        runtime.delete_origin_keys[id(delete_entry)] = tuple(corners)
+    for marker in description.deleted_edge_markers:
+        partner = edge_pairs.get(marker)
+        if partner is None:
+            continue
+        first, second = snapshot.edge_endpoint_map().get(marker, (None, None))
+        delete_entry = _DeletePlanEntry("EDGE", marker, partner, partner == marker)
+        delete_entries.append(delete_entry)
+        runtime.delete_origin_keys[id(delete_entry)] = (
+            (first, second) if first is not None and second is not None else None
+        )
+    for vertex_id in description.deleted_vertex_ids:
+        partner = vertex_pairs.get(vertex_id)
+        if partner is None:
+            continue
+        delete_entry = _DeletePlanEntry("VERT", vertex_id, partner, partner == vertex_id)
+        delete_entries.append(delete_entry)
+        runtime.delete_origin_keys[id(delete_entry)] = (vertex_id,)
+    plan = MirrorActionPlan(copy_entries, tuple(edge_entries), tuple(face_entries), tuple(delete_entries))
+
+    # 2. Stamp; 3. resolve only non-self deletion entries against live topology.
     token_layers = _stamp_apply_tokens(bm)
+    # Rebuild all lookup tables after layer creation before touching any
+    # apply-local source/witness cache.  Only stable keys cross this point.
+    for sequence in (bm.verts, bm.edges, bm.faces):
+        sequence.ensure_lookup_table()
     before_idents = _element_token_sets(bm, token_layers)
     vertex_layer = bm.verts.layers.int.get(layer_names.VERT_SESSION_ID_LAYER)
     edge_layer = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
     face_layer = bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
     if vertex_layer is None or edge_layer is None or face_layer is None:
         return {}, "temporary topology markers were lost while stamping apply tokens", None
-
     faces_by_id: dict[int, list[bmesh.types.BMFace]] = {}
     for face in bm.faces:
         faces_by_id.setdefault(int(face[face_layer]), []).append(face)
@@ -1323,39 +1551,208 @@ def apply_mirror(
         edges_by_marker.setdefault(int(edge[edge_layer]), []).append(edge)
     verts_by_id = _verts_by_session_id(bm, vertex_layer)
 
-    delete_faces: list[bmesh.types.BMFace] = []
-    for face_id in description.deleted_face_ids:
-        partner = face_pairs.get(face_id)
-        if partner is None:
-            continue
-        matches = faces_by_id.get(partner, [])
-        if len(matches) == 1:
-            delete_faces.append(matches[0])
-        elif len(matches) > 1:
-            return {}, "a deleted face has an ambiguous mirrored counterpart", None
+    def _origin_live(vertex_id: int) -> bmesh.types.BMVert | None:
+        expected = preop.get(vertex_id)
+        if expected is None:
+            return None
+        hits = [
+            vertex
+            for vertex in verts_by_id.get(vertex_id, ())
+            if vertex.is_valid
+            and not any(vertex is copy for copy in runtime.copy_sources.values())
+            and matching.coordinates_match(vertex.co, expected.as_tuple(), snapshot.tolerance)
+        ]
+        return hits[0] if len(hits) == 1 else None
 
-    delete_edges: list[bmesh.types.BMEdge] = []
-    for marker in description.deleted_edge_markers:
-        partner = edge_pairs.get(marker)
-        if partner is None:
-            continue
-        matches = edges_by_marker.get(partner, [])
-        if len(matches) == 1:
-            delete_edges.append(matches[0])
-        elif len(matches) > 1:
-            return {}, "a deleted edge has an ambiguous mirrored counterpart", None
+    def _origin_face_candidate(face: bmesh.types.BMFace, partner: int) -> bool:
+        expected_corners = snapshot_face_corners.get(partner)
+        if expected_corners is None:
+            return False
+        live_corners = tuple(int(loop.vert[vertex_layer]) for loop in face.loops)
+        if not _signatures_match(live_corners, expected_corners):
+            return False
+        return all(_origin_live(int(loop.vert[vertex_layer])) is loop.vert for loop in face.loops)
 
-    delete_verts: list[bmesh.types.BMVert] = []
-    for vertex_id in description.deleted_vertex_ids:
-        partner = vertex_pairs.get(vertex_id)
-        if partner is None:
-            continue
-        matches = verts_by_id.get(partner, [])
-        if len(matches) == 1:
-            delete_verts.append(matches[0])
-        elif len(matches) > 1:
-            return {}, "a deleted vertex has an ambiguous mirrored counterpart", None
+    def _origin_edge_candidate(edge: bmesh.types.BMEdge, partner: int) -> bool:
+        expected_endpoints = snapshot_edge_endpoints.get(partner)
+        if expected_endpoints is None:
+            return False
+        live_endpoints = tuple(int(vertex[vertex_layer]) for vertex in edge.verts)
+        if live_endpoints not in (expected_endpoints, expected_endpoints[::-1]):
+            return False
+        return all(_origin_live(int(vertex[vertex_layer])) is vertex for vertex in edge.verts)
 
+    def _origin_vert_candidate(vertex: bmesh.types.BMVert) -> bool:
+        return _origin_live(int(vertex[vertex_layer])) is vertex
+
+    def _copy_live(key: CopyKey) -> bmesh.types.BMVert | None:
+        expected = runtime.copy_source_coords.get(key)
+        if expected is None:
+            return None
+        candidates = [
+            vertex
+            for vertex in verts_by_id.get(key.vertex_id, ())
+            if vertex.is_valid and matching.coordinates_match(vertex.co, expected, snapshot.tolerance)
+        ]
+        if key.source_face_signature:
+            if snapshot.route == "GIZMO_ADOPTED":
+                # Gizmo caps have FACE_ID == 0 and the adopted snapshot uses
+                # synthetic (negative) face IDs.  Their stable attribution is
+                # the copied cap's vertex-ID cycle, not FACE_ID membership.
+                candidates = [
+                    vertex
+                    for vertex in candidates
+                    if any(
+                        (live_signature := tuple(int(loop.vert[vertex_layer]) for loop in face.loops))
+                        and _signatures_match(live_signature, key.source_face_signature)
+                        and all(
+                            CopyKey(int(loop.vert[vertex_layer]), key.source_face_signature) in plan.copies
+                            for loop in face.loops
+                        )
+                        for face in vertex.link_faces
+                        if face.is_valid
+                    )
+                ]
+            else:
+                face_layer_live = bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
+                if face_layer_live is None:
+                    return None
+                candidates = [
+                    vertex
+                    for vertex in candidates
+                    if any(
+                        int(face[face_layer_live]) in snapshot.selected_face_ids
+                        and _signatures_match(
+                            tuple(int(loop.vert[vertex_layer]) for loop in face.loops),
+                            key.source_face_signature,
+                        )
+                        for face in vertex.link_faces
+                        if face.is_valid
+                    )
+                ]
+        return candidates[0] if len(candidates) == 1 else None
+
+    def _source_of_spec(spec: OriginRef | CopyKey) -> bmesh.types.BMVert | None:
+        return _origin_live(spec.vertex_id) if isinstance(spec, OriginRef) else runtime.copy_sources.get(spec)
+
+    def _source_face_for_entry(entry: _ElementPlanEntry) -> bmesh.types.BMFace | None:
+        corners = tuple(_source_of_spec(spec) for spec in entry.endpoints)
+        if any(vertex is None for vertex in corners):
+            return None
+        expected = tuple(corners)  # type: ignore[arg-type]
+        matches = [
+            face
+            for face in bm.faces
+            if face.is_valid and _cycle_identity(tuple(loop.vert for loop in face.loops), expected)
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    def _rehydrate_after_topology_change(resolve_delete_targets: bool) -> str | None:
+        """Rebuild every wrapper cache after layer creation or native delete."""
+
+        nonlocal vertex_layer, edge_layer, face_layer, verts_by_id, faces_by_id, edges_by_marker
+        for sequence in (bm.verts, bm.edges, bm.faces):
+            sequence.ensure_lookup_table()
+        vertex_layer = bm.verts.layers.int.get(layer_names.VERT_SESSION_ID_LAYER)
+        edge_layer = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
+        face_layer = bm.faces.layers.int.get(layer_names.FACE_ID_LAYER)
+        if vertex_layer is None or edge_layer is None or face_layer is None:
+            return "temporary topology markers were lost while rehydrating apply state"
+        verts_by_id = _verts_by_session_id(bm, vertex_layer)
+        faces_by_id = {}
+        for face in bm.faces:
+            faces_by_id.setdefault(int(face[face_layer]), []).append(face)
+        edges_by_marker = {}
+        for edge in bm.edges:
+            edges_by_marker.setdefault(int(edge[edge_layer]), []).append(edge)
+        runtime.copy_sources.clear()
+        runtime.element_sources.clear()
+        runtime.delete_origins.clear()
+        runtime.delete_live.clear()
+        for key in plan.copies:
+            source = _copy_live(key)
+            if source is None or any(source is other for other in runtime.copy_sources.values()):
+                return "a source copy key was missing or ambiguous after topology change"
+            runtime.copy_sources[key] = source
+        for entry in plan.deletes:
+            keys = runtime.delete_origin_keys.get(id(entry))
+            if keys is None:
+                runtime.delete_origins[id(entry)] = None
+            else:
+                resolved = tuple(_origin_live(vertex_id) for vertex_id in keys)
+                runtime.delete_origins[id(entry)] = resolved[0] if entry.domain == "VERT" else resolved
+        for entry in plan.edges:
+            corners = tuple(_source_of_spec(spec) for spec in entry.endpoints)
+            if any(vertex is None for vertex in corners):
+                return "a source edge could not be rehydrated after topology change"
+            source = _edge_between(corners[0], corners[1])  # type: ignore[arg-type]
+            if source is None:
+                return "a source edge could not be rehydrated after topology change"
+            runtime.element_sources[id(entry)] = source
+        for entry in plan.faces:
+            source = _source_face_for_entry(entry)
+            if source is None:
+                return "a source face could not be rehydrated after topology change"
+            runtime.element_sources[id(entry)] = source
+        if resolve_delete_targets:
+            apply_layers = {
+                "FACE": bm.faces.layers.int.get(layer_names.FACE_APPLY_ID_LAYER),
+                "EDGE": bm.edges.layers.int.get(layer_names.EDGE_APPLY_ID_LAYER),
+                "VERT": bm.verts.layers.int.get(layer_names.VERT_APPLY_ID_LAYER),
+            }
+            if any(layer is None for layer in apply_layers.values()):
+                return "apply identity tokens are missing while resolving delete targets"
+            for entries, sequence, domain in (
+                (plan.edges, bm.edges, "EDGE"),
+                (plan.faces, bm.faces, "FACE"),
+            ):
+                for entry in entries:
+                    if not entry.self_witness:
+                        continue
+                    source = runtime.element_sources.get(id(entry))
+                    witness_index = entry.witness_index
+                    if (
+                        source is None
+                        or witness_index is None
+                        or witness_index < 0
+                        or witness_index >= len(sequence)
+                        or source.index != witness_index
+                    ):
+                        return "a self-witness does not identify the source element"
+                    runtime.witness_tokens[id(entry)] = int(sequence[witness_index][apply_layers[domain]])
+            for entry in plan.deletes:
+                if entry.self_partner:
+                    continue
+                table = {"FACE": faces_by_id, "EDGE": edges_by_marker, "VERT": verts_by_id}[entry.domain]
+                matches = [element for element in table.get(entry.partner, ()) if element.is_valid]
+                if len(matches) > 1:
+                    if entry.domain == "FACE":
+                        matches = [element for element in matches if _origin_face_candidate(element, entry.partner)]
+                    elif entry.domain == "EDGE":
+                        matches = [element for element in matches if _origin_edge_candidate(element, entry.partner)]
+                    else:
+                        matches = [element for element in matches if _origin_vert_candidate(element)]
+                if len(matches) != 1:
+                    return f"a deleted {entry.domain.lower()} has an ambiguous mirrored counterpart"
+                runtime.delete_live[id(entry)] = matches[0]
+                runtime.delete_tokens[id(entry)] = int(matches[0][apply_layers[entry.domain]])
+        return None
+
+    # Rehydrate once after stamping and again immediately after native delete;
+    # bmesh.ops.delete invalidates wrappers and lookup tables a second time.
+    reason = _rehydrate_after_topology_change(True)
+    if reason is not None:
+        return {}, reason, None
+
+    delete_faces = [
+        runtime.delete_live[id(entry)] for entry in plan.deletes if entry.domain == "FACE" and not entry.self_partner
+    ]
+    delete_edges = [
+        runtime.delete_live[id(entry)] for entry in plan.deletes if entry.domain == "EDGE" and not entry.self_partner
+    ]
+    delete_verts = [
+        runtime.delete_live[id(entry)] for entry in plan.deletes if entry.domain == "VERT" and not entry.self_partner
+    ]
     delete_face_set = set(delete_faces)
     delete_edge_set = set(delete_edges)
     delete_vert_set = set(delete_verts)
@@ -1379,6 +1776,7 @@ def apply_mirror(
         if face not in delete_face_set
     }
 
+    # 4. Native deletion order. Self entries are deliberate no-ops.
     if delete_faces:
         bmesh.ops.delete(bm, geom=delete_faces, context="FACES_ONLY")
     if delete_edges:
@@ -1390,89 +1788,150 @@ def apply_mirror(
         if still:
             bmesh.ops.delete(bm, geom=still, context="VERTS")
 
-    bm.verts.ensure_lookup_table()
-    bm.edges.ensure_lookup_table()
-    bm.faces.ensure_lookup_table()
-    vertex_layer = bm.verts.layers.int.get(layer_names.VERT_SESSION_ID_LAYER)
-    if vertex_layer is None:
-        return {}, "the session vertex ID layer was lost during delete", None
+    reason = _rehydrate_after_topology_change(False)
+    if reason is not None:
+        return {}, reason, None
 
+    # 5. Build copies. A copy that landed on the plane reuses its source object.
     mirror_copies: dict[tuple[int, tuple[int, ...]], bmesh.types.BMVert] = {}
-    for copy_key, coord in copy_coords.items():
-        mirrored = matching.mirror_coordinate(Vector(coord), snapshot.axis_index)
-        new_vert = bm.verts.new(mirrored)
-        new_vert.select = False
-        mirror_copies[copy_key] = new_vert
+    for key, entry in plan.copies.items():
+        if entry.reuse:
+            source = runtime.copy_sources[key]
+            if not source.is_valid:
+                return {}, "a reusable source copy was lost during deletion", None
+            mirror = source
+        else:
+            mirror = bm.verts.new(matching.mirror_coordinate(Vector(entry.coordinate), snapshot.axis_index))
+            mirror.select = False
+        runtime.copy_mirrors[key] = mirror
+        mirror_copies[(key.vertex_id, key.source_face_signature)] = mirror
 
     vertex_layer = bm.verts.layers.int.get(layer_names.VERT_SESSION_ID_LAYER)
     if vertex_layer is None:
         return {}, "the session vertex ID layer was lost while creating copies", None
     verts_by_id = _verts_by_session_id(bm, vertex_layer)
 
-    def _mirror_of_spec(vertex_id: int, role: str, signature: tuple[int, ...] = ()) -> bmesh.types.BMVert | None:
-        if role not in {"copy", "origin"}:
-            return None
-        if role == "copy":
-            return mirror_copies.get((vertex_id, signature))
-        partner = vertex_pairs.get(vertex_id)
-        if partner is None:
-            return None
-        matches = [vertex for vertex in verts_by_id.get(partner, []) if vertex.is_valid]
-        if len(matches) == 1:
-            return matches[0]
-        if vertex_id in preop and matches:
-            reflected = matching.mirror_coordinate(Vector(preop[vertex_id].as_tuple()), snapshot.axis_index)
-            stayed = [
-                vertex for vertex in matches if matching.coordinates_match(vertex.co, reflected, snapshot.tolerance)
-            ]
-            if len(stayed) == 1:
-                return stayed[0]
-        return None
+    def _mirror_of_spec(spec: OriginRef | CopyKey) -> bmesh.types.BMVert | None:
+        if isinstance(spec, CopyKey):
+            return runtime.copy_mirrors.get(spec)
+        partner = vertex_pairs.get(spec.vertex_id)
+        return None if partner is None else _origin_live(partner)
 
-    for first_spec, second_spec in edge_specs:
-        first = _mirror_of_spec(*first_spec)
-        second = _mirror_of_spec(*second_spec)
-        if first is None or second is None:
+    # 6. Build elements, skipping only plan-proven self images.
+    for entry in plan.edges:
+        if entry.self_witness:
+            continue
+        endpoints = tuple(_mirror_of_spec(spec) for spec in entry.endpoints)
+        if any(vertex is None for vertex in endpoints):
             return {}, "a mirrored new edge is missing an endpoint", None
-        if first == second:
+        first, second = endpoints
+        if first is second:
             return {}, "a mirrored new edge would be degenerate", None
-        existing = next((candidate for candidate in first.link_edges if candidate.other_vert(first) is second), None)
-        if existing is not None:
+        if _edge_between(first, second) is not None:
             return {}, "a mirrored new edge already exists", None
         try:
-            bm.edges.new((first, second))
+            runtime.created[id(entry)] = bm.edges.new((first, second))
         except ValueError:
             return {}, "a mirrored new edge already exists", None
-
-    for corners, material_index, smooth, stored_signature in face_specs:
-        mirror_corners = []
-        for vertex_id, role, signature in corners:
-            mapped = _mirror_of_spec(vertex_id, role, signature)
-            if mapped is None:
-                return {}, "a mirrored new face is missing a corner", None
-            mirror_corners.append(mapped)
+    for entry in plan.faces:
+        if entry.self_witness:
+            continue
+        mirror_corners = tuple(_mirror_of_spec(spec) for spec in entry.endpoints)
+        if any(vertex is None for vertex in mirror_corners):
+            return {}, "a mirrored new face is missing a corner", None
         if len(set(mirror_corners)) != len(mirror_corners):
             return {}, "the mirrored extrude face would be degenerate", None
+        vertex_layer = bm.verts.layers.int.get(layer_names.VERT_SESSION_ID_LAYER)
         source_face, locate_reason = _locate_face_by_signature(
-            bm,
-            stored_signature,
-            vertex_layer,
-            snapshot,
-            classified,
+            bm, entry.face_signature, vertex_layer, snapshot, classified
         )
         if source_face is None:
             return {}, locate_reason or "a source new face could not be relocated after mirroring", None
-        source_loops = list(source_face.loops)
         try:
-            mirror_face = bm.faces.new(list(reversed(mirror_corners)))
+            runtime.created[id(entry)] = bm.faces.new(list(reversed(mirror_corners)))
         except ValueError:
             return {}, "the mirrored extrude face already exists", None
-        mirror_face.material_index = material_index
-        mirror_face.smooth = smooth
-        mirror_face.select = False
-        for mirror_loop, source_loop in zip(mirror_face.loops, reversed(source_loops), strict=True):
+        created_face = runtime.created[id(entry)]
+        created_face.material_index = entry.material_index
+        created_face.smooth = entry.smooth
+        created_face.select = False
+        for mirror_loop, source_loop in zip(created_face.loops, reversed(tuple(source_face.loops)), strict=True):
             mirror_loop.copy_from(source_loop)
-        mirror_face.normal_update()
+        created_face.normal_update()
+
+    # 7. Element postconditions, self-consumption predicates, then census.
+    for entry in (*plan.edges, *plan.faces):
+        if entry.self_witness:
+            source = runtime.element_sources.get(id(entry))
+            witness_token = runtime.witness_tokens.get(id(entry))
+            sequence = bm.edges if isinstance(source, bmesh.types.BMEdge) else bm.faces
+            apply_layer = sequence.layers.int.get(
+                layer_names.EDGE_APPLY_ID_LAYER
+                if isinstance(source, bmesh.types.BMEdge)
+                else layer_names.FACE_APPLY_ID_LAYER
+            )
+            if (
+                source is None
+                or not source.is_valid
+                or witness_token is None
+                or apply_layer is None
+                or source not in sequence
+                or int(source[apply_layer]) != witness_token
+                or id(entry) in runtime.created
+            ):
+                return {}, "a self-witness does not identify the source element", None
+            mapped = tuple(_mirror_of_spec(spec) for spec in entry.endpoints)
+            if any(vertex is None for vertex in mapped):
+                return {}, "a self-witness has no live mirrored image", None
+            if isinstance(source, bmesh.types.BMEdge):
+                if not _edge_identity(source, tuple(mapped)):  # type: ignore[arg-type]
+                    return {}, "a self-witness does not match its mirrored image", None
+            elif not (
+                _cycle_identity(tuple(loop.vert for loop in source.loops), tuple(mapped))
+                or _cycle_identity(tuple(loop.vert for loop in source.loops), tuple(reversed(mapped)))
+            ):
+                return {}, "a self-witness does not match its mirrored image", None
+            continue
+        if id(entry) in runtime.witness_tokens:
+            return {}, "a non-self mirror entry unexpectedly has a self-witness", None
+        created = runtime.created.get(id(entry))
+        if created is None or not created.is_valid:
+            return {}, "a mirrored element was not created exactly once", None
+        mapped = tuple(_mirror_of_spec(spec) for spec in entry.endpoints)
+        if any(vertex is None for vertex in mapped):
+            return {}, "a mirrored element does not match its planned image", None
+        if isinstance(created, bmesh.types.BMEdge):
+            if not _edge_identity(created, tuple(mapped)):  # type: ignore[arg-type]
+                return {}, "a mirrored element does not match its planned image", None
+            edge_apply = bm.edges.layers.int.get(layer_names.EDGE_APPLY_ID_LAYER)
+            if edge_apply is None or int(created[edge_apply]) != 0:
+                return {}, "a created mirrored edge retained an apply token", None
+        else:
+            actual = tuple(loop.vert for loop in created.loops)
+            expected_cycle = tuple(reversed(tuple(mapped)))
+            if not _cycle_identity(actual, expected_cycle):  # type: ignore[arg-type]
+                return {}, "a mirrored element does not match its planned image", None
+            face_apply = bm.faces.layers.int.get(layer_names.FACE_APPLY_ID_LAYER)
+            if face_apply is None or int(created[face_apply]) != 0:
+                return {}, "a created mirrored face retained an apply token", None
+    for entry in plan.deletes:
+        if not entry.self_partner:
+            token = runtime.delete_tokens.get(id(entry))
+            layer_name = {
+                "FACE": layer_names.FACE_APPLY_ID_LAYER,
+                "EDGE": layer_names.EDGE_APPLY_ID_LAYER,
+                "VERT": layer_names.VERT_APPLY_ID_LAYER,
+            }.get(entry.domain)
+            sequence = {"FACE": bm.faces, "EDGE": bm.edges, "VERT": bm.verts}.get(entry.domain)
+            if token is None or layer_name is None or sequence is None:
+                return {}, "a non-self deletion target has no recorded apply token", None
+            layer = sequence.layers.int.get(layer_name)
+            if layer is None:
+                return {}, "apply identity tokens are missing for a deletion postcondition", None
+            if any(element.is_valid and int(element[layer]) == token for element in sequence):
+                return {}, "a non-self deletion target survived mirroring", None
+        if entry.self_partner and not _self_delete_consumed(bm, entry, runtime):
+            return {}, "a self deletion target was not consumed by the native extrude", None
 
     token_layers = (
         bm.verts.layers.int.get(layer_names.VERT_APPLY_ID_LAYER),
@@ -1483,11 +1942,7 @@ def apply_mirror(
         return {}, "apply identity tokens were lost during mirroring", None
     after_idents = _element_token_sets(bm, token_layers)
     created = _count_untokened(bm, token_layers)
-    deleted = (
-        len(before_idents[0] - after_idents[0]),
-        len(before_idents[1] - after_idents[1]),
-        len(before_idents[2] - after_idents[2]),
-    )
+    deleted = tuple(len(before_idents[index] - after_idents[index]) for index in range(3))
     audit = ExtrudeApplyAudit(
         created=created,
         deleted=deleted,
@@ -1495,6 +1950,9 @@ def apply_mirror(
         source_vert_select=source_vert_select,
         source_edge_ends=source_edge_ends,
         source_face_corners=source_face_corners,
+        expected_created=plan.expected_created,
+        expected_deleted=plan.expected_deleted,
+        mirror_plan=plan,
     )
     return mirror_copies, None, audit
 
@@ -1547,21 +2005,23 @@ def verify_mirror(
 ) -> str | None:
     """Verify mirror census, reflection, and source-side stationarity."""
 
-    if audit.created != description.created or audit.deleted != description.deleted:
+    if audit.created != audit.expected_created or audit.deleted != audit.expected_deleted:
         return (
-            f"mirror census {audit.created}/{audit.deleted} does not match source "
-            f"{description.created}/{description.deleted}"
+            f"mirror census {audit.created}/{audit.deleted} does not match plan "
+            f"{audit.expected_created}/{audit.expected_deleted}"
         )
     audit_net = (
         audit.created[0] - audit.deleted[0],
         audit.created[1] - audit.deleted[1],
         audit.created[2] - audit.deleted[2],
     )
-    if audit_net != description.net:
-        return f"mirror net {audit_net} does not match source {description.net}"
+    expected_net = tuple(audit.expected_created[index] - audit.expected_deleted[index] for index in range(3))
+    if audit_net != expected_net:
+        return f"mirror net {audit_net} does not match plan {expected_net}"
 
-    if len(mirror_copies) != len(description.new_verts):
-        return "mirrored new vertex count does not match the source"
+    expected_copy_keys = {(key.vertex_id, key.source_face_signature) for key in audit.mirror_plan.copies}
+    if set(mirror_copies) != expected_copy_keys:
+        return "mirrored copy keys do not match the plan"
     vertex_layer = bm.verts.layers.int.get(layer_names.VERT_SESSION_ID_LAYER)
     if vertex_layer is None:
         return "the session vertex ID layer is missing"
@@ -1619,9 +2079,17 @@ def verify_mirror(
         expected_source = source_copy_coords.get(copy_key)
         if expected_source is None:
             return "a mirrored copy has no recorded source coordinate"
-        reflected = matching.mirror_coordinate(Vector(expected_source), snapshot.axis_index)
-        if not matching.coordinates_match(mirror.co, reflected, snapshot.tolerance):
-            return "a mirrored copy is not a reflection of the source copy"
+        plan_key = CopyKey(copy_key[0], copy_key[1])
+        plan_entry = audit.mirror_plan.copies.get(plan_key)
+        if plan_entry is None:
+            return "a mirrored copy has no plan entry"
+        if plan_entry.reuse:
+            if abs(float(mirror.co[snapshot.axis_index])) > snapshot.tolerance:
+                return "a reusable mirrored copy is not on the mirror plane"
+        else:
+            reflected = matching.mirror_coordinate(Vector(expected_source), snapshot.axis_index)
+            if not matching.coordinates_match(mirror.co, reflected, snapshot.tolerance):
+                return "a mirrored copy is not a reflection of the source copy"
     return None
 
 

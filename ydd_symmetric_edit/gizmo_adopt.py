@@ -46,10 +46,20 @@ class _ReadPlan:
     survivor_edges: set[bmesh.types.BMEdge]
     new_edges: set[bmesh.types.BMEdge]
     edge_partner: dict[bmesh.types.BMEdge, bmesh.types.BMEdge]
+    # Logical source edges consumed by native extrusion.  This is deliberately
+    # separate from deleted_edge_targets, which contains only live distinct
+    # mirror edges that the addon must delete during apply.
+    source_deleted_edge_pairs: tuple[tuple[bmesh.types.BMVert, bmesh.types.BMVert], ...]
     deleted_edge_targets: tuple[bmesh.types.BMEdge, ...]
     survivor_faces: set[bmesh.types.BMFace]
     new_faces: set[bmesh.types.BMFace]
     face_partner: dict[bmesh.types.BMFace, bmesh.types.BMFace]
+    region_faces: tuple[tuple[bmesh.types.BMVert, ...], ...]
+    # Logical source E_r endpoint pairs.  Pairs may have no live BMesh edge
+    # after native self-consumption and are materialized as synthetic markers
+    # during snapshot stamping.
+    region_edge_pairs: tuple[tuple[bmesh.types.BMVert, bmesh.types.BMVert], ...]
+    self_region_cycles: tuple[tuple[bmesh.types.BMVert, ...], ...]
     deleted_face_targets: tuple[bmesh.types.BMFace, ...]
     selected_copy_edges: tuple[bmesh.types.BMEdge, ...]
     copy_source_cycles: dict[bmesh.types.BMVert, tuple[bmesh.types.BMVert, ...]]
@@ -403,8 +413,6 @@ def _build_read_plan(bm, axis_index: int, tolerance: float, kind: str, mesh_sele
         if len(origins) > 1:
             return None, "a copy has multiple surviving rail origins"
         origin = next(iter(origins))
-        if abs(float(origin.co[axis_index])) <= tolerance:
-            return None, "the extrusion selection includes a vertex on the mirror plane"
         copy_origin[copy] = origin
 
     # Mirror counterparts are resolved only for the origins; the rest of the
@@ -418,11 +426,12 @@ def _build_read_plan(bm, axis_index: int, tolerance: float, kind: str, mesh_sele
         if index is None:
             return None, "an extrusion origin has no unique mirrored counterpart"
         partner = survivor_list[index]
-        if partner is origin or partner.hide:
+        if partner is not origin and partner.hide:
             return None, "an extrusion origin has a missing or hidden mirror vertex"
         vertex_partner[origin] = partner
         vertex_partner[partner] = origin
-    if len({vertex_partner[origin].index for origin in origin_list}) != len(origin_list):
+    off_plane_origins = [origin for origin in origin_list if vertex_partner[origin] is not origin]
+    if len({vertex_partner[origin].index for origin in off_plane_origins}) != len(off_plane_origins):
         return None, "the extrusion origins do not have distinct mirror vertices"
 
     new_edges = {edge for edge in bm.edges if any(vertex in copies for vertex in edge.verts)}
@@ -433,6 +442,10 @@ def _build_read_plan(bm, axis_index: int, tolerance: float, kind: str, mesh_sele
     edge_partner: dict[bmesh.types.BMEdge, bmesh.types.BMEdge] = {}
     face_partner: dict[bmesh.types.BMFace, bmesh.types.BMFace] = {}
     deleted_edge_targets: tuple[bmesh.types.BMEdge, ...] = ()
+    source_deleted_edge_pairs: tuple[tuple[bmesh.types.BMVert, bmesh.types.BMVert], ...] = ()
+    region_faces: tuple[tuple[bmesh.types.BMVert, ...], ...] = ()
+    region_edge_pairs: tuple[tuple[bmesh.types.BMVert, bmesh.types.BMVert], ...] = ()
+    self_region_cycles: tuple[tuple[bmesh.types.BMVert, ...], ...] = ()
     deleted_face_targets: tuple[bmesh.types.BMFace, ...] = ()
 
     selected_copy_edges = tuple(
@@ -442,42 +455,87 @@ def _build_read_plan(bm, axis_index: int, tolerance: float, kind: str, mesh_sele
     if mesh_select_mode.faces:
         caps = [face for face in new_faces if all(vertex in copies for vertex in face.verts)]
         targets: list[bmesh.types.BMFace] = []
+        regions: list[tuple[bmesh.types.BMVert, ...]] = []
+        self_cycles: list[tuple[bmesh.types.BMVert, ...]] = []
         seen_targets: set[int] = set()
         for cap in caps:
             source_cycle = tuple(copy_origin[loop.vert] for loop in cap.loops)
-            if _face_with_cycle(source_cycle[0], source_cycle):
-                return None, "a cap face still has its live source face"
+            all_self = all(vertex_partner[origin] is origin for origin in source_cycle)
+            # A cap is valid only when native consumed the source face.  This
+            # check is also retained for all-self caps: a live source face is
+            # not evidence of a successful self-consumption.
+            source_matches = _face_with_cycle(source_cycle[0], source_cycle)
+            if source_matches:
+                return None, "the source region face was not consumed by the native extrusion"
+            regions.append(source_cycle)
+            if all_self:
+                self_cycles.append(source_cycle)
             mirror_cycle = tuple(vertex_partner[vertex] for vertex in reversed(source_cycle))
-            matches = _face_with_cycle(mirror_cycle[0], mirror_cycle)
-            if len(matches) != 1:
-                return None, "the mirrored region face is missing or ambiguous"
-            target = matches[0]
-            if target.hide:
-                return None, "a mirrored region counterpart is hidden"
-            if target.index in seen_targets:
-                return None, "cap faces do not bijectively match the reconstructed deleted faces"
-            seen_targets.add(target.index)
-            targets.append(target)
+            if not all_self:
+                matches = _face_with_cycle(mirror_cycle[0], mirror_cycle)
+                if len(matches) != 1:
+                    return None, "the mirrored region face is missing or ambiguous"
+                target = matches[0]
+                if target.hide:
+                    return None, "a mirrored region counterpart is hidden"
+                if target.index in seen_targets:
+                    return None, "cap faces do not bijectively match the reconstructed deleted faces"
+                seen_targets.add(target.index)
+                targets.append(target)
             if kind == "EXTRUDE_FACES_INDIV":
                 for copy in cap.verts:
                     if copy in copy_source_cycles:
                         return None, "an individual-face copy belongs to multiple cap faces"
                     copy_source_cycles[copy] = source_cycle
+        region_faces = tuple(regions)
+        self_region_cycles = tuple(self_cycles)
         deleted_face_targets = tuple(targets)
-        region_edges = {edge for face in deleted_face_targets for edge in face.edges}
+        # Build E_r from logical source endpoint pairs.  Combining live
+        # source and live target wrappers double-counts off-plane edges and
+        # loses internal edges consumed by an all-self region.
+        logical_pairs: dict[frozenset[bmesh.types.BMVert], tuple[bmesh.types.BMVert, bmesh.types.BMVert]] = {}
+        for cycle in region_faces:
+            for first, second in zip(cycle, cycle[1:] + cycle[:1], strict=True):
+                logical_pairs.setdefault(frozenset((first, second)), (first, second))
+        for target in deleted_face_targets:
+            for edge in target.edges:
+                first = vertex_partner.get(edge.verts[0])
+                second = vertex_partner.get(edge.verts[1])
+                if first is None or second is None:
+                    return None, "the mirrored region face is missing or ambiguous"
+                logical_pairs.setdefault(frozenset((first, second)), (first, second))
+        region_edge_pairs = tuple(logical_pairs.values())
         deleted_edges: list[bmesh.types.BMEdge] = []
-        for edge in region_edges:
-            first = vertex_partner.get(edge.verts[0])
-            second = vertex_partner.get(edge.verts[1])
-            if first is None or second is None:
-                return None, "the mirrored region face is missing or ambiguous"
+        source_deleted: list[tuple[bmesh.types.BMVert, bmesh.types.BMVert]] = []
+        seen_deleted_edges: set[int] = set()
+        for first, second in region_edge_pairs:
             source_edge = _edge_between(first, second)
             if source_edge is None:
-                deleted_edges.append(edge)
-            else:
-                if edge.hide:
+                source_deleted.append((first, second))
+                target = _edge_between(vertex_partner[first], vertex_partner[second])
+                if target is None:
+                    if vertex_partner[first] is first and vertex_partner[second] is second:
+                        # Self-consumed source edge: represented by a
+                        # synthetic source marker, with no live delete target.
+                        continue
+                    return None, "the mirrored region edge is missing or ambiguous"
+                if target.hide:
                     return None, "a mirrored region counterpart is hidden"
-                edge_partner[source_edge] = edge
+                if target.index not in seen_deleted_edges:
+                    seen_deleted_edges.add(target.index)
+                    deleted_edges.append(target)
+            else:
+                target = _edge_between(vertex_partner[first], vertex_partner[second])
+                if target is source_edge:
+                    # An on-plane source edge maps to itself.  Keep the
+                    # self-partner explicit so the reconstructed region
+                    # census can account for this live edge pair.
+                    edge_partner[source_edge] = source_edge
+                elif target is not None:
+                    if target.hide:
+                        return None, "a mirrored region counterpart is hidden"
+                    edge_partner[source_edge] = target
+        source_deleted_edge_pairs = tuple(source_deleted)
         deleted_edge_targets = tuple(deleted_edges)
     elif mesh_select_mode.edges:
         if not selected_copy_edges:
@@ -505,20 +563,19 @@ def _build_read_plan(bm, axis_index: int, tolerance: float, kind: str, mesh_sele
     # Structural bijections bound every element, and this pins the totals to
     # the per-kind generation formulas so a shape outside them cannot adopt.
     live_created = (len(copies), len(new_edges), len(new_faces))
-    live_deleted = (0, len(deleted_edge_targets), len(deleted_face_targets))
+    live_deleted = (0, len(source_deleted_edge_pairs), len(region_faces))
     if mesh_select_mode.faces and kind == "EXTRUDE_FACES_INDIV":
-        corner_total = sum(len(face.verts) for face in deleted_face_targets)
-        expected_created = (corner_total, 2 * corner_total, corner_total + len(deleted_face_targets))
-        expected_deleted = (0, 0, len(deleted_face_targets))
+        corner_total = sum(len(cycle) for cycle in region_faces)
+        expected_created = (corner_total, 2 * corner_total, corner_total + len(region_faces))
+        expected_deleted = (0, 0, len(region_faces))
     elif mesh_select_mode.faces:
-        region_vertices = set(copy_origin.values())
-        region_edges = {edge for face in deleted_face_targets for edge in face.edges}
+        region_vertices = {vertex for cycle in region_faces for vertex in cycle}
         expected_created = (
             len(region_vertices),
-            len(region_vertices) + len(region_edges),
-            (len(region_edges) - len(deleted_edge_targets)) + len(deleted_face_targets),
+            len(region_vertices) + len(region_edge_pairs),
+            (len(region_edge_pairs) - len(source_deleted_edge_pairs)) + len(region_faces),
         )
-        expected_deleted = (0, len(deleted_edge_targets), len(deleted_face_targets))
+        expected_deleted = (0, len(source_deleted_edge_pairs), len(region_faces))
     elif mesh_select_mode.edges:
         expected_created = (len(copies), len(copies) + len(selected_copy_edges), len(selected_copy_edges))
         expected_deleted = (0, 0, 0)
@@ -537,10 +594,14 @@ def _build_read_plan(bm, axis_index: int, tolerance: float, kind: str, mesh_sele
             survivor_edges=survivor_edges,
             new_edges=new_edges,
             edge_partner=edge_partner,
+            source_deleted_edge_pairs=source_deleted_edge_pairs,
             deleted_edge_targets=deleted_edge_targets,
             survivor_faces=survivor_faces,
             new_faces=new_faces,
             face_partner=face_partner,
+            region_faces=region_faces,
+            region_edge_pairs=region_edge_pairs,
+            self_region_cycles=self_region_cycles,
             deleted_face_targets=deleted_face_targets,
             selected_copy_edges=selected_copy_edges,
             copy_source_cycles=copy_source_cycles,
@@ -566,10 +627,14 @@ def _plan_to_indices(plan: _ReadPlan) -> dict:
         "survivor_edges": [edge.index for edge in plan.survivor_edges],
         "new_edges": [edge.index for edge in plan.new_edges],
         "edge_partner": [(key.index, value.index) for key, value in plan.edge_partner.items()],
+        "source_deleted_edge_pairs": [[first.index, second.index] for first, second in plan.source_deleted_edge_pairs],
         "deleted_edge_targets": [edge.index for edge in plan.deleted_edge_targets],
         "survivor_faces": [face.index for face in plan.survivor_faces],
         "new_faces": [face.index for face in plan.new_faces],
         "face_partner": [(key.index, value.index) for key, value in plan.face_partner.items()],
+        "region_faces": [[vertex.index for vertex in cycle] for cycle in plan.region_faces],
+        "region_edge_pairs": [[first.index, second.index] for first, second in plan.region_edge_pairs],
+        "self_region_cycles": [[vertex.index for vertex in cycle] for cycle in plan.self_region_cycles],
         "deleted_face_targets": [face.index for face in plan.deleted_face_targets],
         "selected_copy_edges": [edge.index for edge in plan.selected_copy_edges],
         "copy_source_cycles": [
@@ -589,10 +654,16 @@ def _plan_from_indices(bm, data: dict, mesh_select_mode: MeshSelectionMode) -> _
         survivor_edges={edges[index] for index in data["survivor_edges"]},
         new_edges={edges[index] for index in data["new_edges"]},
         edge_partner={edges[key]: edges[value] for key, value in data["edge_partner"]},
+        source_deleted_edge_pairs=tuple(
+            (verts[first], verts[second]) for first, second in data["source_deleted_edge_pairs"]
+        ),
         deleted_edge_targets=tuple(edges[index] for index in data["deleted_edge_targets"]),
         survivor_faces={faces[index] for index in data["survivor_faces"]},
         new_faces={faces[index] for index in data["new_faces"]},
         face_partner={faces[key]: faces[value] for key, value in data["face_partner"]},
+        region_faces=tuple(tuple(verts[index] for index in cycle) for cycle in data["region_faces"]),
+        region_edge_pairs=tuple((verts[first], verts[second]) for first, second in data["region_edge_pairs"]),
+        self_region_cycles=tuple(tuple(verts[index] for index in cycle) for cycle in data["self_region_cycles"]),
         deleted_face_targets=tuple(faces[index] for index in data["deleted_face_targets"]),
         selected_copy_edges=tuple(edges[index] for index in data["selected_copy_edges"]),
         copy_source_cycles={
@@ -652,23 +723,46 @@ def _stamp_and_snapshot(
             face_ids[face] = face_id
             next_id += 1
 
+    edge_pairs = [(edge_ids[edge], edge_ids[partner]) for edge, partner in plan.edge_partner.items()]
+    edge_endpoints = [
+        (edge_ids[edge], (vertex_ids[edge.verts[0]], vertex_ids[edge.verts[1]])) for edge in plan.survivor_edges
+    ]
     synthetic_edges = {edge: -(index + 1) for index, edge in enumerate(plan.deleted_edge_targets)}
     synthetic_faces = {face: -(index + 1) for index, face in enumerate(plan.deleted_face_targets)}
+    synthetic_self_face_ids = {
+        cycle: -(len(synthetic_faces) + index + 1) for index, cycle in enumerate(plan.self_region_cycles)
+    }
+    # Source edges consumed by native extrusion are represented by a negative
+    # source marker.  Distinct targets are paired with that marker; an
+    # all-self pair has no live target and is recorded as a self-pair.
+    endpoint_to_marker = {frozenset(endpoints): marker for marker, endpoints in edge_endpoints}
+    for target, synthetic in synthetic_edges.items():
+        source = tuple(vertex_ids[plan.vertex_partner[vertex]] for vertex in target.verts)
+        endpoint_to_marker[frozenset(source)] = synthetic
+    synthetic_self_edge_pairs: dict[tuple[bmesh.types.BMVert, bmesh.types.BMVert], int] = {}
+    next_synthetic_edge = len(synthetic_edges) + 1
+    for first, second in plan.source_deleted_edge_pairs:
+        source_ids = frozenset((vertex_ids[first], vertex_ids[second]))
+        if source_ids in endpoint_to_marker:
+            continue
+        marker = -next_synthetic_edge
+        next_synthetic_edge += 1
+        synthetic_self_edge_pairs[(first, second)] = marker
+        endpoint_to_marker[source_ids] = marker
     vertex_preop = tuple(
         (vertex_ids[vertex], Coordinate3D(float(vertex.co.x), float(vertex.co.y), float(vertex.co.z)))
         for vertex in plan.survivors
     )
     vertex_pairs = tuple((vertex_ids[vertex], vertex_ids[partner]) for vertex, partner in plan.vertex_partner.items())
 
-    edge_pairs = [(edge_ids[edge], edge_ids[partner]) for edge, partner in plan.edge_partner.items()]
-    edge_endpoints = [
-        (edge_ids[edge], (vertex_ids[edge.verts[0]], vertex_ids[edge.verts[1]])) for edge in plan.survivor_edges
-    ]
     for target, synthetic in synthetic_edges.items():
         target_id = edge_ids[target]
         edge_pairs.extend(((synthetic, target_id), (target_id, synthetic)))
         source = tuple(vertex_ids[plan.vertex_partner[vertex]] for vertex in target.verts)
         edge_endpoints.append((synthetic, (source[0], source[1])))
+    for (first, second), synthetic in synthetic_self_edge_pairs.items():
+        edge_pairs.append((synthetic, synthetic))
+        edge_endpoints.append((synthetic, (vertex_ids[first], vertex_ids[second])))
 
     face_pairs = [(face_ids[face], face_ids[partner]) for face, partner in plan.face_partner.items()]
     face_corners = [
@@ -679,9 +773,12 @@ def _stamp_and_snapshot(
         face_pairs.extend(((synthetic, target_id), (target_id, synthetic)))
         source = tuple(vertex_ids[plan.vertex_partner[loop.vert]] for loop in reversed(target.loops))
         face_corners.append((synthetic, source))
+    for cycle, synthetic in synthetic_self_face_ids.items():
+        source = tuple(vertex_ids[vertex] for vertex in cycle)
+        face_pairs.append((synthetic, synthetic))
+        face_corners.append((synthetic, source))
 
     origin_ids = frozenset(vertex_ids[origin] for origin in plan.copy_origin.values())
-    all_preop_edges = dict(edge_endpoints)
     if plan.mesh_select_mode.edges:
         region_edge_markers = frozenset(
             edge_ids[_edge_between(plan.copy_origin[edge.verts[0]], plan.copy_origin[edge.verts[1]])]
@@ -689,16 +786,23 @@ def _stamp_and_snapshot(
         )
     elif plan.mesh_select_mode.faces:
         region_edge_markers = frozenset(
-            marker
-            for marker, endpoints in all_preop_edges.items()
-            if endpoints[0] in origin_ids and endpoints[1] in origin_ids
+            endpoint_to_marker[frozenset((vertex_ids[first], vertex_ids[second]))]
+            for first, second in plan.region_edge_pairs
         )
     else:
         region_edge_markers = frozenset()
-    region_face_ids = frozenset(synthetic_faces.values()) if plan.mesh_select_mode.faces else frozenset()
+    region_face_ids = (
+        frozenset((*synthetic_faces.values(), *synthetic_self_face_ids.values()))
+        if plan.mesh_select_mode.faces
+        else frozenset()
+    )
 
     created = (len(plan.copies), len(plan.new_edges), len(plan.new_faces))
-    deleted = (0, len(synthetic_edges), len(synthetic_faces))
+    deleted = (
+        0,
+        len(synthetic_edges) + len(synthetic_self_edge_pairs),
+        len(synthetic_faces) + len(synthetic_self_face_ids),
+    )
     net = (
         created[0] - deleted[0],
         created[1] - deleted[1],
@@ -706,8 +810,8 @@ def _stamp_and_snapshot(
     )
     expected_preop = (
         len(plan.survivors),
-        len(plan.survivor_edges) + len(synthetic_edges),
-        len(plan.survivor_faces) + len(synthetic_faces),
+        len(plan.survivor_edges) + len(synthetic_edges) + len(synthetic_self_edge_pairs),
+        len(plan.survivor_faces) + len(synthetic_faces) + len(synthetic_self_face_ids),
     )
 
     copy_keys = []
