@@ -14,8 +14,7 @@ Serialized cases on an X-symmetric grid plane:
 2. multiisland  two disjoint paths ripped by one V: both mirrored.
 3. zeromove   V then immediate LMB: mirrored zero-width slit.
 4. esc        V then ESC: native keeps the rip (R0 §5-5), mirror follows.
-5. onplane    selection touches the mirror plane: no session, native-only
-              result passes through unchanged (WARNING path).
+5. onplane    pure on-plane vertex: accepted self V-open, result is X-symmetric.
 """
 
 from __future__ import annotations
@@ -295,12 +294,12 @@ def verify_zero_width(bm):
     assert_layers_removed(bm)
 
 
-def verify_onplane_passthrough(bm):
-    # Native rip ran unmirrored: source side ripped, mirror side untouched,
-    # so the vertex multiset is NOT X-symmetric and no layer remains.
+def verify_onplane_accepted(bm):
+    # Pure on-plane vertex: V-open is coordinate-only, so native's single
+    # duplicate is the only new vertex and the result is X-symmetric.
     dv = len(bm.verts) - STATE["baseline"][0]
-    assert dv == 2, f"expected native-only rip to add 2 vertices, got {dv}"
-    assert vertex_multiset(bm) != mirrored_multiset(bm), "on-plane rip should not be mirrored"
+    assert dv == 1, f"expected 1 new vertex (self V-open), got {dv}"
+    assert_x_symmetric(bm)
     assert_layers_removed(bm)
 
 
@@ -328,9 +327,9 @@ def start_test():
             run_case("esc", [(4, 2)], (3.6, 2), verify_zero_width, confirm="ESC"),
             run_case(
                 "onplane",
-                [(3, 2), (4, 2)],
+                [(3, 2)],
                 (3.6, 2),
-                verify_onplane_passthrough,
+                verify_onplane_accepted,
             ),
         ]
         run_all(cases)

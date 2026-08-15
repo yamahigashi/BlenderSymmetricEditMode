@@ -254,7 +254,8 @@ def _finish_rip_session(
 
     if reason is not None:
         level = {"ERROR"} if backup_creation_failed or rollback_failed else {"WARNING"}
-        _finish_report(operator, level, f"ydd Symmetric Edit: Rip was not mirrored: {reason}")
+        hint = "" if backup_creation_failed or rollback_failed else " (native kept; mirror manually or undo)"
+        _finish_report(operator, level, f"ydd Symmetric Edit: Rip was not mirrored: {reason}{hint}")
     else:
         _finish_report(operator, {"INFO"}, f"Mirrored Rip across {mirrored_count} seam edge(s)")
         _maybe_extend_selection_to_mirror(obj, session.axis_index, session.tolerance)
