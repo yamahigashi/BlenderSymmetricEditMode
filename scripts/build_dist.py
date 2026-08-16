@@ -24,8 +24,6 @@ PACKAGE_ROOT = REPOSITORY_ROOT / PACKAGE_DIR_NAME
 DIST_ROOT = REPOSITORY_ROOT / "dist"
 
 DEFAULT_TRIAL_DAYS = 14
-DEFAULT_BLENDER52 = r"C:\path\to\blender-5.2\blender.exe"
-DEFAULT_BLENDER42 = r"C:\path\to\blender-4.2\blender.exe"
 
 BASE_NAME = "ydd Symmetric Edit"
 TRIAL_NAME = "ydd Symmetric Edit (Trial)"
@@ -128,9 +126,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def resolve_blender_paths(args: argparse.Namespace) -> tuple[str, str]:
-    blender52 = args.blender52 or os.environ.get("YSE_BLENDER52") or DEFAULT_BLENDER52
-    blender42 = args.blender42 or os.environ.get("YSE_BLENDER42") or DEFAULT_BLENDER42
+def resolve_blender_paths(args: argparse.Namespace) -> tuple[str, str | None]:
+    """Executable paths are machine-local: flags or env vars only, no shipped defaults."""
+    blender52 = args.blender52 or os.environ.get("YSE_BLENDER52")
+    blender42 = args.blender42 or os.environ.get("YSE_BLENDER42")
+    if not blender52:
+        raise BuildError("no Blender 5.2 executable configured; pass --blender52 or set YSE_BLENDER52")
+    if not blender42 and not args.skip_validate:
+        raise BuildError(
+            "no Blender 4.2 executable configured; pass --blender42, set YSE_BLENDER42, or use --skip-validate"
+        )
     return blender52, blender42
 
 
@@ -243,7 +248,11 @@ def verify_package(package_zip: Path, *, trial: bool) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    blender52, blender42 = resolve_blender_paths(args)
+    try:
+        blender52, blender42 = resolve_blender_paths(args)
+    except BuildError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
 
     manifest_path = PACKAGE_ROOT / "blender_manifest.toml"
     version = read_version(manifest_path)
@@ -270,6 +279,8 @@ def main(argv: list[str] | None = None) -> int:
         build_extension(blender52, source_dir, package_zip, REPOSITORY_ROOT)
 
         if not args.skip_validate:
+            # resolve_blender_paths only returns blender42=None under --skip-validate.
+            assert blender42 is not None
             for blender_exe in (blender42, blender52):
                 validate_extension(blender_exe, package_zip, REPOSITORY_ROOT)
 

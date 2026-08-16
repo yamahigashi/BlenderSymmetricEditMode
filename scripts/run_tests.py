@@ -25,8 +25,6 @@ from pathlib import Path
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_PATH = REPOSITORY_ROOT / "tests" / "manifest.toml"
 TESTS_ROOT = REPOSITORY_ROOT / "tests"
-DEFAULT_BLENDER52 = r"C:\path\to\blender-5.2\blender.exe"
-DEFAULT_BLENDER42 = r"C:\path\to\blender-4.2\blender.exe"
 MODES = {"fast-python", "fast-pytest", "background", "gui", "staged-gui"}
 VERSION_ORDER = ("4.2", "5.2")
 # A hung GUI modal must fail one test, not stall the whole sweep.
@@ -185,10 +183,16 @@ def select_specs(
 
 
 def resolve_blender_paths(blender42: str | None = None, blender52: str | None = None) -> dict[str, str]:
-    return {
-        "4.2": blender42 or os.environ.get("YSE_BLENDER42") or DEFAULT_BLENDER42,
-        "5.2": blender52 or os.environ.get("YSE_BLENDER52") or DEFAULT_BLENDER52,
+    """Executable paths are machine-local: flags or env vars only, no shipped defaults.
+
+    Versions without a configured path are omitted; ``run_manifest`` fails loudly
+    (never silently skips) when a selected test needs an omitted version.
+    """
+    candidates = {
+        "4.2": blender42 or os.environ.get("YSE_BLENDER42"),
+        "5.2": blender52 or os.environ.get("YSE_BLENDER52"),
     }
+    return {version: path for version, path in candidates.items() if path}
 
 
 def to_windows_path(path: Path) -> str:
@@ -365,9 +369,24 @@ def run_manifest(
     paths = blender_paths or resolve_blender_paths()
     run_process = executor or execute_process
     records: list[dict[str, object]] = []
-    blender_identity = {version: paths[version] for version in VERSION_ORDER}
+    blender_identity = {version: paths[version] for version in VERSION_ORDER if version in paths}
     started_at = datetime.now(UTC).isoformat()
     requested_versions = set(versions)
+    missing_versions = sorted(
+        {
+            version
+            for spec in selected
+            if spec.mode not in {"fast-python", "fast-pytest", "staged-gui"}
+            for version in spec.versions
+            if version not in paths and (not requested_versions or version in requested_versions)
+        }
+    )
+    if missing_versions:
+        raise ValueError(
+            "no Blender executable configured for version(s) "
+            + ", ".join(missing_versions)
+            + "; pass --blender42/--blender52 or set YSE_BLENDER42/YSE_BLENDER52"
+        )
 
     def versions_for(spec: TestSpec) -> list[str | None]:
         if spec.mode in {"fast-python", "fast-pytest"}:
