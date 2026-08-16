@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 import sys
+from datetime import date
 from typing import TYPE_CHECKING
 
 import bpy
-from bpy.props import BoolProperty, EnumProperty, FloatProperty
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, StringProperty
 
-from . import keymaps, matching
+from . import keymaps, matching, trial
 
 
 def _update_persistent_mode(self, _context):
@@ -20,28 +21,47 @@ class YSE_AddonPreferences(bpy.types.AddonPreferences):
 
     if TYPE_CHECKING:
         enabled: bool
+        trial_started: str
     else:
         enabled: BoolProperty(
             name="Symmetric Edit Mode",
             description=(
                 "Mirror Blender's native Knife, Loop Cut, Offset Edge Loop Cut, Rip, "
-                "Vertex Connect, Merge, Delete, Dissolve, and Edge Collapse. "
+                "Vertex Connect, Merge, Delete, Dissolve, Edge Collapse, and Extrude. "
                 "Use the native tool on one side; the mirror is applied on confirm"
             ),
             default=False,
             update=_update_persistent_mode,
         )
+        trial_started: StringProperty(
+            name="Trial Start Date",
+            description="ISO date the trial period began",
+            default="",
+            options={"HIDDEN"},
+        )
 
     def draw(self, _context):
         layout = self.layout
+        if trial.TRIAL_BUILD:
+            _draw_trial_banner(layout, self.trial_started)
         layout.prop(self, "enabled", toggle=True)
         layout.label(
             text=(
                 "Knife, Loop Cut, Offset Edge Loop Cut, Rip (V), Connect (J), "
-                "Merge (M), Delete (X), Dissolve, Edge Collapse"
+                "Merge (M), Delete (X), Dissolve, Edge Collapse, Extrude (E)"
             )
         )
         layout.label(text="Native events and tools are not replaced.")
+
+
+def _draw_trial_banner(layout, trial_started):
+    remaining = trial.days_left(trial_started, date.today()) if trial_started else None
+    if remaining is None:
+        layout.label(text="Trial version", icon="INFO")
+    elif remaining > 0:
+        layout.label(text=f"Trial version — {remaining} days left", icon="INFO")
+    else:
+        layout.label(text="Trial period ended — please purchase", icon="ERROR")
 
 
 def get_addon_preferences(context):
@@ -97,7 +117,7 @@ class YSE_PG_settings(bpy.types.PropertyGroup):
 
 
 class VIEW3D_PT_ydd_symmetric_edit(bpy.types.Panel):
-    bl_label = "ydd Symmetric Edit"
+    bl_label = "ydd Symmetric Edit (Trial)" if trial.TRIAL_BUILD else "ydd Symmetric Edit"
     bl_idname = "VIEW3D_PT_ydd_symmetric_edit"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -121,6 +141,9 @@ class VIEW3D_PT_ydd_symmetric_edit(bpy.types.Panel):
         preferences = get_addon_preferences(context)
         obj = context.edit_object
         axes = tuple(axis for axis, _index in matching.enabled_mesh_symmetry_axes(obj))
+
+        if trial.TRIAL_BUILD and preferences is not None:
+            _draw_trial_banner(layout, preferences.trial_started)
 
         enabled = preferences is not None and preferences.enabled
         if preferences is None:
