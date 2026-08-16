@@ -661,24 +661,65 @@ class _FakeKeymapItem:
         self.properties = _FakeKeymapProps()
 
 
+class _FakeKeymapItems(list):
+    def new(self, idname, *, type, value, head=False, **event_arguments):
+        item = _FakeKeymapItem(idname, type=type, value=value)
+        for name, value in event_arguments.items():
+            setattr(item, name, value)
+        if head:
+            self.insert(0, item)
+        else:
+            self.append(item)
+        return item
+
+
 class _FakeKeymap:
-    def __init__(self, items):
-        self.name = "Mesh"
-        self.space_type = "EMPTY"
-        self.region_type = "WINDOW"
-        self.is_modal = False
-        self.keymap_items = items
+    def __init__(
+        self,
+        items,
+        *,
+        name="Mesh",
+        space_type="EMPTY",
+        region_type="WINDOW",
+        is_modal=False,
+    ):
+        self.name = name
+        self.space_type = space_type
+        self.region_type = region_type
+        self.is_modal = is_modal
+        self.keymap_items = _FakeKeymapItems(items)
+
+
+class _FakeKeymaps(list):
+    def new(self, *, name, space_type, region_type, modal, tool=False):
+        for keymap in self:
+            if (
+                keymap.name == name
+                and keymap.space_type == space_type
+                and keymap.region_type == region_type
+                and keymap.is_modal == modal
+            ):
+                return keymap
+        keymap = _FakeKeymap(
+            [],
+            name=name,
+            space_type=space_type,
+            region_type=region_type,
+            is_modal=modal,
+        )
+        self.append(keymap)
+        return keymap
 
 
 class _FakeWindowManager:
     def __init__(self, items, addon_items=None):
         keymap = _FakeKeymap(items)
         configs = {
-            "user": type("User", (), {"keymaps": [keymap]})(),
+            "user": type("User", (), {"keymaps": _FakeKeymaps([keymap])})(),
             "active": type("Active", (), {"name": "Blender"})(),
         }
         if addon_items is not None:
-            configs["addon"] = type("Addon", (), {"keymaps": [_FakeKeymap(addon_items)]})()
+            configs["addon"] = type("Addon", (), {"keymaps": _FakeKeymaps([_FakeKeymap(addon_items)])})()
         self.keyconfigs = type("KeyConfigs", (), configs)()
 
 
@@ -730,6 +771,111 @@ def check_extrude_keymap_layers():
     finally:
         keymaps.OPERATOR_TOOL_KINDS = original_operators
         keymaps.EXTRUDE_TOOL_KINDS = original_extrude
+
+
+def check_replay_keymap_routes():
+    connect = _FakeKeymapItem("mesh.vert_connect_path", type="K")
+    connect.ctrl = 1
+    connect_routes, merge_routes, fingerprint = keymaps._replay_keymap_routes(_FakeWindowManager([connect]))
+    assert len(connect_routes) == 1, connect_routes
+    assert merge_routes == [], merge_routes
+    assert connect_routes[0].event.type == "K"
+    assert connect_routes[0].event.ctrl == 1
+    assert keymaps._event_arguments(connect_routes[0].event) == {
+        "type": "K",
+        "value": "PRESS",
+        "ctrl": 1,
+    }
+
+    reassigned = _FakeKeymapItem("mesh.vert_connect_path", type="L")
+    _, _, reassigned_fingerprint = keymaps._replay_keymap_routes(_FakeWindowManager([reassigned]))
+    assert reassigned_fingerprint != fingerprint
+
+    no_connect, _, _ = keymaps._replay_keymap_routes(_FakeWindowManager([_FakeKeymapItem("mesh.select_all", type="J")]))
+    assert no_connect == [], no_connect
+
+    merge = _FakeKeymapItem("wm.call_menu", type="N")
+    merge.properties.name = "VIEW3D_MT_edit_mesh_merge"
+    merge.shift = 1
+    merge.alt = 1
+    merge.oskey = 1
+    merge.key_modifier = "SPACE"
+    connect_routes, merge_routes, merge_fingerprint = keymaps._replay_keymap_routes(_FakeWindowManager([merge]))
+    assert connect_routes == [], connect_routes
+    assert len(merge_routes) == 1, merge_routes
+    assert keymaps._event_arguments(merge_routes[0].event) == {
+        "type": "N",
+        "value": "PRESS",
+        "shift": 1,
+        "alt": 1,
+        "oskey": 1,
+        "key_modifier": "SPACE",
+    }
+
+    default_merge = _FakeKeymapItem("wm.call_menu", type="M")
+    default_merge.properties.name = "VIEW3D_MT_edit_mesh_merge"
+    _, _, default_merge_fingerprint = keymaps._replay_keymap_routes(_FakeWindowManager([default_merge]))
+    assert merge_fingerprint != default_merge_fingerprint
+
+    registered_before = list(keymaps._REGISTERED_ITEMS)
+    try:
+        window_manager = _fake_window_manager_with_addon([merge], [])
+        keymaps._register_replay_keymaps(window_manager, [], merge_routes)
+        addon_items = window_manager.keyconfigs.addon.keymaps[0].keymap_items
+        assert all(item.idname != keymaps.CONNECT_OPERATOR for item in addon_items), addon_items
+        registered_merge = [
+            item for item in addon_items if item.idname == "wm.call_menu" and item.properties.name == keymaps.MERGE_MENU
+        ]
+        assert len(registered_merge) == 1, registered_merge
+    finally:
+        keymaps._REGISTERED_ITEMS.clear()
+        keymaps._REGISTERED_ITEMS.extend(registered_before)
+
+    # A Connect route outside the "Mesh" keymap is still discovered (the scan
+    # is unconditional, like the delete/extrude menu scans).
+    foreign_connect = _FakeKeymapItem("mesh.vert_connect_path", type="P")
+    foreign_wm = _FakeWindowManager([])
+    foreign_wm.keyconfigs.user.keymaps.append(
+        _FakeKeymap([foreign_connect], name="3D View Tool: Edit Mesh, Poly Build")
+    )
+    foreign_routes, _, _ = keymaps._replay_keymap_routes(foreign_wm)
+    assert len(foreign_routes) == 1, foreign_routes
+    assert foreign_routes[0].keymap_name == "3D View Tool: Edit Mesh, Poly Build"
+
+    # Inactive items are ignored.
+    inactive = _FakeKeymapItem("mesh.vert_connect_path", type="J")
+    inactive.active = False
+    inactive_routes, _, _ = keymaps._replay_keymap_routes(_FakeWindowManager([inactive]))
+    assert inactive_routes == [], inactive_routes
+
+    # One event bound to both Connect and the Merge menu is ambiguous: drop both.
+    conflict_connect = _FakeKeymapItem("mesh.vert_connect_path", type="Y")
+    conflict_merge = _FakeKeymapItem("wm.call_menu", type="Y")
+    conflict_merge.properties.name = "VIEW3D_MT_edit_mesh_merge"
+    conflict_connects, conflict_merges, _ = keymaps._replay_keymap_routes(
+        _FakeWindowManager([conflict_connect, conflict_merge])
+    )
+    assert conflict_connects == [], conflict_connects
+    assert conflict_merges == [], conflict_merges
+
+    # The Connect clone registers head-first with the cloned event arguments.
+    registered_before = list(keymaps._REGISTERED_ITEMS)
+    try:
+        connect_item = _FakeKeymapItem("mesh.vert_connect_path", type="K")
+        connect_item.ctrl = 1
+        cloned_routes, _, _ = keymaps._replay_keymap_routes(_FakeWindowManager([connect_item]))
+        assert len(cloned_routes) == 1, cloned_routes
+        window_manager = _fake_window_manager_with_addon([connect_item], [])
+        keymaps._register_replay_keymaps(window_manager, cloned_routes, [])
+        addon_items = window_manager.keyconfigs.addon.keymaps[0].keymap_items
+        registered_connect = [item for item in addon_items if item.idname == keymaps.CONNECT_OPERATOR]
+        assert len(registered_connect) == 1, addon_items
+        assert registered_connect[0].type == "K"
+        assert registered_connect[0].ctrl == 1
+        assert addon_items[0] is registered_connect[0], "connect clone must be inserted head-first"
+    finally:
+        keymaps._REGISTERED_ITEMS.clear()
+        keymaps._REGISTERED_ITEMS.extend(registered_before)
 
 
 class _ExplicitFakeProps:
@@ -973,9 +1119,7 @@ def check_extrude_menu_fail_closed():
         assert keymaps.extrude_menu_route_is_current(route.route_key) is True
         print("YSE_CORE_CASE=t4_route_is_current_false", flush=True)
         assert keymaps.extrude_menu_route_is_current("yse:stale-route") is False
-        live_wm.keyconfigs.addon.keymaps[0].keymap_items.append(
-            _FakeKeymapItem(keymaps.EXTRUDE_MENU_OPENER, type="E")
-        )
+        live_wm.keyconfigs.addon.keymaps[0].keymap_items.append(_FakeKeymapItem(keymaps.EXTRUDE_MENU_OPENER, type="E"))
         assert keymaps.extrude_menu_route_is_current(route.route_key) is False
         live_wm.keyconfigs.addon.keymaps[0].keymap_items.pop()
         assert keymaps.extrude_menu_route_is_current(route.route_key) is True
@@ -1232,6 +1376,7 @@ def run():
     check_vertex_mirror_lookup_nearest_among_candidates()
     check_edge_side_tol_boundary_classification()
     check_extrude_keymap_layers()
+    check_replay_keymap_routes()
     check_kmi_scalar_capture()
     check_extrude_option_capture()
     check_extrude_keymap_regressions()

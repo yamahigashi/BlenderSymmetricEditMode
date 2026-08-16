@@ -21,6 +21,8 @@ EXTRUDE_MENU_OPENER = "mesh.ydd_symmetric_edit_extrude_menu"
 MERGE_MENU = "YSE_MT_merge"
 DELETE_MENU = "YSE_MT_delete"
 EXTRUDE_MENU = "YSE_MT_extrude"
+NATIVE_CONNECT_OPERATOR = "mesh.vert_connect_path"
+NATIVE_MERGE_MENU = "VIEW3D_MT_edit_mesh_merge"
 NATIVE_DELETE_MENU = "VIEW3D_MT_edit_mesh_delete"
 NATIVE_EXTRUDE_MENU = "VIEW3D_MT_edit_mesh_extrude"
 NATIVE_DISSOLVE_MODE = "mesh.dissolve_mode"
@@ -39,6 +41,9 @@ _FINGERPRINT: KeymapFingerprint | None = None
 _DeleteRouteFingerprint = tuple[str, str, str, KeymapEvent, bool, tuple[tuple[str, object], ...]]
 _DELETE_FINGERPRINT: tuple[_DeleteRouteFingerprint, ...] | None = None
 _DISSOLVE_FINGERPRINT: tuple[_DeleteRouteFingerprint, ...] | None = None
+_ReplayRouteFingerprint = tuple[str, str, str, KeymapEvent, bool]
+_ReplayFingerprint = tuple[tuple[_ReplayRouteFingerprint, ...], tuple[_ReplayRouteFingerprint, ...]]
+_REPLAY_FINGERPRINT: _ReplayFingerprint | None = None
 _ExtrudeMenuFingerprint = tuple[str, str, str, KeymapEvent, str]
 _EXTRUDE_MENU_FINGERPRINT: tuple[_ExtrudeMenuFingerprint, ...] | None = None
 _EXTRUDE_MENU_ROUTES_BY_KEY: dict[str, ExtrudeMenuRoute] = {}
@@ -59,6 +64,25 @@ class DeleteMenuRoute:
     is_tool: bool = False
     # Explicitly-set native KMI properties (dissolve_mode use_verts etc.).
     properties: tuple[tuple[str, object], ...] = ()
+
+    @property
+    def keymap_identity(self) -> KeymapIdentity:
+        return KeymapIdentity(
+            name=self.keymap_name,
+            space_type=self.space_type,
+            region_type=self.region_type,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayKeymapRoute:
+    """One native Connect operator or Merge menu binding to clone."""
+
+    keymap_name: str
+    space_type: str
+    region_type: str
+    event: KeymapEvent
+    is_tool: bool = False
 
     @property
     def keymap_identity(self) -> KeymapIdentity:
@@ -202,6 +226,16 @@ def _route_fingerprint(route: DeleteMenuRoute) -> _DeleteRouteFingerprint:
     )
 
 
+def _replay_route_fingerprint(route: ReplayKeymapRoute) -> _ReplayRouteFingerprint:
+    return (
+        route.keymap_name,
+        route.space_type,
+        route.region_type,
+        route.event,
+        route.is_tool,
+    )
+
+
 def _extrude_menu_fingerprint(route: ExtrudeMenuRoute) -> _ExtrudeMenuFingerprint:
     return (
         route.keymap_name,
@@ -311,6 +345,61 @@ def _native_routes(window_manager) -> tuple[list[NativeRoute], KeymapFingerprint
         routes=tuple(routes),
     )
     return routes, fingerprint
+
+
+def _replay_keymap_routes(
+    window_manager,
+) -> tuple[list[ReplayKeymapRoute], list[ReplayKeymapRoute], _ReplayFingerprint]:
+    """Scan user keymaps for active native Connect and Merge routes."""
+
+    key_config = window_manager.keyconfigs.user
+    if key_config is None:
+        return [], [], ((), ())
+
+    connect_routes: list[ReplayKeymapRoute] = []
+    merge_routes: list[ReplayKeymapRoute] = []
+    seen_connect: set[_ReplayRouteFingerprint] = set()
+    seen_merge: set[_ReplayRouteFingerprint] = set()
+    for keymap in key_config.keymaps:
+        if keymap.is_modal:
+            continue
+        for item in keymap.keymap_items:
+            if not item.active:
+                continue
+
+            is_connect = item.idname == NATIVE_CONNECT_OPERATOR
+            is_merge = item.idname == "wm.call_menu" and getattr(item.properties, "name", "") == NATIVE_MERGE_MENU
+            if not is_connect and not is_merge:
+                continue
+
+            route = ReplayKeymapRoute(
+                keymap_name=keymap.name,
+                space_type=keymap.space_type,
+                region_type=keymap.region_type,
+                event=_event_signature(item),
+                is_tool=keymap.name in TOOL_KEYMAP_NAMES,
+            )
+            identity = _replay_route_fingerprint(route)
+            if is_connect and identity not in seen_connect:
+                seen_connect.add(identity)
+                connect_routes.append(route)
+            if is_merge and identity not in seen_merge:
+                seen_merge.add(identity)
+                merge_routes.append(route)
+
+    # An event bound to both Connect and the Merge menu is ambiguous; give
+    # up on both rather than let registration order decide (same fail-closed
+    # stance as _native_routes).
+    ambiguous = seen_connect & seen_merge
+    if ambiguous:
+        connect_routes = [route for route in connect_routes if _replay_route_fingerprint(route) not in ambiguous]
+        merge_routes = [route for route in merge_routes if _replay_route_fingerprint(route) not in ambiguous]
+
+    fingerprint = (
+        tuple(_replay_route_fingerprint(route) for route in connect_routes),
+        tuple(_replay_route_fingerprint(route) for route in merge_routes),
+    )
+    return connect_routes, merge_routes, fingerprint
 
 
 def _delete_menu_routes(
@@ -501,39 +590,51 @@ def _register_routes(window_manager, routes: list[NativeRoute]) -> None:
         _REGISTERED_ITEMS.append((keymap, item))
 
 
-def _register_replay_keymaps(window_manager) -> None:
+def _register_replay_keymaps(
+    window_manager,
+    connect_routes: list[ReplayKeymapRoute],
+    merge_routes: list[ReplayKeymapRoute],
+) -> None:
     addon_config = window_manager.keyconfigs.addon
     if addon_config is None:
         raise RuntimeError("Blender's add-on key configuration is unavailable")
 
-    keymap = addon_config.keymaps.new(
-        name="Mesh",
-        space_type="EMPTY",
-        region_type="WINDOW",
-        modal=False,
-    )
-    connect = keymap.keymap_items.new(
-        CONNECT_OPERATOR,
-        type="J",
-        value="PRESS",
-        head=True,
-    )
-    connect.active = _ENABLED
-    _REGISTERED_ITEMS.append((keymap, connect))
+    if not connect_routes:
+        print("ydd Symmetric Edit: no Connect keymap route found; Connect mirroring not registered")
+    if not merge_routes:
+        print("ydd Symmetric Edit: no Merge keymap route found; Merge mirroring not registered")
 
-    merge_menu = keymap.keymap_items.new(
-        "wm.call_menu",
-        type="M",
-        value="PRESS",
-        head=True,
-    )
-    try:
-        merge_menu.properties.name = MERGE_MENU
-    except Exception:
-        keymap.keymap_items.remove(merge_menu)
-        raise
-    merge_menu.active = _ENABLED
-    _REGISTERED_ITEMS.append((keymap, merge_menu))
+    addon_keymaps = {}
+    for operator_id, menu_name, routes in (
+        (CONNECT_OPERATOR, "", connect_routes),
+        ("wm.call_menu", MERGE_MENU, merge_routes),
+    ):
+        for route in routes:
+            cache_key = (route.keymap_identity, route.is_tool)
+            keymap = addon_keymaps.get(cache_key)
+            if keymap is None:
+                keymap = addon_config.keymaps.new(
+                    name=route.keymap_name,
+                    space_type=route.space_type,
+                    region_type=route.region_type,
+                    modal=False,
+                    tool=route.is_tool,
+                )
+                addon_keymaps[cache_key] = keymap
+
+            item = keymap.keymap_items.new(
+                operator_id,
+                head=True,
+                **_event_arguments(route.event),
+            )
+            if menu_name:
+                try:
+                    item.properties.name = menu_name
+                except Exception:
+                    keymap.keymap_items.remove(item)
+                    raise
+            item.active = _ENABLED
+            _REGISTERED_ITEMS.append((keymap, item))
 
 
 def _register_delete_menu_keymaps(window_manager, routes: list[DeleteMenuRoute]) -> None:
@@ -645,6 +746,8 @@ def _register_extrude_menu_keymaps(window_manager, routes: list[ExtrudeMenuRoute
 def _rebuild(
     window_manager,
     routes: list[NativeRoute],
+    connect_routes: list[ReplayKeymapRoute],
+    merge_routes: list[ReplayKeymapRoute],
     delete_routes: list[DeleteMenuRoute],
     dissolve_routes: list[DeleteMenuRoute],
     extrude_menu_routes: list[ExtrudeMenuRoute],
@@ -664,7 +767,7 @@ def _rebuild(
 
     try:
         _register_routes(window_manager, routes)
-        _register_replay_keymaps(window_manager)
+        _register_replay_keymaps(window_manager, connect_routes, merge_routes)
         _register_delete_menu_keymaps(window_manager, delete_routes)
         _register_dissolve_mode_keymaps(window_manager, dissolve_routes)
         _register_extrude_menu_keymaps(window_manager, extrude_menu_routes)
@@ -685,7 +788,8 @@ def _rebuild(
 
 
 def _refresh(*, force: bool = False) -> bool:
-    global _FINGERPRINT, _DELETE_FINGERPRINT, _DISSOLVE_FINGERPRINT, _EXTRUDE_MENU_FINGERPRINT
+    global _FINGERPRINT, _REPLAY_FINGERPRINT, _DELETE_FINGERPRINT, _DISSOLVE_FINGERPRINT
+    global _EXTRUDE_MENU_FINGERPRINT
 
     window_manager = _window_manager()
     if window_manager is None:
@@ -699,18 +803,29 @@ def _refresh(*, force: bool = False) -> bool:
 
     window_manager.keyconfigs.update()
     routes, fingerprint = _native_routes(window_manager)
+    connect_routes, merge_routes, replay_fingerprint = _replay_keymap_routes(window_manager)
     delete_routes, delete_fingerprint = _delete_menu_routes(window_manager)
     dissolve_routes, dissolve_fingerprint = _dissolve_mode_routes(window_manager)
     extrude_menu_routes, extrude_menu_fingerprint = _extrude_menu_routes(window_manager)
     if (
         force
         or fingerprint != _FINGERPRINT
+        or replay_fingerprint != _REPLAY_FINGERPRINT
         or delete_fingerprint != _DELETE_FINGERPRINT
         or dissolve_fingerprint != _DISSOLVE_FINGERPRINT
         or extrude_menu_fingerprint != _EXTRUDE_MENU_FINGERPRINT
     ):
-        _rebuild(window_manager, routes, delete_routes, dissolve_routes, extrude_menu_routes)
+        _rebuild(
+            window_manager,
+            routes,
+            connect_routes,
+            merge_routes,
+            delete_routes,
+            dissolve_routes,
+            extrude_menu_routes,
+        )
         _FINGERPRINT = fingerprint
+        _REPLAY_FINGERPRINT = replay_fingerprint
         _DELETE_FINGERPRINT = delete_fingerprint
         _DISSOLVE_FINGERPRINT = dissolve_fingerprint
         _EXTRUDE_MENU_FINGERPRINT = extrude_menu_fingerprint
@@ -947,12 +1062,14 @@ def sync(enabled: bool) -> None:
 
 
 def register(*, enabled: bool = False) -> None:
-    global _ENABLED, _FINGERPRINT, _DELETE_FINGERPRINT, _DISSOLVE_FINGERPRINT, _EXTRUDE_MENU_FINGERPRINT
+    global _ENABLED, _FINGERPRINT, _REPLAY_FINGERPRINT, _DELETE_FINGERPRINT, _DISSOLVE_FINGERPRINT
+    global _EXTRUDE_MENU_FINGERPRINT
     global _HAS_DELETE_ROUTES, _HAS_EXTRUDE_MENU_ROUTES, _RUNNING
 
     _RUNNING = True
     _ENABLED = bool(enabled)
     _FINGERPRINT = None
+    _REPLAY_FINGERPRINT = None
     _DELETE_FINGERPRINT = None
     _DISSOLVE_FINGERPRINT = None
     _EXTRUDE_MENU_FINGERPRINT = None
@@ -980,7 +1097,8 @@ def register(*, enabled: bool = False) -> None:
 
 
 def unregister() -> None:
-    global _ENABLED, _FINGERPRINT, _DELETE_FINGERPRINT, _DISSOLVE_FINGERPRINT, _EXTRUDE_MENU_FINGERPRINT
+    global _ENABLED, _FINGERPRINT, _REPLAY_FINGERPRINT, _DELETE_FINGERPRINT, _DISSOLVE_FINGERPRINT
+    global _EXTRUDE_MENU_FINGERPRINT
     global _HAS_DELETE_ROUTES, _HAS_EXTRUDE_MENU_ROUTES, _RUNNING
 
     _RUNNING = False
@@ -1003,6 +1121,7 @@ def unregister() -> None:
     _ROUTES_BY_KEY.clear()
     _EXTRUDE_MENU_ROUTES_BY_KEY.clear()
     _FINGERPRINT = None
+    _REPLAY_FINGERPRINT = None
     _DELETE_FINGERPRINT = None
     _DISSOLVE_FINGERPRINT = None
     _EXTRUDE_MENU_FINGERPRINT = None
