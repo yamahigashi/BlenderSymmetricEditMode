@@ -543,7 +543,18 @@ class MESH_OT_ydd_symmetric_edit_delete(bpy.types.Operator):
         element_pairs.apply_expansion_plan(bm, plan)
         bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
 
-        result = self._native()
+        try:
+            result = self._native()
+        except Exception:
+            # Do not leave the mirror-expanded selection behind; best-effort
+            # restore, then let the native failure surface unchanged.
+            try:
+                bm = bmesh.from_edit_mesh(mesh)
+                _restore_expansion_selection(bm, plan)
+                bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+            except Exception:
+                traceback.print_exc()
+            raise
         if "CANCELLED" in result and "FINISHED" not in result:
             bm = bmesh.from_edit_mesh(mesh)
             _restore_expansion_selection(bm, plan)
