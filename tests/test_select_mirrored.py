@@ -336,9 +336,10 @@ def enter_edit(obj) -> bmesh.types.BMesh:
 def check_connect_on() -> None:
     """§4.3 Connect ON: path verts + mirror counterparts; selection symmetric.
 
-    Connect restore clears edge flags and keeps the native vertex path only;
-    Select Mirrored then add-selects ρ of those verts.  Both sides therefore
-    show vertex selection with edge flags False (contract §4-3 note).
+    Since the history-form lift (2026-08-15) Connect keeps the native edge
+    flags; Select Mirrored add-selects ρ of the selected verts and edges.
+    Both sides therefore show the path verts and the new diagonal selected
+    (supersedes the contract §4-3 note about cleared edge flags).
     """
 
     ensure_addon_registered()
@@ -379,13 +380,16 @@ def check_connect_on() -> None:
     for expected in (*native_path, *mirror_path):
         assert find_vertex(bm, expected).select, expected
 
-    # Both sides' selection state must be symmetric: path verts True, the
-    # connect edges themselves False (existing Connect restore clears edges).
-    assert not native_edge.select
-    assert not mirror_edge.select
+    # Both sides' selection state must be symmetric with the native result:
+    # since the history-form lift (2026-08-15) Connect keeps the native edge
+    # flags, so both new diagonals are selected and nothing else gains a flag.
+    assert native_edge.select
+    assert mirror_edge.select
     for edge in bm.edges:
+        if edge is native_edge or edge is mirror_edge:
+            continue
         assert not edge.select, (
-            f"edge flags must stay cleared on both sides: {[coordinate_key(v.co) for v in edge.verts]}"
+            f"only the connect diagonals may be selected: {[coordinate_key(v.co) for v in edge.verts]}"
         )
 
     selected = selected_vert_keys(bm)

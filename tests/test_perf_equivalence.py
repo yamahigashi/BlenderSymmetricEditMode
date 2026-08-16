@@ -3307,7 +3307,7 @@ def _check_prepare_session_invoke_does_not_resolve():
         context = SimpleNamespace(
             scene=SimpleNamespace(ydd_symmetric_edit=SimpleNamespace(source_side="NEGATIVE", tolerance=TOLERANCE)),
             edit_object=obj,
-            window=SimpleNamespace(as_pointer=lambda: 11),
+            window=SimpleNamespace(as_pointer=lambda: 11, modal_operators=()),
             area=SimpleNamespace(as_pointer=lambda: 12),
             region=SimpleNamespace(as_pointer=lambda: 13),
             tool_settings=SimpleNamespace(mesh_select_mode=(True, False, False)),
@@ -3375,7 +3375,7 @@ def _check_rip_invoke_does_not_resolve():
         context = SimpleNamespace(
             scene=SimpleNamespace(ydd_symmetric_edit=SimpleNamespace(source_side="NEGATIVE", tolerance=TOLERANCE)),
             edit_object=obj,
-            window=SimpleNamespace(as_pointer=lambda: 21),
+            window=SimpleNamespace(as_pointer=lambda: 21, modal_operators=()),
             area=SimpleNamespace(as_pointer=lambda: 22),
             region=SimpleNamespace(as_pointer=lambda: 23),
             tool_settings=SimpleNamespace(
