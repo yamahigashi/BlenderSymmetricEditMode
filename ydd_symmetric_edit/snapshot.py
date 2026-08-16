@@ -19,6 +19,7 @@ from ._types import (
 )
 from .face_mapping import FaceRegistry, _snapshot_face_map
 from .layer_names import (
+    CONNECT_HISTORY_EDGE_TOKEN_LAYER,
     EDGE_APPLY_ID_LAYER,
     EDGE_HIDDEN_LAYER,
     EDGE_LIVE_HIDDEN_LAYER,
@@ -56,6 +57,7 @@ def remove_temporary_layers(bm: bmesh.types.BMesh) -> bool:
     removed = False
     layer_groups = (
         (bm.edges.layers.int, EDGE_ORIGINAL_LAYER),
+        (bm.edges.layers.int, CONNECT_HISTORY_EDGE_TOKEN_LAYER),
         (bm.faces.layers.int, FACE_ID_LAYER),
         (bm.faces.layers.int, FACE_MIRROR_ID_LAYER),
         (bm.faces.layers.int, FACE_HIDDEN_LAYER),
@@ -882,6 +884,7 @@ class SelectionCapture:
     empty when their domain was not requested. Face-loop arrays are populated
     only when the face domain was requested. History is populated only when
     ``include_history=True`` was passed to :func:`capture_selection_snapshot`.
+    Edge history retains endpoint indices and unfiltered element type names.
     """
 
     coords: numpy.ndarray
@@ -893,6 +896,8 @@ class SelectionCapture:
     loop_totals: numpy.ndarray = field(default_factory=lambda: numpy.empty(0, dtype=numpy.int64))
     history_coords: tuple[Vector, ...] = ()
     history_indices: tuple[int, ...] = ()
+    history_edge_indices: tuple[tuple[int, int], ...] = ()
+    history_htypes: tuple[str, ...] = ()
 
 
 def _empty_selected() -> numpy.ndarray:
@@ -1097,9 +1102,16 @@ def capture_selection_snapshot(
         Iterable[bmesh.types.BMVert | bmesh.types.BMEdge | bmesh.types.BMFace],
         bm.select_history,
     )
-    history_vertices = [element for element in history if isinstance(element, bmesh.types.BMVert)]
+    history_elements = list(history)
+    history_vertices = [element for element in history_elements if isinstance(element, bmesh.types.BMVert)]
     history_coords = tuple(element.co.copy() for element in history_vertices)
     history_indices = tuple(element.index for element in history_vertices)
+    history_edge_indices = tuple(
+        (int(element.verts[0].index), int(element.verts[1].index))
+        for element in history_elements
+        if isinstance(element, bmesh.types.BMEdge)
+    )
+    history_htypes = tuple(type(element).__name__ for element in history_elements)
     return SelectionCapture(
         coords=captured.coords,
         selected_verts=captured.selected_verts,
@@ -1110,4 +1122,6 @@ def capture_selection_snapshot(
         loop_totals=captured.loop_totals,
         history_coords=history_coords,
         history_indices=history_indices,
+        history_edge_indices=history_edge_indices,
+        history_htypes=history_htypes,
     )

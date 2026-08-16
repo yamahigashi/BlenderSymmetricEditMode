@@ -19,9 +19,13 @@ from mathutils import Vector
 from . import backup, layer_names, matching, selection, stitch_pathedges
 from . import snapshot as snapshot_module
 from ._types import MirrorOverlap
-from .snapshot import capture_selection_snapshot
+from .snapshot import SelectionCapture, capture_selection_snapshot
 
 _MERGE_MODES = frozenset({"CENTER", "COLLAPSE", "FIRST", "LAST"})
+FORM_PAIR = "FORM_PAIR"
+FORM_VERT = "FORM_VERT"
+FORM_EDGE = "FORM_EDGE"
+FORM_OTHER = "FORM_OTHER"
 
 # float64 shaped (N, 3) coordinate matrix from capture_selection_snapshot / _vertex_snapshot.
 VertexCoordArray = numpy.ndarray
@@ -200,6 +204,36 @@ def _vertex_snapshot(
     return capture.coords, selected, capture.history_coords, capture.history_indices
 
 
+def _connect_snapshot(bm: bmesh.types.BMesh, *, mesh_object=None) -> SelectionCapture:
+    return capture_selection_snapshot(
+        bm,
+        mesh_object=mesh_object,
+        domains=("VERT", "EDGE"),
+        include_history=True,
+    )
+
+
+def _classify_connect_form(snapshot: SelectionCapture) -> str:
+    selected_count = len(snapshot.selected_verts)
+    history_types = snapshot.history_htypes
+    if selected_count == 2:
+        return FORM_PAIR
+    if (
+        history_types
+        and all(name == "BMVert" for name in history_types)
+        and len(history_types) == selected_count
+        and selected_count > 2
+    ):
+        return FORM_VERT
+    if (
+        history_types
+        and all(name == "BMEdge" for name in history_types)
+        and len(snapshot.selected_edges) == len(history_types)
+    ):
+        return FORM_EDGE
+    return FORM_OTHER
+
+
 def _symmetry_parameters(context) -> tuple[bpy.types.Object, int, float] | None:
     obj = context.edit_object
     if obj is None or obj.type != "MESH":
@@ -235,6 +269,8 @@ def _set_vertex_path(
     *,
     selected_coords: Sequence[Vector] | None = None,
 ) -> bool:
+    if not path_coords:
+        return False
     selected_coords = path_coords if selected_coords is None else selected_coords
     bm.verts.ensure_lookup_table()
     coords = tuple(vertex.co.copy() for vertex in bm.verts)
@@ -269,6 +305,164 @@ def _set_vertex_path(
         assert vertex is not None
         vertex.select = True
         bm.select_history.add(vertex)
+    return True
+
+
+def _set_edge_path(
+    bm: bmesh.types.BMesh,
+    edge_coords: Sequence[tuple[Vector, Vector]],
+    axis_index: int,
+    tolerance: float,
+) -> bool:
+    edges = _resolve_edge_path(bm, edge_coords, axis_index, tolerance)
+    if edges is None:
+        return False
+    _clear_selection(bm)
+    for edge in edges:
+        edge.select = True
+        for vertex in edge.verts:
+            vertex.select = True
+    bm.select_history.clear()
+    for edge in edges:
+        bm.select_history.add(edge)
+    return True
+
+
+def _resolve_mirrored_edge_path(
+    bm: bmesh.types.BMesh,
+    history_edges: Sequence[tuple[int, int]],
+    coords: VertexCoordArray,
+    pairs: dict[int, int],
+    axis_index: int,
+    tolerance: float,
+) -> tuple[tuple[Vector, Vector], ...] | None:
+    queries: list[Vector] = []
+    for first_index, second_index in history_edges:
+        if pairs.get(first_index) is None or pairs.get(second_index) is None:
+            return None
+        queries.extend((Vector(coords[pairs[first_index]]), Vector(coords[pairs[second_index]])))
+    resolved_vertices = _resolve_vertex_queries(bm, queries, axis_index, tolerance)
+    if resolved_vertices is None:
+        return None
+    edge_coords = []
+    for offset in range(0, len(resolved_vertices), 2):
+        first = resolved_vertices[offset]
+        second = resolved_vertices[offset + 1]
+        if first is None or second is None:
+            return None
+        candidates = [edge for edge in first.link_edges if edge.other_vert(first) is second]
+        if len(candidates) != 1:
+            return None
+        edge_coords.append((first.co.copy(), second.co.copy()))
+    return tuple(edge_coords)
+
+
+def _resolve_edge_path(
+    bm: bmesh.types.BMesh,
+    edge_coords: Sequence[tuple[Vector, Vector]],
+    axis_index: int,
+    tolerance: float,
+) -> tuple[bmesh.types.BMEdge, ...] | None:
+    queries = [coordinate for edge in edge_coords for coordinate in edge]
+    resolved_vertices = _resolve_vertex_queries(bm, queries, axis_index, tolerance)
+    if resolved_vertices is None:
+        return None
+    edges = []
+    for offset in range(0, len(resolved_vertices), 2):
+        first = resolved_vertices[offset]
+        second = resolved_vertices[offset + 1]
+        if first is None or second is None:
+            return None
+        candidates = [edge for edge in first.link_edges if edge.other_vert(first) is second]
+        if len(candidates) != 1 or candidates[0] in edges:
+            return None
+        edges.append(candidates[0])
+    return tuple(edges)
+
+
+def _resolve_vertex_queries(
+    bm: bmesh.types.BMesh,
+    queries: Sequence[Vector],
+    axis_index: int,
+    tolerance: float,
+) -> tuple[bmesh.types.BMVert | None, ...] | None:
+    if not queries:
+        return None
+    bm.verts.ensure_lookup_table()
+    lookup = matching.build_vertex_mirror_lookup(tuple(vertex.co.copy() for vertex in bm.verts), axis_index, tolerance)
+    unique: list[Vector] = []
+    positions: dict[tuple[float, float, float], int] = {}
+    for query in queries:
+        key = (float(query[0]), float(query[1]), float(query[2]))
+        if key not in positions:
+            positions[key] = len(unique)
+            unique.append(query)
+    resolved = lookup.find_all_direct(unique)
+    result = []
+    for query in queries:
+        key = (float(query[0]), float(query[1]), float(query[2]))
+        index = resolved[positions[key]]
+        result.append(None if index is None else bm.verts[index])
+    if any(vertex is None for vertex in result):
+        return None
+    return tuple(result)
+
+
+def _mark_connect_history_edges(
+    bm: bmesh.types.BMesh,
+    history_edges: Sequence[tuple[int, int]],
+    coords: VertexCoordArray,
+    axis_index: int,
+    tolerance: float,
+) -> tuple[tuple[int, tuple[Vector, Vector]], ...] | None:
+    layer = _ensure_int_layer(bm.edges.layers.int, layer_names.CONNECT_HISTORY_EDGE_TOKEN_LAYER)
+    queries = [Vector(coords[index]) for edge in history_edges for index in edge]
+    resolved_vertices = _resolve_vertex_queries(bm, queries, axis_index, tolerance)
+    if resolved_vertices is None:
+        return None
+    marked = []
+    for token, (first_index, second_index) in enumerate(history_edges, start=1):
+        first = Vector(coords[first_index])
+        second = Vector(coords[second_index])
+        offset = (token - 1) * 2
+        first_vertex = resolved_vertices[offset]
+        second_vertex = resolved_vertices[offset + 1]
+        if first_vertex is None or second_vertex is None:
+            return None
+        candidates = [edge for edge in first_vertex.link_edges if edge.other_vert(first_vertex) is second_vertex]
+        if len(candidates) != 1:
+            return None
+        candidates[0][layer] = token
+        marked.append((token, (first.copy(), second.copy())))
+    return tuple(marked)
+
+
+def _restore_connect_edge_history(
+    bm: bmesh.types.BMesh,
+    marked: Sequence[tuple[int, tuple[Vector, Vector]]],
+    tolerance: float,
+) -> bool:
+    layer = bm.edges.layers.int.get(layer_names.CONNECT_HISTORY_EDGE_TOKEN_LAYER)
+    if layer is None:
+        return False
+    matches = []
+    for token, (first, second) in marked:
+        candidates = [
+            edge
+            for edge in bm.edges
+            if int(edge[layer]) == token
+            and _edge_coords_match(edge.verts[0].co, edge.verts[1].co, first, second, tolerance)
+        ]
+        if len(candidates) != 1:
+            return False
+        matches.append(candidates[0])
+    _clear_selection(bm)
+    for edge in matches:
+        edge.select = True
+        for vertex in edge.verts:
+            vertex.select = True
+    for edge in matches:
+        bm.select_history.add(edge)
     return True
 
 
@@ -879,7 +1073,13 @@ class MESH_OT_ydd_symmetric_edit_connect(bpy.types.Operator):
             return _native_vert_connect_path()
 
         bm = bmesh.from_edit_mesh(mesh)
-        coords, selected_indices, history_coords, history_indices = _vertex_snapshot(bm, mesh_object=obj)
+        connect_capture = _connect_snapshot(bm, mesh_object=obj)
+        coords = connect_capture.coords
+        selected_indices = tuple(int(index) for index in connect_capture.selected_verts)
+        history_coords = connect_capture.history_coords
+        history_indices = connect_capture.history_indices
+        history_edge_indices = connect_capture.history_edge_indices
+        connect_form = _classify_connect_form(connect_capture)
         snapshot = classify_mirror_selection(
             coords,
             selected_indices,
@@ -887,6 +1087,7 @@ class MESH_OT_ydd_symmetric_edit_connect(bpy.types.Operator):
             tolerance=tolerance,
         )
         mirrored_history = _map_history_via_pairs(history_indices, snapshot.pairs)
+        mirrored_pair = _map_history_via_pairs(selected_indices, snapshot.pairs)
 
         # Stamp markers before native so R is post-hoc recoverable.
         try:
@@ -903,7 +1104,20 @@ class MESH_OT_ydd_symmetric_edit_connect(bpy.types.Operator):
                 traceback.print_exc()
             return _native_vert_connect_path()
 
-        result = _native_vert_connect_path()
+        try:
+            result = _native_vert_connect_path()
+        except RuntimeError as exc:
+            try:
+                bm = bmesh.from_edit_mesh(mesh)
+                _remove_connect_markers(bm)
+                bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+            except Exception:
+                pass
+            message = str(exc)
+            if message.startswith("Error: "):
+                message = message[7:]
+            _connect_report(self, {"ERROR"}, message)
+            return {"CANCELLED"}
         if "FINISHED" not in result:
             try:
                 bm = bmesh.from_edit_mesh(mesh)
@@ -939,19 +1153,67 @@ class MESH_OT_ydd_symmetric_edit_connect(bpy.types.Operator):
                 _maybe_extend_selection_to_mirror(mesh, axis_index, tolerance, mesh_object=obj)
                 return result
 
+            if connect_form == "FORM_OTHER":
+                _connect_report(self, {"WARNING"}, "Mirrored connect skipped: unsupported selection history")
+                return result
+
             # Counterpart missing → legitimate decline (native kept + WARNING).
-            if mirrored_history is None:
+            if connect_form == "FORM_EDGE":
+                mirrored_edges = _resolve_mirrored_edge_path(
+                    bm,
+                    history_edge_indices,
+                    coords,
+                    snapshot.pairs,
+                    axis_index,
+                    tolerance,
+                )
+                if mirrored_edges is None:
+                    _report_missing(self, max(1, len(history_edge_indices)), partial=False)
+                    return result
+            elif connect_form == "FORM_PAIR":
+                if mirrored_pair is None:
+                    _report_missing(self, max(1, len(snapshot.missing)), partial=False)
+                    return result
+                if frozenset(mirrored_pair) == snapshot.selected:
+                    # Re-running the same pair cannot mirror an asymmetric effect.
+                    _connect_report(
+                        self,
+                        {"WARNING"},
+                        "Mirrored connect skipped: the selection is its own mirror",
+                    )
+                    return result
+            elif mirrored_history is None:
                 _report_missing(self, max(1, len(snapshot.missing)), partial=False)
                 return result
 
             mirrored_history_coords = tuple(
                 Vector((float(coords[index][0]), float(coords[index][1]), float(coords[index][2])))
-                for index in mirrored_history
+                for index in (mirrored_history or ())
+            )
+            mirrored_pair_coords = tuple(
+                Vector((float(coords[index][0]), float(coords[index][1]), float(coords[index][2])))
+                for index in (mirrored_pair or ())
             )
             selected_coords = tuple(
                 Vector((float(coords[index][0]), float(coords[index][1]), float(coords[index][2])))
                 for index in selected_indices
             )
+
+            marked_edge_history = ()
+            if connect_form == "FORM_EDGE":
+                marked_edge_history = (
+                    _mark_connect_history_edges(
+                        bm,
+                        history_edge_indices,
+                        coords,
+                        axis_index,
+                        tolerance,
+                    )
+                    or ()
+                )
+                if not marked_edge_history:
+                    _report_missing(self, max(1, len(history_edge_indices)), partial=False)
+                    return result
 
             try:
                 backup_mesh = backup.create_topology_backup(bm)
@@ -964,20 +1226,29 @@ class MESH_OT_ydd_symmetric_edit_connect(bpy.types.Operator):
 
             try:
                 bm = bmesh.from_edit_mesh(mesh)
-                if not _set_vertex_path(
-                    bm,
-                    mirrored_history_coords,
-                    axis_index,
-                    tolerance,
-                ):
+                if connect_form == "FORM_EDGE":
+                    path_set = _set_edge_path(bm, mirrored_edges, axis_index, tolerance)
+                else:
+                    path_coords = mirrored_pair_coords if connect_form == "FORM_PAIR" else mirrored_history_coords
+                    path_set = _set_vertex_path(bm, path_coords, axis_index, tolerance)
+                    if path_set and connect_form == "FORM_PAIR":
+                        # Pair mode ignores history; keep the mirror side history-free.
+                        bm.select_history.clear()
+                if not path_set:
                     mirror_warning = "Mirrored connect path changed after native execution; mirrored connect skipped"
                 else:
+                    if connect_form in {"FORM_VERT", "FORM_PAIR"}:
+                        bm.select_flush(True)
                     # Snapshot verts before second native (for p-newness).
                     pre_second_coords = _vertex_coords_snapshot(bm)
                     # Re-stamp so the second call's novelty set is R′ only.
                     _remark_connect_markers(bm)
                     bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
-                    second_result = _native_vert_connect_path()
+                    try:
+                        second_result = _native_vert_connect_path()
+                    except RuntimeError as exc:
+                        second_result = {"CANCELLED"}
+                        mirror_warning = str(exc)
                     bm = bmesh.from_edit_mesh(mesh)
                     # CANCELLED → always rollback regardless of side effects.
                     if "CANCELLED" in second_result and "FINISHED" not in second_result:
@@ -1009,13 +1280,28 @@ class MESH_OT_ydd_symmetric_edit_connect(bpy.types.Operator):
             # Selection restore is best effort (signature compare is post-normalize).
             try:
                 bm = bmesh.from_edit_mesh(mesh)
-                if _set_vertex_path(
-                    bm,
-                    history_coords,
-                    axis_index,
-                    tolerance,
-                    selected_coords=selected_coords,
-                ):
+                if connect_form == "FORM_EDGE":
+                    restored = _restore_connect_edge_history(bm, marked_edge_history, tolerance)
+                elif connect_form == "FORM_PAIR" and not history_coords:
+                    restored = _set_vertex_path(
+                        bm,
+                        selected_coords,
+                        axis_index,
+                        tolerance,
+                        selected_coords=selected_coords,
+                    )
+                    bm.select_history.clear()
+                else:
+                    restored = _set_vertex_path(
+                        bm,
+                        history_coords,
+                        axis_index,
+                        tolerance,
+                        selected_coords=selected_coords,
+                    )
+                if restored:
+                    if connect_form in {"FORM_VERT", "FORM_PAIR"}:
+                        bm.select_flush(True)
                     bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
                 else:
                     mirror_warning = (

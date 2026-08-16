@@ -5,6 +5,7 @@ FACE_ID_LAYER = ".yse_original_face_id"
 FACE_MIRROR_ID_LAYER = ".yse_mirror_face_id"
 FACE_HIDDEN_LAYER = ".yse_face_hidden"
 HISTORY_TOKEN_LAYER = ".yse_history_token"
+CONNECT_HISTORY_EDGE_TOKEN_LAYER = ".yse_connect_history_edge_token"
 VERT_SELECTION_LAYER = ".yse_vertex_selection"
 EDGE_SELECTION_LAYER = ".yse_edge_selection"
 FACE_SELECTION_LAYER = ".yse_face_selection"
@@ -26,6 +27,7 @@ TEMP_LAYER_NAMES = (
     FACE_MIRROR_ID_LAYER,
     FACE_HIDDEN_LAYER,
     HISTORY_TOKEN_LAYER,
+    CONNECT_HISTORY_EDGE_TOKEN_LAYER,
     VERT_SELECTION_LAYER,
     EDGE_SELECTION_LAYER,
     FACE_SELECTION_LAYER,

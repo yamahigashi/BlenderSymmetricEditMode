@@ -197,6 +197,7 @@ def leave_edit(window, area, region) -> None:
 
 def assert_no_temp_layers(bm) -> None:
     assert bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER) is None
+    assert bm.edges.layers.int.get(layer_names.CONNECT_HISTORY_EDGE_TOKEN_LAYER) is None
     assert bm.faces.layers.int.get(layer_names.FACE_ID_LAYER) is None
     assert bm.verts.layers.int.get(layer_names.VERT_BACKUP_ID_LAYER) is None
 
