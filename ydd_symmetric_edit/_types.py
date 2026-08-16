@@ -400,6 +400,10 @@ class KnifeSession:
     # Resident pass-through modals (screencast-style addons) live here; the
     # intervening-modal decline fires only for modals NOT in this set.
     preexisting_modal_operators: tuple[tuple[int, str], ...] = ()
+    # (verts, edges, faces) counts seen by the last new-path poll.  The
+    # watched tools only add geometry before confirmation, so unchanged
+    # counts mean the O(n) marker scan can be skipped on large meshes.
+    poll_element_counts: tuple[int, int, int] | None = None
 
 
 @dataclass(slots=True)

@@ -135,14 +135,21 @@ def _session_has_new_path(session: KnifeSession) -> bool:
     try:
         if obj.mode == "EDIT":
             bm = bmesh.from_edit_mesh(obj.data)
-            if session.tool_kind == "RIP":
-                return rip.has_rip_result(bm)
-            if session.tool_kind in EXTRUDE_TOOL_KINDS:
-                return extrude.has_extrude_result(bm)
-            marker_layer = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
-            if marker_layer is None:
+            counts = (len(bm.verts), len(bm.edges), len(bm.faces))
+            if counts == session.poll_element_counts:
                 return False
-            return any(int(edge[marker_layer]) <= 0 for edge in bm.edges)
+            if session.tool_kind == "RIP":
+                found = rip.has_rip_result(bm)
+            elif session.tool_kind in EXTRUDE_TOOL_KINDS:
+                found = extrude.has_extrude_result(bm)
+            else:
+                marker_layer = bm.edges.layers.int.get(layer_names.EDGE_ORIGINAL_LAYER)
+                if marker_layer is None:
+                    return False
+                found = any(int(edge[marker_layer]) <= 0 for edge in bm.edges)
+            if not found:
+                session.poll_element_counts = counts
+            return found
     except (ReferenceError, RuntimeError):
         return False
     return False
@@ -202,9 +209,7 @@ def _capture_confirmed_extrude_operator(session: KnifeSession, window) -> None:
 
 def _confirmed_extrude_fully_captured(session: KnifeSession) -> bool:
     return bool(
-        session.confirmed_operator_idname
-        and session.confirmed_operator_pointer
-        and session.extrude_options_captured
+        session.confirmed_operator_idname and session.confirmed_operator_pointer and session.extrude_options_captured
     )
 
 

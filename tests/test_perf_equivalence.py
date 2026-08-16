@@ -3353,6 +3353,60 @@ def _check_prepare_session_invoke_does_not_resolve():
         bm.free()
 
 
+def _check_new_path_poll_count_short_circuit():
+    """Unchanged element counts must skip the O(n) marker scan between polls."""
+
+    class CountingSequence:
+        def __init__(self, values):
+            self.values = list(values)
+            self.iterations = 0
+
+        def __iter__(self):
+            self.iterations += 1
+            return iter(self.values)
+
+        def __len__(self):
+            return len(self.values)
+
+    class FakeEdge:
+        def __init__(self, marker):
+            self.marker = marker
+
+        def __getitem__(self, _layer):
+            return self.marker
+
+    edges = CountingSequence([FakeEdge(1), FakeEdge(2)])
+    marker_layer = object()
+    setattr(cast(Any, edges), "layers", SimpleNamespace(int=SimpleNamespace(get=lambda _name: marker_layer)))
+    fake_bm = SimpleNamespace(verts=[object()] * 4, edges=edges, faces=[object()])
+    fake_obj = SimpleNamespace(type="MESH", mode="EDIT", data=SimpleNamespace(name="mesh"))
+    fake_bpy = SimpleNamespace(data=SimpleNamespace(objects=SimpleNamespace(get=lambda _name: fake_obj)))
+    fake_bmesh = SimpleNamespace(from_edit_mesh=lambda _mesh: fake_bm)
+    session = SimpleNamespace(object_name="obj", mesh_name="mesh", tool_kind="KNIFE", poll_element_counts=None)
+
+    original_bpy = watcher_module.bpy
+    original_bmesh = watcher_module.bmesh
+    setattr(watcher_module, "bpy", fake_bpy)
+    setattr(watcher_module, "bmesh", fake_bmesh)
+    try:
+        assert watcher_module._session_has_new_path(cast(Any, session)) is False
+        assert edges.iterations == 1
+        assert session.poll_element_counts == (4, 2, 1)
+        # Same counts: the scan must not run again.
+        assert watcher_module._session_has_new_path(cast(Any, session)) is False
+        assert edges.iterations == 1
+        # New geometry changes the counts and re-arms the scan.
+        edges.values.append(FakeEdge(0))
+        assert watcher_module._session_has_new_path(cast(Any, session)) is True
+        assert edges.iterations == 2
+        # A found path must stay found on the next tick (counts not stored).
+        assert watcher_module._session_has_new_path(cast(Any, session)) is True
+        assert edges.iterations == 3
+    finally:
+        setattr(watcher_module, "bpy", original_bpy)
+        setattr(watcher_module, "bmesh", original_bmesh)
+
+
 def _check_rip_invoke_does_not_resolve():
     """RIP invoke builds its snapshot without consuming full topology resolution."""
 
@@ -3986,6 +4040,7 @@ def run():
     _check_lazy_restore_state_matrix()
     _check_prepare_session_invoke_does_not_resolve()
     _check_rip_invoke_does_not_resolve()
+    _check_new_path_poll_count_short_circuit()
     # Duplicate COMMITTED records and F9 ABSENT are exercised by the existing
     # GUI-only history and discriminator suites.
     print("YSE_PERF_EQUIV_OK", flush=True)
