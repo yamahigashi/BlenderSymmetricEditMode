@@ -23,6 +23,12 @@ versions = ["4.2", "5.2"]
 tags = ["fast", "unit"]
 
 [[tests]]
+file = "test_inset_bevel_units.py"
+mode = "fast-pytest"
+markers = []
+tags = ["fast", "unit"]
+
+[[tests]]
 file = "test_core.py"
 mode = "background"
 markers = ["YSE_CORE_TEST_OK"]
@@ -533,3 +539,17 @@ mode = "gui"
 markers = ["YSE_SELECT_MIRRORED_GUI_TEST_OK"]
 versions = ["4.2", "5.2"]
 tags = ["gui", "selection"]
+
+[[tests]]
+file = "test_inset_route.py"
+mode = "gui"
+markers = ["YSE_INSET_ROUTE_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "inset"]
+
+[[tests]]
+file = "test_bevel_route.py"
+mode = "gui"
+markers = ["YSE_BEVEL_ROUTE_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "bevel"]
