@@ -719,11 +719,6 @@ def _register_replay_keymaps(
     if addon_config is None:
         raise RuntimeError("Blender's add-on key configuration is unavailable")
 
-    if not connect_routes:
-        print("ydd Symmetric Edit: no Connect keymap route found; Connect mirroring not registered")
-    if not merge_routes:
-        print("ydd Symmetric Edit: no Merge keymap route found; Merge mirroring not registered")
-
     addon_keymaps = {}
     for operator_id, menu_name, routes in (
         (CONNECT_OPERATOR, "", connect_routes),
