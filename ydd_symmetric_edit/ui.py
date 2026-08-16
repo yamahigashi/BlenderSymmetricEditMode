@@ -27,7 +27,8 @@ class YSE_AddonPreferences(bpy.types.AddonPreferences):
             name="Symmetric Edit Mode",
             description=(
                 "Mirror Blender's native Knife, Loop Cut, Offset Edge Loop Cut, Rip, "
-                "Vertex Connect, Merge, Delete, Dissolve, Edge Collapse, and Extrude. "
+                "Vertex Connect, Merge, Delete, Dissolve, Edge Collapse, Extrude, "
+                "Inset, and Bevel. "
                 "Use the native tool on one side; the mirror is applied on confirm"
             ),
             default=False,
@@ -48,7 +49,8 @@ class YSE_AddonPreferences(bpy.types.AddonPreferences):
         layout.label(
             text=(
                 "Knife, Loop Cut, Offset Edge Loop Cut, Rip (V), Connect (J), "
-                "Merge (M), Delete (X), Dissolve, Edge Collapse, Extrude (E)"
+                "Merge (M), Delete (X), Dissolve, Edge Collapse, Extrude (E), "
+                "Inset (I), Bevel"
             )
         )
         layout.label(text="Native events and tools are not replaced.")

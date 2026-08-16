@@ -17,7 +17,7 @@ from datetime import date  # noqa: E402
 import bpy  # noqa: E402
 from bpy.props import PointerProperty  # noqa: E402
 
-from . import delete_dissolve, extrude_menu, keymaps, operators, replay, trial, ui  # noqa: E402
+from . import delete_dissolve, extrude_menu, inset_bevel, keymaps, operators, replay, trial, ui  # noqa: E402
 
 _TRIAL_START_MAX_ATTEMPTS = 20
 
@@ -88,6 +88,7 @@ def register():
             *replay.CLASSES,
             *delete_dissolve.CLASSES,
             *extrude_menu.CLASSES,
+            *inset_bevel.CLASSES,
         ):
             bpy.utils.register_class(cls)
             cleanups.append(lambda cls=cls: bpy.utils.unregister_class(cls))
@@ -142,6 +143,7 @@ def unregister():
             *replay.CLASSES,
             *delete_dissolve.CLASSES,
             *extrude_menu.CLASSES,
+            *inset_bevel.CLASSES,
         )
     ):
         # register() may already have unwound some classes after a partial

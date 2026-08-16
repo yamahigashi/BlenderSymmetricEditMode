@@ -11,6 +11,12 @@ from ._types import (
 
 _SESSIONS: dict[int, KnifeSession] = {}
 _HISTORY_RECORDS: OrderedDict[int, HistoryRecord] = OrderedDict()
+
+
+def sessions_active() -> bool:
+    return bool(_SESSIONS)
+
+
 _NEXT_HISTORY_TOKEN = max(1, int(time.time_ns() & 0x7FFFFFFF))
 _HISTORY_REPAIR_QUEUED = False
 _HISTORY_REPAIR_BUSY = False

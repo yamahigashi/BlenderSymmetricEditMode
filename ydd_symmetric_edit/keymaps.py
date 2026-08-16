@@ -18,6 +18,8 @@ INTERCEPT_OPERATOR = "mesh.ydd_symmetric_edit_intercept"
 CONNECT_OPERATOR = "mesh.ydd_symmetric_edit_connect"
 DISSOLVE_MODE_OPERATOR = "mesh.ydd_symmetric_edit_dissolve_mode"
 EXTRUDE_MENU_OPENER = "mesh.ydd_symmetric_edit_extrude_menu"
+INSET_BEVEL_INTERCEPT_OPERATOR = "mesh.ydd_symmetric_edit_inset_bevel_intercept"
+INSET_BEVEL_NATIVE_OPERATORS = frozenset({"mesh.inset", "mesh.bevel"})
 MERGE_MENU = "YSE_MT_merge"
 DELETE_MENU = "YSE_MT_delete"
 EXTRUDE_MENU = "YSE_MT_extrude"
@@ -30,7 +32,15 @@ TOOL_KEYMAP_NAME = TOOL_PROFILES["KNIFE"].tool_idnames[0]
 TOOL_KEYMAP_NAMES = frozenset(tool_idname for profile in TOOL_PROFILES.values() for tool_idname in profile.tool_idnames)
 OPERATOR_TOOL_KINDS = {profile.keymap_operator: profile.kind for profile in TOOL_PROFILES.values()}
 
-_OWN_OPERATOR_IDS = frozenset({INTERCEPT_OPERATOR, CONNECT_OPERATOR, DISSOLVE_MODE_OPERATOR, EXTRUDE_MENU_OPENER})
+_OWN_OPERATOR_IDS = frozenset(
+    {
+        INTERCEPT_OPERATOR,
+        CONNECT_OPERATOR,
+        DISSOLVE_MODE_OPERATOR,
+        EXTRUDE_MENU_OPENER,
+        INSET_BEVEL_INTERCEPT_OPERATOR,
+    }
+)
 _WATCH_INTERVAL = 1.0
 _RETRY_INTERVAL = 0.25
 
@@ -47,6 +57,9 @@ _REPLAY_FINGERPRINT: _ReplayFingerprint | None = None
 _ExtrudeMenuFingerprint = tuple[str, str, str, KeymapEvent, str]
 _EXTRUDE_MENU_FINGERPRINT: tuple[_ExtrudeMenuFingerprint, ...] | None = None
 _EXTRUDE_MENU_ROUTES_BY_KEY: dict[str, ExtrudeMenuRoute] = {}
+_InsetBevelFingerprint = tuple[str, str, str, str, KeymapEvent, bool, tuple[tuple[str, object], ...]]
+_INSET_BEVEL_FINGERPRINT: tuple[_InsetBevelFingerprint, ...] | None = None
+_INSET_BEVEL_ROUTES_BY_KEY: dict[str, InsetBevelRoute] = {}
 _HAS_DELETE_ROUTES = False
 _HAS_EXTRUDE_MENU_ROUTES = False
 _ENABLED = False
@@ -104,6 +117,28 @@ class ExtrudeMenuRoute:
     menu_name: str = NATIVE_EXTRUDE_MENU
     is_tool: bool = False
     route_key: str = ""
+
+    @property
+    def keymap_identity(self) -> KeymapIdentity:
+        return KeymapIdentity(
+            name=self.keymap_name,
+            space_type=self.space_type,
+            region_type=self.region_type,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class InsetBevelRoute:
+    """One scanned native mesh.inset / mesh.bevel binding to intercept."""
+
+    keymap_name: str
+    space_type: str
+    region_type: str
+    event: KeymapEvent
+    native_operator: str
+    is_tool: bool = False
+    route_key: str = ""
+    kmi_properties: tuple[tuple[str, object], ...] = ()
 
     @property
     def keymap_identity(self) -> KeymapIdentity:
@@ -537,6 +572,91 @@ def _dissolve_mode_routes(
     return routes, fingerprint
 
 
+def _inset_bevel_fingerprint(route: InsetBevelRoute) -> _InsetBevelFingerprint:
+    return (
+        route.keymap_name,
+        route.space_type,
+        route.region_type,
+        route.native_operator,
+        route.event,
+        route.is_tool,
+        route.kmi_properties,
+    )
+
+
+def _kmi_menu_name(item) -> str:
+    if item.idname != "wm.call_menu":
+        return ""
+    return str(getattr(item.properties, "name", "") or "")
+
+
+def _inset_bevel_overlap_count(keymap, item) -> int:
+    from .inset_bevel import is_collision_consumer, kmi_events_overlap
+
+    session_reflect = frozenset(OPERATOR_TOOL_KINDS)
+    total = 0
+    for other in keymap.keymap_items:
+        if not other.active:
+            continue
+        if not is_collision_consumer(
+            other.idname,
+            menu_name=_kmi_menu_name(other),
+            session_reflect_idnames=session_reflect,
+        ):
+            continue
+        if kmi_events_overlap(item, other):
+            total += 1
+    return total
+
+
+def _inset_bevel_routes(
+    window_manager,
+) -> tuple[list[InsetBevelRoute], tuple[_InsetBevelFingerprint, ...]]:
+    from .inset_bevel import is_space_tool_keymap
+
+    key_config = window_manager.keyconfigs.user
+    if key_config is None:
+        return [], ()
+
+    routes: list[InsetBevelRoute] = []
+    seen: set[_InsetBevelFingerprint] = set()
+    for keymap in key_config.keymaps:
+        if keymap.is_modal:
+            continue
+        for item in keymap.keymap_items:
+            if not item.active:
+                continue
+            if item.idname not in INSET_BEVEL_NATIVE_OPERATORS:
+                continue
+            if _inset_bevel_overlap_count(keymap, item) != 1:
+                continue
+            event = _event_signature(item)
+            route = InsetBevelRoute(
+                keymap_name=keymap.name,
+                space_type=keymap.space_type,
+                region_type=keymap.region_type,
+                event=event,
+                native_operator=item.idname,
+                is_tool=is_space_tool_keymap(keymap.name),
+                route_key=_make_route_key(
+                    keymap.name,
+                    keymap.space_type,
+                    keymap.region_type,
+                    item.idname,
+                    event,
+                ),
+                kmi_properties=_capture_set_kmi_properties(item),
+            )
+            identity = _inset_bevel_fingerprint(route)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            routes.append(route)
+
+    fingerprint = tuple(_inset_bevel_fingerprint(route) for route in routes)
+    return routes, fingerprint
+
+
 def _is_owned_item(item) -> bool:
     if item.idname in _OWN_OPERATOR_IDS:
         return True
@@ -743,6 +863,39 @@ def _register_extrude_menu_keymaps(window_manager, routes: list[ExtrudeMenuRoute
         _REGISTERED_ITEMS.append((keymap, item))
 
 
+def _register_inset_bevel_keymaps(window_manager, routes: list[InsetBevelRoute]) -> None:
+    addon_config = window_manager.keyconfigs.addon
+    if addon_config is None:
+        raise RuntimeError("Blender's add-on key configuration is unavailable")
+
+    addon_keymaps = {}
+    for route in routes:
+        cache_key = (route.keymap_identity, route.is_tool)
+        keymap = addon_keymaps.get(cache_key)
+        if keymap is None:
+            keymap = addon_config.keymaps.new(
+                name=route.keymap_name,
+                space_type=route.space_type,
+                region_type=route.region_type,
+                modal=False,
+                tool=route.is_tool,
+            )
+            addon_keymaps[cache_key] = keymap
+
+        item = keymap.keymap_items.new(
+            INSET_BEVEL_INTERCEPT_OPERATOR,
+            head=True,
+            **_event_arguments(route.event),
+        )
+        try:
+            item.properties.route_key = route.route_key
+        except Exception:
+            keymap.keymap_items.remove(item)
+            raise
+        item.active = _ENABLED
+        _REGISTERED_ITEMS.append((keymap, item))
+
+
 def _rebuild(
     window_manager,
     routes: list[NativeRoute],
@@ -751,6 +904,7 @@ def _rebuild(
     delete_routes: list[DeleteMenuRoute],
     dissolve_routes: list[DeleteMenuRoute],
     extrude_menu_routes: list[ExtrudeMenuRoute],
+    inset_bevel_routes: list[InsetBevelRoute],
 ) -> None:
     global _HAS_DELETE_ROUTES, _HAS_EXTRUDE_MENU_ROUTES
 
@@ -762,6 +916,7 @@ def _rebuild(
     _REGISTERED_ITEMS.clear()
     _ROUTES_BY_KEY.clear()
     _EXTRUDE_MENU_ROUTES_BY_KEY.clear()
+    _INSET_BEVEL_ROUTES_BY_KEY.clear()
     _HAS_DELETE_ROUTES = False
     _HAS_EXTRUDE_MENU_ROUTES = False
 
@@ -771,17 +926,20 @@ def _rebuild(
         _register_delete_menu_keymaps(window_manager, delete_routes)
         _register_dissolve_mode_keymaps(window_manager, dissolve_routes)
         _register_extrude_menu_keymaps(window_manager, extrude_menu_routes)
+        _register_inset_bevel_keymaps(window_manager, inset_bevel_routes)
     except Exception:
         _remove_owned_items(addon_config)
         _REGISTERED_ITEMS.clear()
         _HAS_DELETE_ROUTES = False
         _HAS_EXTRUDE_MENU_ROUTES = False
         _EXTRUDE_MENU_ROUTES_BY_KEY.clear()
+        _INSET_BEVEL_ROUTES_BY_KEY.clear()
         window_manager.keyconfigs.update()
         raise
 
     _ROUTES_BY_KEY.update((route.route_key, route) for route in routes)
     _EXTRUDE_MENU_ROUTES_BY_KEY.update((route.route_key, route) for route in extrude_menu_routes)
+    _INSET_BEVEL_ROUTES_BY_KEY.update((route.route_key, route) for route in inset_bevel_routes)
     _HAS_DELETE_ROUTES = bool(delete_routes)
     _HAS_EXTRUDE_MENU_ROUTES = bool(extrude_menu_routes)
     window_manager.keyconfigs.update()
@@ -789,7 +947,7 @@ def _rebuild(
 
 def _refresh(*, force: bool = False) -> bool:
     global _FINGERPRINT, _REPLAY_FINGERPRINT, _DELETE_FINGERPRINT, _DISSOLVE_FINGERPRINT
-    global _EXTRUDE_MENU_FINGERPRINT
+    global _EXTRUDE_MENU_FINGERPRINT, _INSET_BEVEL_FINGERPRINT
 
     window_manager = _window_manager()
     if window_manager is None:
@@ -807,6 +965,7 @@ def _refresh(*, force: bool = False) -> bool:
     delete_routes, delete_fingerprint = _delete_menu_routes(window_manager)
     dissolve_routes, dissolve_fingerprint = _dissolve_mode_routes(window_manager)
     extrude_menu_routes, extrude_menu_fingerprint = _extrude_menu_routes(window_manager)
+    inset_bevel_routes, inset_bevel_fingerprint = _inset_bevel_routes(window_manager)
     if (
         force
         or fingerprint != _FINGERPRINT
@@ -814,6 +973,7 @@ def _refresh(*, force: bool = False) -> bool:
         or delete_fingerprint != _DELETE_FINGERPRINT
         or dissolve_fingerprint != _DISSOLVE_FINGERPRINT
         or extrude_menu_fingerprint != _EXTRUDE_MENU_FINGERPRINT
+        or inset_bevel_fingerprint != _INSET_BEVEL_FINGERPRINT
     ):
         _rebuild(
             window_manager,
@@ -823,12 +983,14 @@ def _refresh(*, force: bool = False) -> bool:
             delete_routes,
             dissolve_routes,
             extrude_menu_routes,
+            inset_bevel_routes,
         )
         _FINGERPRINT = fingerprint
         _REPLAY_FINGERPRINT = replay_fingerprint
         _DELETE_FINGERPRINT = delete_fingerprint
         _DISSOLVE_FINGERPRINT = dissolve_fingerprint
         _EXTRUDE_MENU_FINGERPRINT = extrude_menu_fingerprint
+        _INSET_BEVEL_FINGERPRINT = inset_bevel_fingerprint
     return True
 
 
@@ -1031,6 +1193,46 @@ def extrude_menu_route_is_current(route_key: str) -> bool:
     )
 
 
+def inset_bevel_route(route_key: str) -> InsetBevelRoute | None:
+    return _INSET_BEVEL_ROUTES_BY_KEY.get(route_key)
+
+
+def inset_bevel_route_is_current(route_key: str) -> bool:
+    if not _RUNNING or not _ENABLED:
+        return False
+    route = _INSET_BEVEL_ROUTES_BY_KEY.get(route_key)
+    if route is None:
+        return False
+
+    window_manager = _window_manager()
+    if window_manager is None or window_manager.keyconfigs.user is None:
+        return False
+    keymap = _find_keymap(window_manager.keyconfigs.user, route.keymap_identity)
+    if keymap is None:
+        return False
+
+    from .inset_bevel import is_collision_consumer, kmi_events_overlap
+
+    session_reflect = frozenset(OPERATOR_TOOL_KINDS)
+    matching = [
+        item
+        for item in keymap.keymap_items
+        if item.active
+        and is_collision_consumer(
+            item.idname,
+            menu_name=_kmi_menu_name(item),
+            session_reflect_idnames=session_reflect,
+        )
+        and kmi_events_overlap(route.event, item)  # ty: ignore[invalid-argument-type]
+    ]
+    if len(matching) != 1:
+        return False
+    item = matching[0]
+    if item.idname != route.native_operator:
+        return False
+    return _capture_set_kmi_properties(item) == route.kmi_properties
+
+
 def sync(enabled: bool) -> None:
     """Apply the persistent toggle without changing Blender's native KMI."""
 
@@ -1063,8 +1265,10 @@ def sync(enabled: bool) -> None:
 
 def register(*, enabled: bool = False) -> None:
     global _ENABLED, _FINGERPRINT, _REPLAY_FINGERPRINT, _DELETE_FINGERPRINT, _DISSOLVE_FINGERPRINT
-    global _EXTRUDE_MENU_FINGERPRINT
+    global _EXTRUDE_MENU_FINGERPRINT, _INSET_BEVEL_FINGERPRINT
     global _HAS_DELETE_ROUTES, _HAS_EXTRUDE_MENU_ROUTES, _RUNNING
+
+    from . import inset_bevel
 
     _RUNNING = True
     _ENABLED = bool(enabled)
@@ -1073,11 +1277,14 @@ def register(*, enabled: bool = False) -> None:
     _DELETE_FINGERPRINT = None
     _DISSOLVE_FINGERPRINT = None
     _EXTRUDE_MENU_FINGERPRINT = None
+    _INSET_BEVEL_FINGERPRINT = None
     _HAS_DELETE_ROUTES = False
     _HAS_EXTRUDE_MENU_ROUTES = False
     _REGISTERED_ITEMS.clear()
     _ROUTES_BY_KEY.clear()
     _EXTRUDE_MENU_ROUTES_BY_KEY.clear()
+    _INSET_BEVEL_ROUTES_BY_KEY.clear()
+    inset_bevel.install_runtime_hooks()
 
     window_manager = _window_manager()
     if window_manager is not None:
@@ -1098,8 +1305,10 @@ def register(*, enabled: bool = False) -> None:
 
 def unregister() -> None:
     global _ENABLED, _FINGERPRINT, _REPLAY_FINGERPRINT, _DELETE_FINGERPRINT, _DISSOLVE_FINGERPRINT
-    global _EXTRUDE_MENU_FINGERPRINT
+    global _EXTRUDE_MENU_FINGERPRINT, _INSET_BEVEL_FINGERPRINT
     global _HAS_DELETE_ROUTES, _HAS_EXTRUDE_MENU_ROUTES, _RUNNING
+
+    from . import inset_bevel
 
     _RUNNING = False
     _ENABLED = False
@@ -1108,6 +1317,7 @@ def unregister() -> None:
     if bpy.app.timers.is_registered(_poll_gizmo_global):
         bpy.app.timers.unregister(_poll_gizmo_global)
     gizmo_adopt.clear_runtime_state()
+    inset_bevel.cleanup_runtime()
 
     window_manager = _window_manager()
     if window_manager is not None:
@@ -1120,10 +1330,12 @@ def unregister() -> None:
     _REGISTERED_ITEMS.clear()
     _ROUTES_BY_KEY.clear()
     _EXTRUDE_MENU_ROUTES_BY_KEY.clear()
+    _INSET_BEVEL_ROUTES_BY_KEY.clear()
     _FINGERPRINT = None
     _REPLAY_FINGERPRINT = None
     _DELETE_FINGERPRINT = None
     _DISSOLVE_FINGERPRINT = None
     _EXTRUDE_MENU_FINGERPRINT = None
+    _INSET_BEVEL_FINGERPRINT = None
     _HAS_DELETE_ROUTES = False
     _HAS_EXTRUDE_MENU_ROUTES = False
