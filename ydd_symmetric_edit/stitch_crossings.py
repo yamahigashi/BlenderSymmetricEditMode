@@ -405,7 +405,7 @@ def plan_mirrored_path_crossings(
             assert result.coordinate is not None
             raw_crossings.append(
                 _RawMirroredPathCrossing(
-                    coordinate=result.coordinate,
+                    coordinate=result.coordinate,  # ty: ignore[invalid-argument-type]  # fake-bpy/ty stub limitation
                     positive=(_occurrence(positive_edge, result.factor_a, result.endpoint_a, axis_index),),
                     negative=(_occurrence(negative_edge, result.factor_b, result.endpoint_b, axis_index),),
                 )
@@ -464,7 +464,7 @@ def plan_mirrored_path_crossings(
                 )
                 raw_crossings.append(
                     _RawMirroredPathCrossing(
-                        coordinate=result.coordinate,
+                        coordinate=result.coordinate,  # ty: ignore[invalid-argument-type]  # fake-bpy/ty stub limitation
                         positive=(moving_occurrence, fixed_positive) if moving_is_positive else (fixed_positive,),
                         negative=(fixed_negative,) if moving_is_positive else (moving_occurrence, fixed_negative),
                     )
@@ -515,7 +515,7 @@ def plan_mirrored_path_crossings(
                 negative_occurrences.append(_occurrence(edge, factor, endpoint, axis_index))
             raw_crossings.append(
                 _RawMirroredPathCrossing(
-                    coordinate=result.coordinate,
+                    coordinate=result.coordinate,  # ty: ignore[invalid-argument-type]  # fake-bpy/ty stub limitation
                     positive=tuple(positive_occurrences),
                     negative=tuple(negative_occurrences),
                 )
@@ -539,8 +539,8 @@ def plan_mirrored_path_crossings(
             negative_occurrences = []
         clusters.append(
             _MirroredPathCrossingCluster(
-                positive_coordinate=representative,
-                negative_coordinate=mirrored,
+                positive_coordinate=representative,  # ty: ignore[invalid-argument-type]  # fake-bpy/ty stub limitation
+                negative_coordinate=mirrored,  # ty: ignore[invalid-argument-type]  # fake-bpy/ty stub limitation
                 positive=_deduplicate_occurrences(positive_occurrences),
                 negative=_deduplicate_occurrences(negative_occurrences),
                 tolerance=tolerance,

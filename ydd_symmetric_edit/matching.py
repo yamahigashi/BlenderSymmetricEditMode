@@ -450,7 +450,7 @@ class VertexMirrorLookup:
                 dtype=numpy.float64,
             ).reshape(len(positions), 3)
         inverse = 1.0 / max(self._tolerance, 1.0e-12)
-        scaled_queries = query_coords * inverse
+        scaled_queries = query_coords * inverse  # ty: ignore[unsupported-operator]  # fake-bpy/ty stub limitation
         if not numpy.isfinite(scaled_queries).all() or numpy.any(numpy.abs(scaled_queries) >= 2**62):
             return None
 
@@ -513,7 +513,7 @@ class VertexMirrorLookup:
         distances = distances[within]
         # Window traversal is already query-grouped; a per-query (distance,
         # index) sort is only needed when some query has several candidates.
-        if len(query_indices) and int(numpy.bincount(query_indices).max()) > 1:
+        if len(query_indices) and int(numpy.bincount(query_indices).max()) > 1:  # ty: ignore[invalid-argument-type]  # fake-bpy/ty stub limitation
             candidate_order = numpy.lexsort((registered_indices, distances, query_indices))
             query_indices = query_indices[candidate_order]
             registered_indices = registered_indices[candidate_order]
@@ -1148,7 +1148,7 @@ def _one_sided_pair_table(
 
 
 def build_vertex_mirror_lookup(
-    coords: Sequence[Vector] | numpy.ndarray,
+    coords: Sequence[Vector] | Sequence[tuple[float, float, float]] | numpy.ndarray,
     axis_index: int,
     tolerance: float,
 ) -> VertexMirrorLookup:

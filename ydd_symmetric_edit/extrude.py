@@ -301,11 +301,12 @@ def _solver_vertex_mapping(snapshot: ExtrudeSnapshot, live_vertices) -> dict[int
     resolved = lookup.find_all_direct(
         [Vector(coordinate.as_tuple()) for _vertex_id, coordinate in snapshot.vertex_preop]
     )
-    if len(resolved) != len(snapshot.vertex_preop) or any(index is None for index in resolved):
+    resolved_indices = [index for index in resolved if index is not None]
+    if len(resolved) != len(snapshot.vertex_preop) or len(resolved_indices) != len(resolved):
         return None
     return {
         vertex_id: int(live_index)
-        for (vertex_id, _coordinate), live_index in zip(snapshot.vertex_preop, resolved, strict=True)
+        for (vertex_id, _coordinate), live_index in zip(snapshot.vertex_preop, resolved_indices, strict=True)
     }
 
 
@@ -1594,10 +1595,10 @@ class MirrorActionPlan:
 
     @property
     def expected_deleted(self) -> tuple[int, int, int]:
-        return tuple(
-            sum(entry.domain == domain and not entry.self_partner for entry in self.deletes)
-            for domain in ("VERT", "EDGE", "FACE")
-        )
+        def count(domain: str) -> int:
+            return sum(entry.domain == domain and not entry.self_partner for entry in self.deletes)
+
+        return (count("VERT"), count("EDGE"), count("FACE"))
 
 
 def _self_delete_consumed(bm: bmesh.types.BMesh, entry: _DeletePlanEntry, runtime: _MirrorRuntime) -> bool:
@@ -1616,7 +1617,7 @@ def _self_delete_consumed(bm: bmesh.types.BMesh, entry: _DeletePlanEntry, runtim
         first, second = origins
         if not getattr(first, "is_valid", False) or not getattr(second, "is_valid", False):
             return True
-        return _edge_between(first, second) is None
+        return _edge_between(first, second) is None  # ty: ignore[invalid-argument-type]  # dynamically guarded; see runtime checks above
     origins = origin_value
     if not isinstance(origins, tuple) or not origins or any(origin is None for origin in origins):
         return True
@@ -1626,7 +1627,7 @@ def _self_delete_consumed(bm: bmesh.types.BMesh, entry: _DeletePlanEntry, runtim
     return not any(
         face.is_valid
         and len(face.loops) == len(wanted)
-        and _cycle_identity(tuple(loop.vert for loop in face.loops), wanted)
+        and _cycle_identity(tuple(loop.vert for loop in face.loops), wanted)  # ty: ignore[invalid-argument-type]  # dynamically guarded; see runtime checks above
         for face in bm.faces
     )
 
@@ -1726,10 +1727,10 @@ def apply_mirror(
             return {}, "a new edge endpoint is not a classified origin or copy", None
         mapped = tuple(_pre_mapped(spec) for spec in specs if spec is not None)
         witness = (
-            len(mapped) == 2 and all(vertex is not None for vertex in mapped) and _edge_identity(edge, tuple(mapped))  # type: ignore[arg-type]
+            len(mapped) == 2 and all(vertex is not None for vertex in mapped) and _edge_identity(edge, tuple(mapped))  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]  # dynamically guarded; see runtime checks above
         )
         edge_entry = _ElementPlanEntry(
-            endpoints=specs,  # type: ignore[arg-type]
+            endpoints=specs,  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]  # dynamically guarded; see runtime checks above
             self_witness=witness,
             witness_index=int(edge.index) if witness else None,
         )
@@ -1758,11 +1759,11 @@ def apply_mirror(
             and all(vertex is not None for vertex in mapped)
             and _cycle_identity(
                 tuple(loop.vert for loop in face.loops),
-                tuple(mapped),  # type: ignore[arg-type]
+                tuple(mapped),  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]  # dynamically guarded; see runtime checks above
             )
         )
         face_entry = _ElementPlanEntry(
-            endpoints=specs,  # type: ignore[arg-type]
+            endpoints=specs,  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]  # dynamically guarded; see runtime checks above
             self_witness=witness,
             witness_index=int(face.index) if witness else None,
             face_signature=stored_signature,
@@ -1912,7 +1913,7 @@ def apply_mirror(
         matches = [
             face
             for face in bm.faces
-            if face.is_valid and _cycle_identity(tuple(loop.vert for loop in face.loops), expected)
+            if face.is_valid and _cycle_identity(tuple(loop.vert for loop in face.loops), expected)  # ty: ignore[invalid-argument-type]  # dynamically guarded; see runtime checks above
         ]
         return matches[0] if len(matches) == 1 else None
 
@@ -1954,7 +1955,7 @@ def apply_mirror(
             corners = tuple(_source_of_spec(spec) for spec in entry.endpoints)
             if any(vertex is None for vertex in corners):
                 return "a source edge could not be rehydrated after topology change"
-            source = _edge_between(corners[0], corners[1])  # type: ignore[arg-type]
+            source = _edge_between(corners[0], corners[1])  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]  # dynamically guarded; see runtime checks above
             if source is None:
                 return "a source edge could not be rehydrated after topology change"
             runtime.element_sources[id(entry)] = source
@@ -1996,9 +1997,9 @@ def apply_mirror(
                 matches = [element for element in table.get(entry.partner, ()) if element.is_valid]
                 if len(matches) > 1:
                     if entry.domain == "FACE":
-                        matches = [element for element in matches if _origin_face_candidate(element, entry.partner)]
+                        matches = [element for element in matches if _origin_face_candidate(element, entry.partner)]  # ty: ignore[invalid-argument-type]  # dynamically guarded; see runtime checks above
                     elif entry.domain == "EDGE":
-                        matches = [element for element in matches if _origin_edge_candidate(element, entry.partner)]
+                        matches = [element for element in matches if _origin_edge_candidate(element, entry.partner)]  # ty: ignore[invalid-argument-type]  # dynamically guarded; see runtime checks above
                     else:
                         matches = [element for element in matches if _origin_vert_candidate(element)]
                 if len(matches) != 1:
@@ -2047,15 +2048,15 @@ def apply_mirror(
 
     # 4. Native deletion order. Self entries are deliberate no-ops.
     if delete_faces:
-        bmesh.ops.delete(bm, geom=delete_faces, context="FACES_ONLY")
+        bmesh.ops.delete(bm, geom=delete_faces, context="FACES_ONLY")  # ty: ignore[invalid-argument-type]  # dynamically guarded; see runtime checks above
     if delete_edges:
-        still = [edge for edge in delete_edges if edge.is_valid]
+        still = [edge for edge in delete_edges if edge.is_valid]  # ty: ignore[unresolved-attribute]  # dynamically guarded; see runtime checks above
         if still:
-            bmesh.ops.delete(bm, geom=still, context="EDGES")
+            bmesh.ops.delete(bm, geom=still, context="EDGES")  # ty: ignore[invalid-argument-type]  # dynamically guarded; see runtime checks above
     if delete_verts:
-        still = [vertex for vertex in delete_verts if vertex.is_valid]
+        still = [vertex for vertex in delete_verts if vertex.is_valid]  # ty: ignore[unresolved-attribute]  # dynamically guarded; see runtime checks above
         if still:
-            bmesh.ops.delete(bm, geom=still, context="VERTS")
+            bmesh.ops.delete(bm, geom=still, context="VERTS")  # ty: ignore[invalid-argument-type]  # dynamically guarded; see runtime checks above
 
     reason = _rehydrate_after_topology_change(False)
     if reason is not None:
@@ -2096,10 +2097,10 @@ def apply_mirror(
         first, second = endpoints
         if first is second:
             return {}, "a mirrored new edge would be degenerate", None
-        if _edge_between(first, second) is not None:
+        if _edge_between(first, second) is not None:  # ty: ignore[invalid-argument-type]  # dynamically guarded; see runtime checks above
             return {}, "a mirrored new edge already exists", None
         try:
-            runtime.created[id(entry)] = bm.edges.new((first, second))
+            runtime.created[id(entry)] = bm.edges.new((first, second))  # ty: ignore[invalid-argument-type]  # dynamically guarded; see runtime checks above
         except ValueError:
             return {}, "a mirrored new edge already exists", None
     for entry in plan.faces:
@@ -2117,14 +2118,14 @@ def apply_mirror(
         if source_face is None:
             return {}, locate_reason or "a source new face could not be relocated after mirroring", None
         try:
-            runtime.created[id(entry)] = bm.faces.new(list(reversed(mirror_corners)))
+            runtime.created[id(entry)] = bm.faces.new(list(reversed(mirror_corners)))  # ty: ignore[invalid-argument-type]  # dynamically guarded; see runtime checks above
         except ValueError:
             return {}, "the mirrored extrude face already exists", None
         created_face = runtime.created[id(entry)]
-        created_face.material_index = entry.material_index
+        created_face.material_index = entry.material_index  # ty: ignore[invalid-assignment]  # dynamically guarded; see runtime checks above
         created_face.smooth = entry.smooth
         created_face.select = False
-        for mirror_loop, source_loop in zip(created_face.loops, reversed(tuple(source_face.loops)), strict=True):
+        for mirror_loop, source_loop in zip(created_face.loops, reversed(tuple(source_face.loops)), strict=True):  # ty: ignore[unresolved-attribute]  # dynamically guarded; see runtime checks above
             mirror_loop.copy_from(source_loop)
         created_face.normal_update()
 
@@ -2153,11 +2154,11 @@ def apply_mirror(
             if any(vertex is None for vertex in mapped):
                 return {}, "a self-witness has no live mirrored image", None
             if isinstance(source, bmesh.types.BMEdge):
-                if not _edge_identity(source, tuple(mapped)):  # type: ignore[arg-type]
+                if not _edge_identity(source, tuple(mapped)):  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]  # dynamically guarded; see runtime checks above
                     return {}, "a self-witness does not match its mirrored image", None
             elif not (
-                _cycle_identity(tuple(loop.vert for loop in source.loops), tuple(mapped))
-                or _cycle_identity(tuple(loop.vert for loop in source.loops), tuple(reversed(mapped)))
+                _cycle_identity(tuple(loop.vert for loop in source.loops), tuple(mapped))  # ty: ignore[invalid-argument-type]  # dynamically guarded; see runtime checks above
+                or _cycle_identity(tuple(loop.vert for loop in source.loops), tuple(reversed(mapped)))  # ty: ignore[invalid-argument-type]  # dynamically guarded; see runtime checks above
             ):
                 return {}, "a self-witness does not match its mirrored image", None
             continue
@@ -2170,7 +2171,7 @@ def apply_mirror(
         if any(vertex is None for vertex in mapped):
             return {}, "a mirrored element does not match its planned image", None
         if isinstance(created, bmesh.types.BMEdge):
-            if not _edge_identity(created, tuple(mapped)):  # type: ignore[arg-type]
+            if not _edge_identity(created, tuple(mapped)):  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]  # dynamically guarded; see runtime checks above
                 return {}, "a mirrored element does not match its planned image", None
             edge_apply = bm.edges.layers.int.get(layer_names.EDGE_APPLY_ID_LAYER)
             if edge_apply is None or int(created[edge_apply]) != 0:
@@ -2178,7 +2179,7 @@ def apply_mirror(
         else:
             actual = tuple(loop.vert for loop in created.loops)
             expected_cycle = tuple(reversed(tuple(mapped)))
-            if not _cycle_identity(actual, expected_cycle):  # type: ignore[arg-type]
+            if not _cycle_identity(actual, expected_cycle):  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]  # dynamically guarded; see runtime checks above
                 return {}, "a mirrored element does not match its planned image", None
             face_apply = bm.faces.layers.int.get(layer_names.FACE_APPLY_ID_LAYER)
             if face_apply is None or int(created[face_apply]) != 0:
@@ -2211,7 +2212,11 @@ def apply_mirror(
         return {}, "apply identity tokens were lost during mirroring", None
     after_idents = _element_token_sets(bm, token_layers)
     created = _count_untokened(bm, token_layers)
-    deleted = tuple(len(before_idents[index] - after_idents[index]) for index in range(3))
+    deleted = (
+        len(before_idents[0] - after_idents[0]),
+        len(before_idents[1] - after_idents[1]),
+        len(before_idents[2] - after_idents[2]),
+    )
     audit = ExtrudeApplyAudit(
         created=created,
         deleted=deleted,

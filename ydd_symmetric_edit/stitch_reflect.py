@@ -10,7 +10,7 @@ import mathutils.geometry
 from mathutils import Vector
 
 from . import stitch_common
-from ._types import CarrierFrameMap, FaceId, MirrorFaceMap
+from ._types import CarrierFrameMap, FaceId, MirrorFaceMap, QuantizedCoordinate
 from .layer_names import EDGE_ORIGINAL_LAYER, FACE_ID_LAYER
 from .matching import coordinates_match, mirror_coordinate
 
@@ -292,6 +292,8 @@ def _carrier_polygon_2d(carrier_frames: CarrierFrameMap | None, face_id: FaceId)
     if carrier_frames is None:
         return None
     frame = carrier_frames.get(face_id)
+    if frame is None:
+        return None
     vectors = _carrier_vectors(frame)
     if vectors is None or not frame.vertices:
         return None
@@ -861,7 +863,7 @@ def _find_interior_chains(
         member_host_ids = {host_ids.get(key) for key in ordered}
         if len(member_host_ids) != 1 or None in member_host_ids:
             return [], "a reflected cut vertex is not on a target boundary edge"
-        target_face_id = next(iter(member_host_ids))
+        target_face_id = next(host_id for host_id in member_host_ids if host_id is not None)
         if target_face_id not in target_ids_by_vertex.get(
             end_a, set()
         ) or target_face_id not in target_ids_by_vertex.get(end_b, set()):
@@ -911,7 +913,7 @@ def _register_face_edges(
     faces: Iterable[bmesh.types.BMFace],
     existing_edges,
     tolerance: float,
-    registered_entries: dict[bmesh.types.BMEdge, tuple[tuple[int, int, int], tuple]] | None = None,
+    registered_entries: dict[bmesh.types.BMEdge, tuple[QuantizedCoordinate, tuple]] | None = None,
 ) -> None:
     if existing_edges is None:
         return
@@ -957,7 +959,7 @@ def _face_split_mutation(
     lineage_by_face: dict[bmesh.types.BMFace, object],
     existing_edges,
     realized_face_ids: set[FaceId],
-    registered_entries: dict[bmesh.types.BMEdge, tuple[tuple[int, int, int], tuple]] | None,
+    registered_entries: dict[bmesh.types.BMEdge, tuple[QuantizedCoordinate, tuple]] | None,
     tolerance: float,
     selection_tracker: stitch_common._SelectionMutationTracker | None,
 ) -> tuple[bmesh.types.BMFace | None, str]:
@@ -976,7 +978,7 @@ def _face_split_mutation(
         # accepts plain float tuples, so normalize or omit it entirely.
         if coords:
             coordinate_tuples = [tuple(coordinate) for coordinate in coords]
-            new_face, _new_loop = bmesh.utils.face_split(target_face, end_a, end_b, coords=coordinate_tuples)
+            new_face, _new_loop = bmesh.utils.face_split(target_face, end_a, end_b, coords=coordinate_tuples)  # ty: ignore[invalid-argument-type]  # fake-bpy/ty stub limitation
         else:
             new_face, _new_loop = bmesh.utils.face_split(target_face, end_a, end_b)
     except (RuntimeError, ValueError) as exc:
@@ -1018,7 +1020,7 @@ def _realize_interior_chain(
     lineage_by_face: dict[bmesh.types.BMFace, object] | None = None,
     classification: dict | None = None,
     carrier_frames: CarrierFrameMap | None = None,
-    registered_entries: dict[bmesh.types.BMEdge, tuple[tuple[int, int, int], tuple]] | None = None,
+    registered_entries: dict[bmesh.types.BMEdge, tuple[QuantizedCoordinate, tuple]] | None = None,
 ) -> tuple[int, int, str, dict | None]:
     """face_split one accepted interior chain. Returns created/already_present delta."""
 
@@ -1069,10 +1071,13 @@ def _realize_interior_chain(
         target_deviation = _carrier_deviation(carrier_frames, chain.target_face_id)
         if target_deviation is None or len(chain.source_face_ids) != len(chain.members):
             return 0, 0, "carrier frame is missing or degenerate for an interior host", existing_edges
+        # Comprehension scope loses the None-narrowing of target_deviation.
+        target_deviation_value = float(target_deviation)
         source_deviations = tuple(
             _carrier_deviation(carrier_frames, source_face_id) for source_face_id in chain.source_face_ids
         )
-        if any(deviation is None for deviation in source_deviations):
+        checked_source_deviations = tuple(deviation for deviation in source_deviations if deviation is not None)
+        if len(checked_source_deviations) != len(source_deviations):
             return 0, 0, "carrier frame is missing or degenerate for an interior host", existing_edges
         strict_faces = [
             face
@@ -1092,12 +1097,12 @@ def _realize_interior_chain(
                         2.5
                         * max(
                             source_deviation,
-                            target_deviation,
+                            target_deviation_value,
                         ),
                     )
                     and _point_is_non_near_face(coordinate, face, tolerance)
                     and _projected_point_inside_carrier(coordinate, face, carrier_frames, chain.target_face_id)
-                    for coordinate, source_deviation in zip(reflected_coords, source_deviations, strict=True)
+                    for coordinate, source_deviation in zip(reflected_coords, checked_source_deviations, strict=True)
                 )
             ]
             if len(relaxed_faces) != 1:
@@ -1137,7 +1142,7 @@ def _realize_interior_chain(
         target_face,
         end_a,
         end_b,
-        coords=[tuple(coordinate) for coordinate in reflected_coords] or None,
+        coords=[tuple(coordinate) for coordinate in reflected_coords] or None,  # ty: ignore[invalid-argument-type]  # fake-bpy/ty stub limitation
         face_layer=face_layer,
         target_faces_by_id=target_faces_by_id,
         lineage_by_face=lineage_by_face,
@@ -1259,8 +1264,8 @@ def _mirror_wire_edges(
     created = 0
     already = 0
     for edge in wire_edges:
-        resolved: list[bmesh.types.BMVert] = []
-        pending_coords: list[Vector] = []
+        resolved: list[bmesh.types.BMVert | None] = []
+        pending_coords: list[Vector | None] = []
         for vertex in edge.verts:
             expected = mirror_coordinate(vertex.co, axis_index)
             candidates = _wire_endpoint_candidates(bm, expected, tolerance)
@@ -1283,6 +1288,8 @@ def _mirror_wire_edges(
         endpoints = []
         for vertex, expected in zip(resolved, pending_coords, strict=False):
             if vertex is None:
+                # The candidate loop above fills exactly one of the pair.
+                assert expected is not None
                 vertex = bm.verts.new(expected)
                 tracker.add_vertex(vertex)
                 vertex.select = False
@@ -1572,7 +1579,7 @@ def apply_reflected_path_topology(
     already_present = 0
 
     realized_face_ids: set[FaceId] = set()
-    registered_entries: dict[bmesh.types.BMEdge, tuple[tuple[int, int, int], tuple]] = {}
+    registered_entries: dict[bmesh.types.BMEdge, tuple[QuantizedCoordinate, tuple]] = {}
     if network_plan.paths:
         # Network mutation starts with a live endpoint store so every
         # face_split can update it through the common helper (R-N1).

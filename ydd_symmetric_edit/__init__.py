@@ -44,7 +44,8 @@ def _make_trial_start_timer():
             preferences.trial_started = date.today().isoformat()
             # Property writes from timers do not tag preferences dirty, so the
             # stamp would be lost on exit without an explicit save.
-            if bpy.context.preferences.use_preferences_save:
+            user_preferences = bpy.context.preferences
+            if user_preferences is not None and user_preferences.use_preferences_save:
                 bpy.ops.wm.save_userpref()
         return None
 
@@ -144,8 +145,9 @@ def unregister():
         )
     ):
         # register() may already have unwound some classes after a partial
-        # failure; unregistering twice raises RuntimeError.
-        if cls.is_registered:
+        # failure; unregistering twice raises RuntimeError.  getattr because
+        # the fake-bpy stubs do not model is_registered on every class.
+        if getattr(cls, "is_registered", False):
             bpy.utils.unregister_class(cls)
 
 

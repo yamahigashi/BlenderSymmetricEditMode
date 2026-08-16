@@ -616,7 +616,9 @@ def _prepare_adjust_last_operation_repeat() -> bool:
         return False
     identifier = getattr(active_operator, "bl_idname", "").upper()
     tool_kind = _WM_OPERATOR_TO_TOOL.get(identifier)
-    profile = TOOL_PROFILES.get(tool_kind) if tool_kind is not None else None
+    if tool_kind is None:
+        return False
+    profile = TOOL_PROFILES.get(tool_kind)
     if profile is None or not profile.supports_adjust_repeat:
         return False
     if not _single_edit_mesh_poll(context):
@@ -661,7 +663,10 @@ def _prepare_adjust_last_operation_repeat() -> bool:
     if tool_kind in EXTRUDE_TOOL_KINDS:
         try:
             bm = bmesh.from_edit_mesh(obj.data)
-            current_mode = context.tool_settings.mesh_select_mode
+            tool_settings = context.tool_settings
+            if tool_settings is None:
+                return False
+            current_mode = tool_settings.mesh_select_mode
             mesh_select_mode = MeshSelectionMode(
                 vertices=bool(current_mode[0]),
                 edges=bool(current_mode[1]),
