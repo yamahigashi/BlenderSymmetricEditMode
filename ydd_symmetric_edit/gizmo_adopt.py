@@ -898,6 +898,7 @@ def _commit_adoption(context, obj, operator, kind: str, axis_index: int, plan: _
             preexisting_modal_operators=watcher.modal_operator_pairs(context.window),
         )
         session_state._SESSIONS[adopted.window_pointer] = adopted
+        session_state.record_touched_mesh(adopted.mesh_name)
         registered = True
         history._remember_history_session(adopted, context)
         remembered = True

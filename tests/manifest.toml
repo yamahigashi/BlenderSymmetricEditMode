@@ -51,6 +51,13 @@ versions = ["4.2", "5.2"]
 tags = ["core", "release"]
 
 [[tests]]
+file = "test_attr_ownership.py"
+mode = "background"
+markers = ["YSE_ATTR_OWNERSHIP_OK"]
+versions = ["4.2", "5.2"]
+tags = ["core", "release"]
+
+[[tests]]
 file = "test_axis_sync.py"
 mode = "gui"
 markers = ["YSE_AXIS_SYNC_TEST_OK"]

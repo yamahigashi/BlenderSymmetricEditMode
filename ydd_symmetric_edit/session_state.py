@@ -23,6 +23,14 @@ _GIZMO_TICKETS: dict[tuple[int, str], GizmoExclusionTicket] = {}
 _GIZMO_TOMBSTONES: dict[int, bool] = {}
 _GIZMO_MODAL_POINTERS_BY_WINDOW: dict[int, frozenset[int]] = {}
 _GIZMO_POLL_ARMED: bool = False
+# Mesh datablock names the add-on created temporary layers on.  The save-time
+# attribute sweep is scoped to this set so a foreign attribute that merely
+# shares a .yse_* name on an untouched mesh survives saving.
+_TOUCHED_MESH_NAMES: set[str] = set()
+
+
+def record_touched_mesh(mesh_name: str) -> None:
+    _TOUCHED_MESH_NAMES.add(mesh_name)
 
 
 def _new_history_token() -> int:

@@ -118,10 +118,18 @@ def __dir__():
 
 @persistent
 def cleanup_stale_attributes(_dummy=None) -> None:
-    """Save/load handler: temporary detection layers must never reach disk."""
+    """Save handler: temporary detection layers must never reach disk.
+
+    Scoped to meshes the add-on actually touched, so a foreign attribute
+    that merely shares a .yse_* name on an untouched mesh survives saving.
+    """
 
     cleanup_all_sessions()
-    for mesh in bpy.data.meshes:
+    for mesh_name in tuple(session_state._TOUCHED_MESH_NAMES):
+        mesh = bpy.data.meshes.get(mesh_name)
+        if mesh is None:
+            session_state._TOUCHED_MESH_NAMES.discard(mesh_name)
+            continue
         try:
             snapshot.remove_temporary_mesh_attributes(mesh)
         except RuntimeError:
@@ -131,7 +139,15 @@ def cleanup_stale_attributes(_dummy=None) -> None:
 @persistent
 def cleanup_after_load(_dummy=None) -> None:
     clear_history_records()
-    cleanup_stale_attributes()
+    cleanup_all_sessions()
+    session_state._TOUCHED_MESH_NAMES.clear()
+    # Full sweep as stale recovery: layers left in the file by a crashed or
+    # older session must not survive the load.
+    for mesh in bpy.data.meshes:
+        try:
+            snapshot.remove_temporary_mesh_attributes(mesh)
+        except RuntimeError:
+            pass
 
 
 class MESH_OT_ydd_symmetric_edit_intercept(bpy.types.Operator):

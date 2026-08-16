@@ -581,6 +581,7 @@ def _prepare_session(
             preexisting_modal_operators=modal_operator_pairs(context.window),
         )
         session_state._SESSIONS[window_pointer] = session
+        session_state.record_touched_mesh(session.mesh_name)
         registered = True
         _suspend_mesh_symmetry(session, obj)
         _remember_history_session(session, context)

@@ -16,7 +16,7 @@ import numpy
 from bpy.props import EnumProperty, FloatProperty
 from mathutils import Vector
 
-from . import backup, layer_names, matching, selection, stitch_pathedges
+from . import backup, layer_names, matching, selection, session_state, stitch_pathedges
 from . import snapshot as snapshot_module
 from ._types import MirrorOverlap
 from .snapshot import SelectionCapture, capture_selection_snapshot
@@ -248,6 +248,9 @@ def _symmetry_parameters(context) -> tuple[bpy.types.Object, int, float] | None:
         return None
     _axis_name, axis_index = axes[0]
     settings = context.scene.ydd_symmetric_edit
+    # Every replay / delete / dissolve flow that may create temporary layers
+    # enters through here; the save-time sweep is scoped to recorded meshes.
+    session_state.record_touched_mesh(obj.data.name)
     return obj, axis_index, float(settings.tolerance)
 
 
