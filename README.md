@@ -1,7 +1,7 @@
 # BlenderSymmetricEditMode
 
 **ydd Symmetric Edit** makes Blender's own editing tools symmetry-aware, without a
-Mirror modifier. It covers two families of native operations on an already
+Mirror modifier. It covers four families of native operations on an already
 symmetrical mesh:
 
 - **Cut tools** — **Knife**, **Loop Cut**, and **Offset Edge Loop Cut**. The
@@ -14,8 +14,12 @@ symmetrical mesh:
   Vertices/Edges/Faces**, **Dissolve Selection (Ctrl+X)**, **Edge Collapse**,
   and **Edge Loops**. The selection is expanded to its mirrored counterparts
   and the native operator runs once, so both sides change together.
+- **Extrude** — **E**, the toolbar **Extrude** tools and their gizmo handles,
+  and the **Alt+E** menu kinds. The native drag stays untouched; the mirrored
+  extrusion is built on confirm and follows Adjust Last Operation (F9). See
+  the [Extrude section](#extrude-e--toolbar-extrude-tools--alte) for details.
 
-In both cases the native tool remains the one you are using: shortcuts, modal
+In all cases the native tool remains the one you are using: shortcuts, modal
 controls, operator options, and the Adjust Last Operation (F9) panel all stay
 native.
 
