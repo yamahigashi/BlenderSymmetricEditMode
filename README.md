@@ -1,7 +1,7 @@
 # BlenderSymmetricEditMode
 
 **ydd Symmetric Edit** makes Blender's own editing tools symmetry-aware, without a
-Mirror modifier. It covers four families of native operations on an already
+Mirror modifier. It covers five families of native operations on an already
 symmetrical mesh:
 
 - **Cut tools** — **Knife**, **Loop Cut**, and **Offset Edge Loop Cut**. The
@@ -18,6 +18,11 @@ symmetrical mesh:
   and the **Alt+E** menu kinds. The native drag stays untouched; the mirrored
   extrusion is built on confirm and follows Adjust Last Operation (F9). See
   the [Extrude section](#extrude-e--toolbar-extrude-tools--alte) for details.
+- **Inset Faces and Bevel** — **I**, **Ctrl+B**, **Ctrl+Shift+B**, and the
+  toolbar **Inset Faces** / **Bevel** tools. The selection is expanded to
+  the mirrored side, then the native modal runs, so the drag preview is
+  already symmetric. See the
+  [Inset / Bevel section](#inset-faces-and-bevel-i--ctrlb--toolbar).
 
 In all cases the native tool remains the one you are using: shortcuts, modal
 controls, operator options, and the Adjust Last Operation (F9) panel all stay
@@ -203,6 +208,39 @@ keeps the native layout; **Limited Dissolve** stays native (out of scope).
 - If the panel shows **Delete key route not found**, the active keymap has no
   binding to the native Delete menu for the scanner to replace.
 
+## Inset Faces and Bevel (I / Ctrl+B / toolbar)
+
+With the add-on enabled and one symmetry axis active, **Inset Faces** and
+**Bevel** expand the selection to the mirrored side and then let Blender's
+own modal run:
+
+- **I** insets the selected faces. **Ctrl+B** bevels edges; **Ctrl+Shift+B**
+  bevels vertices. The toolbar **Inset Faces** and **Bevel** tools (click-drag
+  in the viewport) are included. Because the native modal sees both sides
+  already selected, the live preview is symmetric from the first drag.
+- If every selected element has a visible mirrored counterpart, the confirmed
+  result is symmetric. A counterpart that is only hidden declines the
+  operation (nothing changes, with a warning). A mesh that is itself
+  asymmetric — no counterpart exists — runs the native operator on the
+  selected side only, with a warning; the result is not guaranteed.
+- The Adjust Last Operation (**F9**) panel stays the native `Inset Faces` /
+  `Bevel` operator. Changing a property and applying it again stays
+  symmetric. One undo restores the mesh to the pre-operation state; redo
+  brings the symmetric result back.
+
+Known limits:
+
+- When the add-on expands the selection it records that as an undo step, so
+  any redo branch you had open is discarded. Immediately after cancelling
+  (Esc / right-click), Ctrl+Z may show the expanded selection for a moment.
+- Dragging a toolbar **gizmo handle** (`VIEW3D_GGT_tool_generic_handle_normal`
+  / `_free`) does not go through the keymap and is not mirrored.
+- F3 search, menus, and scripted calls to `mesh.inset` / `mesh.bevel` are
+  not mirrored (that remains an intentional escape hatch to the native
+  operator).
+- No symmetry axis, more than one axis, or multi-object Edit Mode: the
+  native operator runs unchanged.
+
 ## Direct operator calls
 
 Menu, F3, and scripted calls to the native cut operators bypass the keymap
@@ -211,7 +249,10 @@ Connect and Merge are mirrored through their J / M bindings and the M menu.
 The same applies to the removal family: F3 or scripted calls to the native
 `mesh.delete` / `mesh.dissolve_*` / `mesh.edge_collapse` operators stay
 native, while the X / Del / Ctrl+X routes (and direct calls to the
-`mesh.ydd_symmetric_edit_*` operators) are mirrored.
+`mesh.ydd_symmetric_edit_*` operators) are mirrored. Inset Faces and Bevel
+are mirrored only through the I / Ctrl+B / Ctrl+Shift+B and toolbar
+click-drag routes; calling `mesh.inset` or `mesh.bevel` directly stays
+native.
 
 ## Scope and data
 
