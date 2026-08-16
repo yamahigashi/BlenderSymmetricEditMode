@@ -73,6 +73,9 @@ def execute_process(command: Sequence[str], cwd: Path, timeout: float = DEFAULT_
         completed = subprocess.run(
             list(command),
             cwd=str(cwd),
+            # cmd.exe children consume an inherited stdin (known WSL interop
+            # pitfall); never let a test read the runner's stdin.
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             check=False,
@@ -431,7 +434,19 @@ def run_manifest(
                 print(f"ERROR {spec.file} {version or ''}: {exc}", file=sys.stderr)
             duration = time.monotonic() - started
             exit_code = execution.returncode if execution is not None else None
-            records.append(_result_record(spec, version, status, exit_code, missing, duration))
+            record = _result_record(spec, version, status, exit_code, missing, duration)
+            if status == "fail" and execution is not None:
+                # A failure without its raw output cannot be diagnosed later.
+                failure_log = (
+                    repository_root / "tmp" / "test_runs" / f"fail_{spec.file}.{version or 'fast'}.{int(started)}.log"
+                )
+                try:
+                    failure_log.parent.mkdir(parents=True, exist_ok=True)
+                    failure_log.write_text(execution.output, encoding="utf-8")
+                    record["failure_log"] = str(failure_log)
+                except OSError as exc:
+                    print(f"ERROR: could not write failure log: {exc}", file=sys.stderr)
+            records.append(record)
             print(f"{status.upper()} {spec.file}" + (f" [{version}]" if version else ""))
 
     finished_at = datetime.now(UTC).isoformat()

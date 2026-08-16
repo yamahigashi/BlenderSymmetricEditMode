@@ -1519,6 +1519,19 @@ def run_test() -> None:
                 pass
             operators._SESSIONS.clear()
 
+    # The direct-construction fixtures (cases g/j/l/m) crash Blender's final
+    # draw at shutdown (exit 0xC0000005) if their objects are left in the
+    # scene; empty it before quitting.
+    try:
+        if bpy.context.object and bpy.context.object.mode != "OBJECT":
+            with bpy.context.temp_override(window=window, area=area, region=region):
+                bpy.ops.object.mode_set(mode="OBJECT")
+        for leftover in list(bpy.data.objects):
+            bpy.data.objects.remove(leftover, do_unlink=True)
+        bpy.context.view_layer.update()
+    except BaseException:
+        traceback.print_exc()
+
     if failures:
         print(f"YSE_KNIFE_CROSS_MIRROR_STITCH_FAILURES={','.join(failures)}", flush=True)
         print(MARKER_FAILED, flush=True)
