@@ -1,0 +1,528 @@
+# Wave 1 test manifest.  Order is execution order; keep the GUI block in the
+# order frozen by tmp/run_full_regression_20260815.ps1.
+
+[[tests]]
+file = "test_metadata.py"
+mode = "fast-python"
+markers = ["YSE_METADATA_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["fast", "metadata"]
+
+[[tests]]
+file = "test_trial_unit.py"
+mode = "fast-pytest"
+markers = []
+versions = ["4.2", "5.2"]
+tags = ["fast", "unit"]
+
+[[tests]]
+file = "test_runner_unit.py"
+mode = "fast-pytest"
+markers = []
+versions = ["4.2", "5.2"]
+tags = ["fast", "unit"]
+
+[[tests]]
+file = "test_core.py"
+mode = "background"
+markers = ["YSE_CORE_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["core"]
+
+[[tests]]
+file = "test_replay_units.py"
+mode = "background"
+markers = ["YSE_REPLAY_UNITS_OK"]
+versions = ["4.2", "5.2"]
+tags = ["core", "replay"]
+
+[[tests]]
+file = "test_delete_expand_units.py"
+mode = "background"
+markers = ["YSE_DELETE_UNITS_OK"]
+versions = ["4.2", "5.2"]
+tags = ["core", "delete"]
+
+[[tests]]
+file = "test_register_rollback.py"
+mode = "background"
+markers = ["YSE_REGISTER_ROLLBACK_OK"]
+versions = ["4.2", "5.2"]
+tags = ["core", "release"]
+
+[[tests]]
+file = "test_axis_sync.py"
+mode = "gui"
+markers = ["YSE_AXIS_SYNC_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "core"]
+
+[[tests]]
+file = "test_integration.py"
+mode = "gui"
+markers = ["YSE_INTEGRATION_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "release"]
+
+[[tests]]
+file = "test_native_cancel.py"
+mode = "gui"
+markers = ["YSE_NATIVE_CANCEL_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui"]
+
+[[tests]]
+file = "test_native_modal.py"
+mode = "gui"
+markers = ["YSE_NATIVE_MODAL_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui"]
+
+[[tests]]
+file = "test_persistent_mode.py"
+mode = "gui"
+markers = ["YSE_PERSISTENT_MODE_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "release"]
+
+[[tests]]
+file = "test_tool_context_selection.py"
+mode = "gui"
+markers = ["YSE_TOOL_CONTEXT_SELECTION_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui"]
+
+[[tests]]
+file = "test_tool_route_history.py"
+mode = "gui"
+markers = ["YSE_TOOL_ROUTE_HISTORY_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui"]
+
+[[tests]]
+file = "test_loopcut_route_history.py"
+mode = "gui"
+markers = ["YSE_LOOPCUT_ROUTE_HISTORY_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui"]
+
+[[tests]]
+file = "test_offset_loopcut_route_history.py"
+mode = "gui"
+markers = ["YSE_OFFSET_ROUTE_HISTORY_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui"]
+
+[[tests]]
+file = "test_loopcut_straddling.py"
+mode = "gui"
+markers = ["YSE_LOOPCUT_STRADDLING_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui"]
+
+[[tests]]
+file = "test_knife_both_sides.py"
+mode = "gui"
+markers = ["YSE_KNIFE_BOTH_SIDES_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "knife"]
+
+[[tests]]
+file = "test_rollback.py"
+mode = "gui"
+markers = ["YSE_ROLLBACK_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "release"]
+
+[[tests]]
+file = "test_connect_route.py"
+mode = "gui"
+markers = ["YSE_CONNECT_ROUTE_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "replay"]
+
+[[tests]]
+file = "test_connect_lift.py"
+mode = "gui"
+markers = ["YSE_CONNECT_LIFT_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "replay"]
+
+[[tests]]
+file = "test_merge_modes.py"
+mode = "gui"
+markers = ["YSE_MERGE_MODES_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "replay"]
+
+[[tests]]
+file = "test_merge_redo.py"
+mode = "gui"
+markers = ["YSE_MERGE_REDO_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "replay"]
+
+[[tests]]
+file = "test_rip_edge_path.py"
+mode = "gui"
+markers = ["YSE_RIP_EDGE_PATH_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "rip"]
+
+[[tests]]
+file = "test_rip_vertex_boundary.py"
+mode = "gui"
+markers = ["YSE_RIP_VERTEX_BOUNDARY_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "rip"]
+
+[[tests]]
+file = "test_rip_fill_redo.py"
+mode = "gui"
+markers = ["YSE_RIP_FILL_REDO_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "rip"]
+
+[[tests]]
+file = "test_rip_self_mirrored.py"
+mode = "gui"
+markers = ["YSE_RIP_SELF_MIRRORED_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "rip"]
+
+[[tests]]
+file = "test_rip_onplane.py"
+mode = "gui"
+markers = ["YSE_RIP_ONPLANE_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "rip"]
+
+[[tests]]
+file = "test_delete_routes.py"
+mode = "gui"
+markers = ["YSE_DELETE_ROUTES_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "delete"]
+
+[[tests]]
+file = "test_delete_dissolve.py"
+mode = "gui"
+markers = ["YSE_DELETE_DISSOLVE_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "delete"]
+
+[[tests]]
+file = "test_edge_collapse_sym.py"
+mode = "gui"
+markers = ["YSE_COLLAPSE_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "delete"]
+
+[[tests]]
+file = "test_extrude_region.py"
+mode = "gui"
+markers = ["YSE_EXTRUDE_REGION_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "extrude"]
+
+[[tests]]
+file = "test_extrude_tool_context.py"
+mode = "gui"
+markers = ["YSE_EXTRUDE_TOOL_CONTEXT_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "extrude"]
+
+[[tests]]
+file = "test_extrude_shrink_fatten.py"
+mode = "gui"
+markers = ["YSE_EXTRUDE_SHRINKFATTEN_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "extrude"]
+
+[[tests]]
+file = "test_extrude_menu.py"
+mode = "gui"
+markers = ["YSE_EXTRUDE_MENU_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "extrude"]
+
+[[tests]]
+file = "test_extrude_indiv.py"
+mode = "gui"
+markers = ["YSE_EXTRUDE_INDIV_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "extrude"]
+
+[[tests]]
+file = "test_extrude_edges_verts.py"
+mode = "gui"
+markers = ["YSE_EXTRUDE_EDGEVERT_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "extrude"]
+
+[[tests]]
+file = "test_extrude_manifold.py"
+mode = "gui"
+markers = ["YSE_EXTRUDE_MANIFOLD_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "extrude"]
+
+[[tests]]
+file = "test_extrude_gizmo.py"
+mode = "gui"
+markers = ["YSE_EXTRUDE_GIZMO_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "extrude"]
+
+[[tests]]
+file = "test_extrude_midplane.py"
+mode = "gui"
+markers = ["YSE_EXTRUDE_MIDPLANE_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "extrude"]
+
+[[tests]]
+file = "test_loopcut_onplane.py"
+mode = "gui"
+markers = ["YSE_LOOPCUT_ONPLANE_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui"]
+
+[[tests]]
+file = "test_extrude_resident_modal.py"
+mode = "gui"
+markers = ["YSE_EXTRUDE_RESIDENT_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "extrude"]
+
+[[tests]]
+file = "test_extrude_f9_matrix.py"
+mode = "gui"
+markers = ["YSE_EXTRUDE_F9_MATRIX_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "extrude", "f9"]
+
+[[tests]]
+file = "test_extrude_f9_kind_normal.py"
+mode = "gui"
+markers = ["YSE_EXTRUDE_F9_KIND_NORMAL_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "extrude", "f9"]
+
+[[tests]]
+file = "test_extrude_f9_kind_context.py"
+mode = "gui"
+markers = ["YSE_EXTRUDE_F9_KIND_CONTEXT_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "extrude", "f9"]
+
+[[tests]]
+file = "test_extrude_f9_kind_shrink_fatten.py"
+mode = "gui"
+markers = ["YSE_EXTRUDE_F9_KIND_SHRINK_FATTEN_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "extrude", "f9"]
+
+[[tests]]
+file = "test_extrude_f9_kind_faces_indiv.py"
+mode = "gui"
+markers = ["YSE_EXTRUDE_F9_KIND_FACES_INDIV_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "extrude", "f9"]
+
+[[tests]]
+file = "test_extrude_f9_kind_edges_indiv.py"
+mode = "gui"
+markers = ["YSE_EXTRUDE_F9_KIND_EDGES_INDIV_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "extrude", "f9"]
+
+[[tests]]
+file = "test_extrude_f9_kind_verts_indiv.py"
+mode = "gui"
+markers = ["YSE_EXTRUDE_F9_KIND_VERTS_INDIV_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "extrude", "f9"]
+
+[[tests]]
+file = "test_extrude_f9_gizmo.py"
+mode = "gui"
+markers = ["YSE_EXTRUDE_F9_GIZMO_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "extrude", "f9"]
+
+[[tests]]
+file = "test_extrude_f9_foreign.py"
+mode = "gui"
+markers = ["YSE_EXTRUDE_F9_FOREIGN_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "extrude", "f9"]
+
+[[tests]]
+file = "test_extrude_f9_seam.py"
+mode = "gui"
+markers = ["YSE_EXTRUDE_F9_SEAM_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "extrude", "f9"]
+
+[[tests]]
+file = "test_extrude_f9_dance.py"
+mode = "gui"
+markers = ["YSE_EXTRUDE_F9_DANCE_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "extrude", "f9"]
+
+[[tests]]
+file = "test_extrude_f9_indiv_repair.py"
+mode = "gui"
+markers = ["YSE_EXTRUDE_F9_INDIV_REPAIR_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "extrude", "f9"]
+
+[[tests]]
+file = "test_extrude_f9_undo_redo.py"
+mode = "gui"
+markers = ["YSE_EXTRUDE_F9_UNDO_REDO_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "extrude", "f9"]
+
+[[tests]]
+file = "test_extrude_f9_hetero_a.py"
+mode = "gui"
+markers = ["YSE_EXTRUDE_F9_HETERO_A_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "extrude", "f9"]
+
+[[tests]]
+file = "test_extrude_f9_hetero_b.py"
+mode = "gui"
+markers = ["YSE_EXTRUDE_F9_HETERO_B_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "extrude", "f9"]
+
+[[tests]]
+file = "test_extrude_f9_hetero_c.py"
+mode = "gui"
+markers = ["YSE_EXTRUDE_F9_HETERO_C_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "extrude", "f9"]
+
+[[tests]]
+file = "test_preferences_persistence.py"
+mode = "staged-gui"
+markers = ["YSE_PREFERENCES_STAGE2_OK"]
+versions = ["4.2", "5.2"]
+tags = ["release", "staged"]
+
+# Wave 1 additions.  Keep these after the frozen 51-test GUI block.
+[[tests]]
+file = "test_collect_incremental.py"
+mode = "background"
+markers = ["YSE_COLLECT_INCREMENTAL_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["core", "knife"]
+
+[[tests]]
+file = "test_collect_predicate_inline.py"
+mode = "background"
+markers = ["YSE_COLLECT_PREDICATE_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["core", "knife"]
+
+[[tests]]
+file = "test_connect_history_forms.py"
+mode = "background"
+markers = ["YSE_CONNECT_FORMS_OK"]
+versions = ["4.2", "5.2"]
+tags = ["core", "replay"]
+
+[[tests]]
+file = "test_crossings_index_numpy.py"
+mode = "background"
+markers = ["YSE_CROSSINGS_NUMPY_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["core", "knife"]
+
+[[tests]]
+file = "test_crossings_vertex_index.py"
+mode = "background"
+markers = ["YSE_CROSSINGS_INDEX_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["core", "knife"]
+
+[[tests]]
+file = "test_f9_after_undo_dance.py"
+mode = "gui"
+markers = ["YSE_F9_DANCE_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "extrude", "f9"]
+
+[[tests]]
+file = "test_f9_discriminator_matrix.py"
+mode = "gui"
+markers = ["YSE_F9_MATRIX_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "extrude", "f9"]
+
+[[tests]]
+file = "test_gc_gate.py"
+mode = "background"
+markers = ["YSE_GC_GATE_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["core", "release"]
+
+[[tests]]
+file = "test_interior_chain.py"
+mode = "background"
+markers = ["YSE_INTERIOR_CHAIN_OK"]
+versions = ["4.2", "5.2"]
+tags = ["core", "knife"]
+
+[[tests]]
+file = "test_interior_host_golden.py"
+mode = "background"
+markers = ["YSE_INTERIOR_HOST_GOLDEN_OK"]
+versions = ["4.2", "5.2"]
+tags = ["core", "knife", "release"]
+
+[[tests]]
+file = "test_knife_cross_mirror_stitch.py"
+mode = "gui"
+markers = ["YSE_KNIFE_CROSS_MIRROR_STITCH_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "knife"]
+
+[[tests]]
+file = "test_perf_equivalence.py"
+mode = "background"
+markers = ["YSE_PERF_EQUIV_OK"]
+versions = ["4.2", "5.2"]
+tags = ["core", "perf"]
+
+[[tests]]
+file = "test_restore_scoped.py"
+mode = "background"
+markers = ["YSE_RESTORE_SCOPED_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["core"]
+
+[[tests]]
+file = "test_scoped_edge_store.py"
+mode = "background"
+markers = ["YSE_SCOPED_STORE_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["core", "replay"]
+
+[[tests]]
+file = "test_select_mirrored.py"
+mode = "background"
+markers = ["YSE_SELECT_MIRRORED_OK"]
+versions = ["4.2", "5.2"]
+tags = ["core", "selection"]
+
+[[tests]]
+file = "test_select_mirrored_gui.py"
+mode = "gui"
+markers = ["YSE_SELECT_MIRRORED_GUI_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "selection"]
