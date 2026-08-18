@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import shutil
 import sys
 from pathlib import Path
 
@@ -128,6 +129,7 @@ def test_injected_executor_covers_pass_fail_missing_and_exception(tmp_path: Path
     assert results[-1]["exit_code"] is None
 
 
+@pytest.mark.skipif(shutil.which("wslpath") is None, reason="runner drives Blender via cmd.exe and is WSL-only")
 def test_background_mode_builds_blender_command_and_captures_identity(tmp_path: Path) -> None:
     (tmp_path / "test_bg.py").write_text("", encoding="utf-8")
     entry = runner.TestSpec("test_bg.py", "background", ("BG_OK",), ("5.2",), ("core",))
