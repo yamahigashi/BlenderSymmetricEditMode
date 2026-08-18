@@ -26,7 +26,29 @@ tags = ["fast", "unit"]
 file = "test_inset_bevel_units.py"
 mode = "fast-pytest"
 markers = []
+versions = ["4.2", "5.2"]
 tags = ["fast", "unit"]
+
+[[tests]]
+file = "test_inset_f9.py"
+mode = "gui"
+markers = ["YSE_INSET_F9_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "inset_bevel"]
+
+[[tests]]
+file = "test_bevel_f9.py"
+mode = "gui"
+markers = ["YSE_BEVEL_F9_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "inset_bevel"]
+
+[[tests]]
+file = "test_bevel_f9_hist.py"
+mode = "gui"
+markers = ["YSE_BEVEL_F9_HIST_TEST_OK"]
+versions = ["4.2", "5.2"]
+tags = ["gui", "inset_bevel"]
 
 [[tests]]
 file = "test_core.py"

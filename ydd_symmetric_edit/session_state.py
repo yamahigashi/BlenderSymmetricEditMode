@@ -20,6 +20,19 @@ def sessions_active() -> bool:
 _NEXT_HISTORY_TOKEN = max(1, int(time.time_ns() & 0x7FFFFFFF))
 _HISTORY_REPAIR_QUEUED = False
 _HISTORY_REPAIR_BUSY = False
+
+
+def history_repair_active() -> bool:
+    """A history repair is executing right now: no second mutation owner may
+    act on the mesh until it settles.  Read-only, same isolation stance as
+    ``sessions_active``.
+
+    Deliberately ignores ``_HISTORY_REPAIR_QUEUED``: the repair check timer
+    is queued on every undo_post (and usually no-ops), so the queued flag is
+    transiently true at exactly the moment other undo_post handlers run.
+    """
+
+    return bool(_HISTORY_REPAIR_BUSY)
 _MAX_HISTORY_RECORDS = 256
 _HISTORY_SEQUENCE = 0
 _FINISH_REPORTS: list[tuple[str, str]] = []

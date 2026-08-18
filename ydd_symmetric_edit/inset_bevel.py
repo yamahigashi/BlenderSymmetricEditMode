@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import time
 import traceback
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import TYPE_CHECKING, Literal, Protocol
@@ -43,6 +43,24 @@ REPLAY_CALL_MENU_NAMES = frozenset(
     }
 )
 DEFAULT_BEVEL_AFFECT = "EDGES"
+BEVEL_FINGERPRINT_PROPS = (
+    "offset", "offset_pct", "segments", "profile", "spread", "affect",
+    "offset_type", "profile_type", "miter_outer", "miter_inner", "vmesh_method",
+    "face_strength_mode", "material", "use_clamp_overlap", "loop_slide",
+    "mark_seam", "mark_sharp", "harden_normals",
+)
+INSET_REPLAY_PROPS = (
+    "thickness",
+    "depth",
+    "use_boundary",
+    "use_even_offset",
+    "use_relative_offset",
+    "use_edge_rail",
+    "use_outset",
+    "use_select_inset",
+    "use_individual",
+    "use_interpolate",
+)
 ONSET_TIMEOUT_S = 2.0
 POLLER_FIRST_INTERVAL = 0.02
 POLLER_INTERVAL = 0.05
@@ -54,10 +72,8 @@ RESTORE_VERIFY_BASE_INTERVAL = 0.05
 RESTORE_VERIFY_MAX_INTERVAL = 0.4
 DIAGNOSTIC_VERTEX_LIMIT = 500_000
 MAX_ARM_ATTEMPTS = 2
-UNDO_PUSH_MESSAGE = "Symmetric select (inset/bevel)"
 HIDDEN_WARNING = "Inset/Bevel declined: {count} hidden counterpart(s)"
 UNMATCHED_WARNING = "Inset/Bevel will run on one side only; the mesh is not symmetric"
-PUSH_FAILED_WARNING = "Inset/Bevel could not record an undo step; leaving the native route unexpanded"
 ARM_FAILED_WARNING = "Inset/Bevel poller failed; the expanded selection may remain"
 RESTORE_FAILED_WARNING = "Inset/Bevel could not restore the pre-expansion selection"
 DIAGNOSTIC_WARNING = "Inset/Bevel result is not mirror-symmetric ({count} vertices)"
@@ -84,9 +100,9 @@ class TickResult(StrEnum):
 class TransactionEvent(StrEnum):
     EXCEPTION = "exception"
     TOKEN_REGISTER_FAILED = "token_register_failed"
-    PUSH_FAILED = "push_failed"
     ARM_FAILED = "arm_failed"
     RESTORE_FAILED = "restore_failed"
+    S1_CAPTURE_FAILED = "s1_capture_failed"
 
 
 class TransactionAction(StrEnum):
@@ -97,14 +113,337 @@ class TransactionAction(StrEnum):
     RESTORE_S0_DISCARD_TOKEN_WARN_PASS_THROUGH = "restore_s0_discard_token_warn_pass_through"
     ATTEMPT_ARM = "attempt_arm"
     WARN_PASS_THROUGH = "warn_pass_through"
-    LEAVE_EXPANDED_WARN_DISCARD_TOKEN = "leave_expanded_warn_discard_token"
     WARN_ONLY = "warn_only"
+    FAIL_CLOSED = "fail_closed"
 
 
 class PreambleDecision(StrEnum):
     NO_PRIOR = "NO_PRIOR"
     CONSUME_EVENT = "CONSUME_EVENT"
     SETTLED = "SETTLED"
+
+
+class SelectionRelation(StrEnum):
+    SELF_MIRRORED = "SELF_MIRRORED"
+    DISJOINT = "DISJOINT"
+    PARTIAL = "PARTIAL"
+    UNMATCHED = "UNMATCHED"
+
+
+class InsetReplayState(StrEnum):
+    WATCHING = "WATCHING"
+    REPLAY_READY = "REPLAY_READY"
+    EXECUTING = "EXECUTING"
+    EXEC_COMMITTED = "EXEC_COMMITTED"
+    PUSHED = "PUSHED"
+    ABORTED_ONE_SIDED = "ABORTED_ONE_SIDED"
+    DEGRADED_SYMMETRIC = "DEGRADED_SYMMETRIC"
+
+
+class InsetReplayEvent(StrEnum):
+    CONFIRMED = "CONFIRMED"
+    PROPS_READY = "PROPS_READY"
+    EXEC_FINISHED = "EXEC_FINISHED"
+    REPLAY_FAILED = "REPLAY_FAILED"
+    POSTPROCESS_FAILED = "POSTPROCESS_FAILED"
+    PUSH_FINISHED = "PUSH_FINISHED"
+
+
+class CompletionStatus(StrEnum):
+    ACTIVE = "ACTIVE"
+    SUSPENDED = "SUSPENDED"
+
+
+class F9Decision(StrEnum):
+    NO_OP = "NO_OP"
+    INTERVENE = "INTERVENE"
+    SUSPEND = "SUSPEND"
+
+
+@dataclass(frozen=True, slots=True)
+class CompletionRecord:
+    window_pointer: int
+    object_name: str
+    mesh_name: str
+    route: str
+    operator: OperatorIdentity
+    fingerprint: tuple
+    status: CompletionStatus = CompletionStatus.ACTIVE
+
+
+@dataclass(frozen=True, slots=True)
+class F9Classification:
+    decision: F9Decision
+    record: CompletionRecord | None
+    warning: str | None = None
+
+
+def _enum_identifier(value):
+    identifier = getattr(value, "identifier", None)
+    return str(identifier) if identifier is not None else str(value)
+
+
+def _operator_property_value(operator, name: str):
+    properties = getattr(operator, "properties", None)
+    if properties is None:
+        return None, False
+    try:
+        rna = getattr(properties, "bl_rna", None)
+        definition = rna.properties.get(name) if rna is not None else None
+        if definition is not None and bool(getattr(definition, "is_readonly", False)):
+            return None, False
+        if definition is None and not hasattr(properties, name):
+            return None, False
+        value = getattr(properties, name)
+    except (AttributeError, KeyError, TypeError, RuntimeError):
+        return None, False
+    if isinstance(value, bool) or isinstance(value, int):
+        return value, True
+    if isinstance(value, float):
+        return round(value, 6), True
+    if isinstance(value, str):
+        return value, True
+    return _enum_identifier(value), True
+
+
+def fingerprint(operator, *, route: str | None = None, override=None) -> tuple:
+    """Return the single v5.2 normalized operator fingerprint.
+
+    ``override`` is a saved-window context manager supplied by the runtime;
+    pure callers leave it as ``None``.
+    """
+    if operator is None:
+        return ()
+    idname = normalize_operator_idname(
+        getattr(operator, "bl_idname", None) or getattr(operator, "idname", None)
+    )
+    names = INSET_REPLAY_PROPS if (route or idname) == "mesh.inset" else BEVEL_FINGERPRINT_PROPS
+    def read():
+        values = []
+        for name in names:
+            value, present = _operator_property_value(operator, name)
+            if present:
+                values.append((name, value))
+        return tuple(values)
+    if override is None:
+        return read()
+    try:
+        with override:
+            return read()
+    except Exception:
+        return ()
+
+
+def classify_f9_intervention(
+    active_operator,
+    record: CompletionRecord | None,
+    *,
+    window_pointer: int | None,
+    object_name: str | None,
+    mesh_name: str | None,
+    route: str | None = None,
+) -> F9Classification:
+    """Pure §5C-2 discriminator; no mesh/token mutation is performed."""
+    if record is None or record.status is CompletionStatus.SUSPENDED:
+        return F9Classification(F9Decision.NO_OP, record)
+    if active_operator is None:
+        return F9Classification(F9Decision.SUSPEND, replace(record, status=CompletionStatus.SUSPENDED))
+    active_id = normalize_operator_idname(
+        getattr(active_operator, "bl_idname", None) or getattr(active_operator, "idname", None)
+    )
+    if active_id not in TARGET_OPERATOR_IDNAMES:
+        return F9Classification(F9Decision.NO_OP, record)
+    if (window_pointer, object_name, mesh_name, active_id) != (
+        record.window_pointer, record.object_name, record.mesh_name, record.operator.idname
+    ):
+        return F9Classification(F9Decision.NO_OP, record)
+    current = fingerprint(active_operator, route=route or active_id)
+    if current == record.fingerprint:
+        return F9Classification(F9Decision.SUSPEND, replace(record, status=CompletionStatus.SUSPENDED))
+    return F9Classification(F9Decision.INTERVENE, record)
+
+
+def reactivate_completion_record(record: CompletionRecord | None, active_operator, *, window_pointer: int | None, object_name: str | None, mesh_name: str | None) -> CompletionRecord | None:
+    if record is None or active_operator is None:
+        return record
+    active_id = normalize_operator_idname(
+        getattr(active_operator, "bl_idname", None) or getattr(active_operator, "idname", None)
+    )
+    if record.object_name != object_name or record.mesh_name != mesh_name or record.window_pointer != window_pointer or active_id != record.operator.idname:
+        return record
+    return replace(record, status=CompletionStatus.ACTIVE, operator=_identity_from_operator(active_operator))
+
+
+def supersede_decision(*, repeat_origin: bool, restore_only: bool, mode: str, replay_state: InsetReplayState, same_context: bool = True) -> str:
+    if not same_context:
+        return "NO_OP_WARNING"
+    if restore_only:
+        return "RESTORE_BEFORE_SUPERSEDE"
+    if repeat_origin and replay_state is InsetReplayState.WATCHING:
+        return "SUPERSEDE"
+    if mode == "inset" and replay_state in {InsetReplayState.REPLAY_READY, InsetReplayState.EXECUTING, InsetReplayState.EXEC_COMMITTED}:
+        return "NO_OP_WARNING"
+    return "NO_OP_WARNING"
+
+
+def restore_only_required(*, restore_only: bool, verdict: PollerVerdict) -> bool:
+    return bool(restore_only)
+
+
+def completion_record_valid(record: CompletionRecord | None, *, window_exists: bool, object_exists: bool, mesh_exists: bool) -> bool:
+    return record is not None and window_exists and object_exists and mesh_exists
+
+
+def transaction_failure_action(*, snapshot_exists: bool, token_registered: bool, selection_mutated: bool, poller_armed: bool, arm_attempts: int = 0) -> TransactionAction:
+    state = TransactionState(snapshot_exists, token_registered, selection_mutated, poller_armed, arm_attempts)
+    event = TransactionEvent.ARM_FAILED if arm_attempts else TransactionEvent.EXCEPTION
+    return next_transaction_action(state, event)
+
+
+# Contract-facing aliases keep the pure API stable for Blender-free tests.
+fingerprint_operator = fingerprint
+classify_undo_post = classify_f9_intervention
+redo_reactivate = reactivate_completion_record
+supersede_token = supersede_decision
+restore_only_should_restore = restore_only_required
+
+
+def counts_strictly_increased(before: MeshCounts, after: MeshCounts) -> bool:
+    """Return true only when no topology count shrank and one count grew."""
+
+    previous = (before.verts, before.edges, before.faces)
+    current = (after.verts, after.edges, after.faces)
+    return all(new >= old for old, new in zip(previous, current, strict=True)) and any(
+        new > old for old, new in zip(previous, current, strict=True)
+    )
+
+
+def _pair_for(pair_maps, domain: str):
+    return {
+        "VERT": getattr(pair_maps, "vert_pairs", {}),
+        "EDGE": getattr(pair_maps, "edge_pair_by_index", {}),
+        "FACE": getattr(pair_maps, "face_pair_by_index", {}),
+    }[domain]
+
+
+def classify_selection_relation(
+    selected: Mapping[str, Iterable[int]],
+    pair_maps,
+    *,
+    domains: tuple[str, ...],
+) -> tuple[SelectionRelation, bool]:
+    """Classify S versus rho(S), also reporting self-mirror/off-plane mixing.
+
+    The second result is true when an on-plane (self-mirror) element and an
+    off-plane selected element coexist.  Unmatched elements are reported
+    before overlap classification, as required by the intercept guard order.
+    """
+
+    self_mirror = False
+    off_plane: dict[str, set[int]] = {domain: set() for domain in domains}
+    mirror: dict[str, set[int]] = {domain: set() for domain in domains}
+    for domain in domains:
+        pairs = _pair_for(pair_maps, domain)
+        for raw_index in selected.get(domain, ()):
+            index = int(raw_index)
+            partner = pairs.get(index)
+            if partner is None:
+                return SelectionRelation.UNMATCHED, False
+            if int(partner) == index:
+                self_mirror = True
+                continue
+            off_plane[domain].add(index)
+            mirror[domain].add(int(partner))
+    # ``off_plane`` contains S; compare only the off-plane part so plane
+    # elements do not force every selection into PARTIAL.
+    any_off_plane = any(off_plane.values())
+    if not any_off_plane:
+        return SelectionRelation.SELF_MIRRORED, self_mirror
+    intersection = any(
+        bool(off_plane[domain] & mirror[domain]) for domain in domains
+    )
+    complete = all(off_plane[domain] == mirror[domain] for domain in domains)
+    if complete:
+        relation = SelectionRelation.SELF_MIRRORED
+    elif not intersection:
+        relation = SelectionRelation.DISJOINT
+    else:
+        relation = SelectionRelation.PARTIAL
+    return relation, bool(self_mirror and any_off_plane)
+
+
+def inset_replay_relation(
+    selected: Mapping[str, Iterable[int]], pair_maps, *, domains: tuple[str, ...] = ("FACE",)
+) -> tuple[SelectionRelation, bool]:
+    return classify_selection_relation(selected, pair_maps, domains=domains)
+
+
+def next_inset_replay_state(state: InsetReplayState, event: InsetReplayEvent) -> InsetReplayState:
+    """Pure state transition table for §5A; committed work is never one-sided."""
+
+    transitions = {
+        (InsetReplayState.WATCHING, InsetReplayEvent.CONFIRMED): InsetReplayState.REPLAY_READY,
+        (InsetReplayState.REPLAY_READY, InsetReplayEvent.PROPS_READY): InsetReplayState.EXECUTING,
+        (InsetReplayState.REPLAY_READY, InsetReplayEvent.REPLAY_FAILED): InsetReplayState.ABORTED_ONE_SIDED,
+        (InsetReplayState.EXECUTING, InsetReplayEvent.EXEC_FINISHED): InsetReplayState.EXEC_COMMITTED,
+        (InsetReplayState.EXECUTING, InsetReplayEvent.REPLAY_FAILED): InsetReplayState.ABORTED_ONE_SIDED,
+        (InsetReplayState.EXEC_COMMITTED, InsetReplayEvent.PUSH_FINISHED): InsetReplayState.PUSHED,
+        (InsetReplayState.EXEC_COMMITTED, InsetReplayEvent.POSTPROCESS_FAILED): InsetReplayState.DEGRADED_SYMMETRIC,
+    }
+    try:
+        return transitions[(state, event)]
+    except KeyError:
+        raise ValueError(f"invalid inset replay transition: {state} + {event}") from None
+
+
+def classify_element_side(
+    coordinates: Iterable[Iterable[float]], axis_index: int, tolerance: float, user_sign: int
+) -> str:
+    values = [float(tuple(coordinate)[axis_index]) for coordinate in coordinates]
+    if not values or all(abs(value) <= tolerance for value in values):
+        return "PLANE"
+    has_positive = any(value > tolerance for value in values)
+    has_negative = any(value < -tolerance for value in values)
+    if has_positive and has_negative:
+        return "SPAN"
+    if user_sign >= 0:
+        if all(value >= -tolerance for value in values):
+            return "USER"
+        if all(value <= tolerance for value in values):
+            return "MIRROR"
+    else:
+        if all(value <= tolerance for value in values):
+            return "USER"
+        if all(value >= -tolerance for value in values):
+            return "MIRROR"
+    return "SPAN"
+
+
+def normalize_bevel_selection(
+    selected: Mapping[str, Iterable[int]],
+    element_classes: Mapping[tuple[str, int], str],
+    *,
+    select_mirrored: bool,
+    manual_both_sides: bool = False,
+) -> dict[str, frozenset[int]]:
+    if select_mirrored or manual_both_sides:
+        return {domain: frozenset(map(int, selected.get(domain, ()))) for domain in ("VERT", "EDGE", "FACE")}
+    return {
+        domain: frozenset(
+            index
+            for index in map(int, selected.get(domain, ()))
+            if element_classes.get((domain, index)) in {"USER", "SPAN", "PLANE"}
+        )
+        for domain in ("VERT", "EDGE", "FACE")
+    }
+
+
+# Descriptive aliases keep the pure contract vocabulary discoverable to tests
+# and callers without duplicating any classification logic.
+classify_selection_overlap = classify_selection_relation
+classify_bevel_element_side = classify_element_side
+inset_replay_state_transition = next_inset_replay_state
+bevel_selection_normalize = normalize_bevel_selection
 
 
 class _KmiEvent(Protocol):
@@ -146,11 +485,17 @@ class SelectionSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class SelectionContextSnapshot:
+    selection: SelectionSnapshot
+    history: tuple[tuple[str, int], ...] = ()
+    active: tuple[str, int] | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class TransactionState:
     snapshot_exists: bool = False
     token_registered: bool = False
     selection_mutated: bool = False
-    push_finished: bool = False
     poller_armed: bool = False
     arm_attempts: int = 0
 
@@ -167,6 +512,9 @@ class PriorTokenView:
     elapsed_s: float
     s0: frozenset[int]
     discard: bool = False
+    onset_op: OperatorIdentity | None = None
+    mode: Literal["inset", "bevel"] = "bevel"
+    replay_state: InsetReplayState = InsetReplayState.WATCHING
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,10 +605,24 @@ def count_overlapping_consumers(
     return total
 
 
-def confirm_evidence(recorded_op: OperatorIdentity, current_op: OperatorIdentity) -> bool:
-    if current_op == recorded_op:
+def confirm_evidence(
+    recorded_op: OperatorIdentity,
+    current_op: OperatorIdentity,
+    *,
+    onset: bool = False,
+    onset_op: OperatorIdentity | None = None,
+    invoke_counts: MeshCounts | None = None,
+    current_counts: MeshCounts | None = None,
+) -> bool:
+    if current_op.idname not in TARGET_OPERATOR_IDNAMES or current_op == recorded_op:
         return False
-    return current_op.idname in TARGET_OPERATOR_IDNAMES
+    if onset:
+        # After an observed modal onset, lineage is the onset identity, not
+        # merely the target idname (which another operator may reuse).
+        return onset_op is None or current_op == onset_op
+    if invoke_counts is None or current_counts is None:
+        return False
+    return counts_strictly_increased(invoke_counts, current_counts)
 
 
 def classify_poller_tick(
@@ -273,11 +635,49 @@ def classify_poller_tick(
     onset: bool,
     elapsed_s: float,
     selection_matches_s1: bool,
+    onset_op: OperatorIdentity | None = None,
+    mode: str = "bevel",
 ) -> PollerVerdict:
-    if confirm_evidence(recorded_op, current_op):
-        return PollerVerdict.CONFIRMED
+    if mode == "inset" and not counts_strictly_increased(invoke_counts, current_counts):
+        if invoke_counts != current_counts:
+            return PollerVerdict.UNKNOWN
     if modal_alive:
         return PollerVerdict.WAIT
+    if mode == "inset":
+        # Counts are the primary discriminator for inset: a confirmed inset
+        # always adds geometry (RG8, even zero-drag) and a cancel restores the
+        # invoke counts.  Operator identity comparisons are ambiguous here:
+        # consecutive same-type runs can reuse a freed operator pointer, so
+        # run N's active operator can compare equal to run N-1's recorded_op
+        # and a real confirm would silently classify as CANCELLED.
+        if counts_strictly_increased(invoke_counts, current_counts):
+            if current_op.idname == "mesh.inset":
+                return PollerVerdict.CONFIRMED
+            return PollerVerdict.UNKNOWN
+        if onset or elapsed_s >= ONSET_TIMEOUT_S:
+            if invoke_counts == current_counts:
+                return PollerVerdict.CANCELLED
+            return PollerVerdict.UNKNOWN
+        return PollerVerdict.WAIT
+    # Bevel: identity comparisons stay (zero-drag confirms keep the counts
+    # unchanged, RG9), but a count increase with the target operator active
+    # is decisive on its own — consecutive runs can reuse a freed operator
+    # pointer, and identity equality must not veto a real confirm (the
+    # normalization duty makes a silent UNKNOWN harmful here).
+    if (
+        counts_strictly_increased(invoke_counts, current_counts)
+        and current_op.idname == "mesh.bevel"
+    ):
+        return PollerVerdict.CONFIRMED
+    if confirm_evidence(
+        recorded_op,
+        current_op,
+        onset=onset,
+        onset_op=onset_op,
+        invoke_counts=invoke_counts,
+        current_counts=current_counts,
+    ):
+        return PollerVerdict.CONFIRMED
     if onset:
         if current_op == recorded_op:
             if invoke_counts == current_counts:
@@ -337,6 +737,8 @@ def evaluate_poller_tick(
     onset: bool,
     elapsed_s: float,
     selection_matches_s1: bool,
+    onset_op: OperatorIdentity | None = None,
+    mode: str = "bevel",
 ) -> TickResult:
     if poller_generation_is_stale(token_generation, current_generation):
         return TickResult.NO_OP
@@ -362,6 +764,8 @@ def evaluate_poller_tick(
             onset=onset,
             elapsed_s=elapsed_s,
             selection_matches_s1=selection_matches_s1,
+            onset_op=onset_op,
+            mode=mode,
         ).value
     )
 
@@ -371,21 +775,30 @@ def next_transaction_action(state: TransactionState, event: TransactionEvent) ->
         return TransactionAction.WARN_ONLY
     if event is TransactionEvent.TOKEN_REGISTER_FAILED:
         return TransactionAction.DISCARD_S0_PASS_THROUGH
-    if event is TransactionEvent.PUSH_FAILED:
-        return TransactionAction.RESTORE_S0_DISCARD_TOKEN_WARN_PASS_THROUGH
     if event is TransactionEvent.ARM_FAILED:
         if state.arm_attempts < MAX_ARM_ATTEMPTS:
             return TransactionAction.ATTEMPT_ARM
-        return TransactionAction.LEAVE_EXPANDED_WARN_DISCARD_TOKEN
+        return (
+            TransactionAction.RESTORE_S0_DISCARD_TOKEN_WARN_PASS_THROUGH
+            if state.selection_mutated
+            else TransactionAction.WARN_PASS_THROUGH
+        )
+    if event is TransactionEvent.S1_CAPTURE_FAILED:
+        return (
+            TransactionAction.RESTORE_S0_DISCARD_TOKEN_WARN_PASS_THROUGH
+            if state.selection_mutated
+            else TransactionAction.WARN_PASS_THROUGH
+        )
     if event is TransactionEvent.EXCEPTION:
         if not state.selection_mutated:
             if state.token_registered:
                 return TransactionAction.DISCARD_TOKEN_PASS_THROUGH
             return TransactionAction.PASS_THROUGH
-        if not state.push_finished:
-            return TransactionAction.RESTORE_S0_DISCARD_TOKEN_PASS_THROUGH
         if not state.poller_armed:
-            return TransactionAction.ATTEMPT_ARM
+            # A partial expansion failure is user-visible state churn; the
+            # rollback must not be silent (contract: warn on every
+            # post-mutation failure).
+            return TransactionAction.RESTORE_S0_DISCARD_TOKEN_WARN_PASS_THROUGH
         return TransactionAction.PASS_THROUGH
     raise ValueError(event)
 
@@ -395,7 +808,7 @@ def action_after_arm_result(*, succeeded: bool, failed_attempts: int, warn_on_su
         return TransactionAction.WARN_PASS_THROUGH if warn_on_success else TransactionAction.PASS_THROUGH
     if failed_attempts < MAX_ARM_ATTEMPTS:
         return TransactionAction.ATTEMPT_ARM
-    return TransactionAction.LEAVE_EXPANDED_WARN_DISCARD_TOKEN
+    return TransactionAction.RESTORE_S0_DISCARD_TOKEN_WARN_PASS_THROUGH
 
 
 def apply_invoke_preamble(prior: PriorTokenView | None, current_selection: frozenset[int]) -> PreambleResult:
@@ -419,9 +832,21 @@ def apply_invoke_preamble(prior: PriorTokenView | None, current_selection: froze
         onset=prior.onset,
         elapsed_s=max(prior.elapsed_s, ONSET_TIMEOUT_S),
         selection_matches_s1=prior.selection_matches_s1,
+        onset_op=prior.onset_op,
+        mode=prior.mode,
     )
+    # A non-WATCHING replay guard is defensive; synchronous completion keeps
+    # this pending state unreachable during ordinary invocation.
+    if verdict is PollerVerdict.CONFIRMED or (
+        prior.mode == "inset" and prior.replay_state is not InsetReplayState.WATCHING
+    ):
+        return PreambleResult(PreambleDecision.CONSUME_EVENT, verdict, False, False, current_selection)
     if verdict is PollerVerdict.CANCELLED:
-        return PreambleResult(PreambleDecision.SETTLED, verdict, True, True, prior.s0)
+        # Inset cancellation is native-owned; its token is discarded without
+        # touching the selection or mesh.  This guard is defensive because
+        # synchronous completion normally settles the token before preamble.
+        restored = prior.mode != "inset"
+        return PreambleResult(PreambleDecision.SETTLED, verdict, restored, True, prior.s0 if restored else current_selection)
     return PreambleResult(PreambleDecision.SETTLED, verdict, False, True, current_selection)
 
 
@@ -464,11 +889,32 @@ class _InsetBevelToken:
     native_idname: str
     axis_index: int
     tolerance: float
+    mode: Literal["inset", "bevel"] = "bevel"
+    m0: SelectionSnapshot | None = None
+    relation: SelectionRelation = SelectionRelation.DISJOINT
+    self_mixed: bool = False
+    mesh_select_mode: tuple[bool, bool, bool] = (False, True, False)
+    user_sign: int = 1
+    manual_both_sides: bool = False
+    onset_op: OperatorIdentity | None = None
+    replay_state: InsetReplayState = InsetReplayState.WATCHING
+    f_user: SelectionContextSnapshot | None = None
+    f_mirror: SelectionSnapshot | None = None
+    select_mirrored: bool | None = None
+    topology_backup: object | None = None
+    live_layer_cleaned: bool = False
     onset: bool = False
     t0: float | None = None
     armed: bool = False
     restoring: bool = False
     restore_attempts: int = 0
+    normalizing: bool = False
+    normalize_attempts: int = 0
+    pending_selection: SelectionSnapshot | None = None
+    repeat_origin: bool = False
+    restore_only: bool = False
+    props_fingerprint: tuple = ()
+    s0_prime: SelectionSnapshot | None = None
 
 
 _ACTIVE_TOKEN: _InsetBevelToken | None = None
@@ -477,6 +923,9 @@ _NEXT_GENERATION = 1
 _LOAD_PRE = False
 _UNREGISTERED = False
 _REPORTS: list[tuple[str, str]] = []
+_COMPLETION_RECORD: CompletionRecord | None = None
+_UNDO_POST_GUARD = False
+_REDO_POST_GUARD = False
 
 
 def _next_generation() -> int:
@@ -525,7 +974,67 @@ def _capture_selection(bm) -> SelectionSnapshot:
     )
 
 
-def _write_selection(bm, snapshot: SelectionSnapshot) -> None:
+def _element_domain(element) -> str | None:
+    name = type(element).__name__.upper()
+    if "VERT" in name:
+        return "VERT"
+    if "EDGE" in name:
+        return "EDGE"
+    if "FACE" in name:
+        return "FACE"
+    return None
+
+
+def _capture_selection_context(bm) -> SelectionContextSnapshot:
+    history: list[tuple[str, int]] = []
+    active: tuple[str, int] | None = None
+    try:
+        for element in bm.select_history:
+            domain = _element_domain(element)
+            if domain is not None:
+                history.append((domain, int(element.index)))
+        element = bm.select_history.active
+        domain = _element_domain(element)
+        if domain is not None:
+            active = (domain, int(element.index))
+    except (AttributeError, ReferenceError, RuntimeError):
+        pass
+    return SelectionContextSnapshot(_capture_selection(bm), tuple(history), active)
+
+
+def _restore_selection_history(bm, context_snapshot: SelectionContextSnapshot) -> None:
+    try:
+        bm.select_history.clear()
+        tables = {"VERT": bm.verts, "EDGE": bm.edges, "FACE": bm.faces}
+        for domain, index in context_snapshot.history:
+            table = tables[domain]
+            if 0 <= index < len(table):
+                bm.select_history.add(table[index])
+        if context_snapshot.active is not None:
+            domain, index = context_snapshot.active
+            table = tables[domain]
+            if 0 <= index < len(table):
+                bm.select_history.active = table[index]
+    except (AttributeError, ReferenceError, RuntimeError, KeyError):
+        # History restoration is best effort; selection and topology remain
+        # authoritative for the replay transaction.
+        pass
+
+
+def _remove_live_backup_layer(bm) -> None:
+    if bm is None:
+        return
+    try:
+        from . import layer_names
+
+        layer = bm.verts.layers.int.get(layer_names.VERT_BACKUP_ID_LAYER)
+        if layer is not None:
+            bm.verts.layers.int.remove(layer)
+    except Exception:
+        traceback.print_exc()
+
+
+def _write_selection(bm, snapshot: SelectionSnapshot, *, flush: bool = True) -> None:
     bm.verts.ensure_lookup_table()
     bm.edges.ensure_lookup_table()
     bm.faces.ensure_lookup_table()
@@ -547,7 +1056,8 @@ def _write_selection(bm, snapshot: SelectionSnapshot) -> None:
         bm.edges[i].select = True
     for i in snapshot.faces:
         bm.faces[i].select = True
-    bm.select_flush_mode()
+    if flush:
+        bm.select_flush_mode()
 
 
 def _count_selected_leading(bm, domains: tuple[str, ...]) -> int:
@@ -600,6 +1110,15 @@ def _selection_matches(token: _InsetBevelToken, snapshot: SelectionSnapshot | No
         return False
     current = _capture_selection(bm)
     return current.verts == snapshot.verts and current.edges == snapshot.edges and current.faces == snapshot.faces
+
+
+def _selection_matches_snapshot(bm, snapshot: SelectionSnapshot) -> bool:
+    current = _capture_selection(bm)
+    return (
+        current.verts == snapshot.verts
+        and current.edges == snapshot.edges
+        and current.faces == snapshot.faces
+    )
 
 
 def _selection_matches_s1(token: _InsetBevelToken) -> bool:
@@ -687,6 +1206,613 @@ def _restore_s0(token: _InsetBevelToken) -> bool:
     return True
 
 
+def _clear_all_selection(token: _InsetBevelToken) -> bool:
+    obj, mesh, bm = _edit_mesh_for_token(token)
+    if obj is None or mesh is None or bm is None:
+        return False
+    try:
+        for face in bm.faces:
+            face.select = False
+        for edge in bm.edges:
+            edge.select = False
+        for vertex in bm.verts:
+            vertex.select = False
+        bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+        return True
+    except Exception:
+        traceback.print_exc()
+        return False
+
+
+def _snapshot_as_mapping(snapshot: SelectionSnapshot | None) -> dict[str, frozenset[int]]:
+    if snapshot is None:
+        return {"VERT": frozenset(), "EDGE": frozenset(), "FACE": frozenset()}
+    return {"VERT": snapshot.verts, "EDGE": snapshot.edges, "FACE": snapshot.faces}
+
+
+def _element_coordinates(element) -> tuple[tuple[float, float, float], ...]:
+    if hasattr(element, "co"):
+        coordinate = element.co
+        return (tuple(float(value) for value in coordinate),)
+    return tuple(tuple(float(value) for value in vertex.co) for vertex in element.verts)
+
+
+def _capture_native_selection_context(token: _InsetBevelToken, bm) -> SelectionContextSnapshot:
+    del token
+    return _capture_selection_context(bm)
+
+
+def _classify_bevel_sides(
+    bm, domains: tuple[str, ...], axis_index: int, tolerance: float
+) -> tuple[int, bool]:
+    tables = {"VERT": bm.verts, "EDGE": bm.edges, "FACE": bm.faces}
+    candidate_sign = 1
+    for domain in domains:
+        for element in tables[domain]:
+            if not element.select or element.hide:
+                continue
+            values = [coordinate[axis_index] for coordinate in _element_coordinates(element)]
+            off_plane = [value for value in values if abs(value) > tolerance]
+            if off_plane and all(value >= -tolerance for value in values):
+                candidate_sign = 1
+                break
+            if off_plane and all(value <= tolerance for value in values):
+                candidate_sign = -1
+                break
+        else:
+            continue
+        break
+    user_count = 0
+    mirror_count = 0
+    for domain in domains:
+        for element in tables[domain]:
+            if not element.select or element.hide:
+                continue
+            category = classify_element_side(
+                _element_coordinates(element), axis_index, tolerance, candidate_sign
+            )
+            if category == "USER":
+                user_count += 1
+            elif category == "MIRROR":
+                mirror_count += 1
+    return candidate_sign, bool(user_count and mirror_count)
+
+
+def _normalize_bevel_selection_in_mesh(token: _InsetBevelToken, bm) -> bool:
+    if token.select_mirrored or token.relation is SelectionRelation.SELF_MIRRORED or token.manual_both_sides:
+        return True
+    tables = {"VERT": bm.verts, "EDGE": bm.edges, "FACE": bm.faces}
+    selected = _capture_selection(bm)
+    selected_map = _snapshot_as_mapping(selected)
+    classes: dict[tuple[str, int], str] = {}
+    for domain, table in tables.items():
+        table.ensure_lookup_table()
+        for element in table:
+            if not element.select:
+                continue
+            category = classify_element_side(_element_coordinates(element), token.axis_index, token.tolerance, token.user_sign)
+            classes[(domain, int(element.index))] = category
+    normalized = normalize_bevel_selection(
+        selected_map,
+        classes,
+        select_mirrored=bool(token.select_mirrored),
+        manual_both_sides=token.manual_both_sides,
+    )
+    try:
+        pending = SelectionSnapshot(
+            verts=normalized["VERT"],
+            edges=normalized["EDGE"],
+            faces=normalized["FACE"],
+            counts=selected.counts,
+        )
+        _write_selection(bm, pending, flush=False)
+        # §5B explicitly forbids select_flush_mode on this path.
+        _obj, mesh, _ = _edit_mesh_for_token(token)
+        if mesh is None:
+            return False
+        bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+        token.pending_selection = pending
+        token.normalizing = True
+        token.normalize_attempts = 0
+        return True
+    except Exception:
+        traceback.print_exc()
+        return False
+
+
+def _token_override(token: _InsetBevelToken):
+    window = token.window if _reference_alive(token.window) else None
+    area = token.area if _reference_alive(token.area) else None
+    region = token.region if _reference_alive(token.region) else None
+    if window is None:
+        raise RuntimeError("saved Blender window is unavailable")
+    return bpy.context.temp_override(window=window, area=area, region=region)
+
+
+def _active_operator_for_token(token: _InsetBevelToken):
+    window = token.window if _reference_alive(token.window) else None
+    area = token.area if _reference_alive(token.area) else None
+    region = token.region if _reference_alive(token.region) else None
+    if window is None:
+        return None
+    try:
+        with bpy.context.temp_override(window=window, area=area, region=region):
+            return getattr(bpy.context, "active_operator", None)
+    except Exception:
+        return None
+
+
+def _save_completion_record(token: _InsetBevelToken, operator=None) -> None:
+    global _COMPLETION_RECORD
+    operator = operator or _active_operator_for_token(token)
+    identity = _identity_from_operator(operator) if operator is not None else token.onset_op
+    if identity is None:
+        return
+    if identity.idname not in TARGET_OPERATOR_IDNAMES:
+        return
+    if operator is None:
+        props = token.props_fingerprint
+    else:
+        try:
+            with _token_override(token):
+                props = fingerprint(operator, route=token.native_idname)
+        except Exception:
+            props = fingerprint(operator, route=token.native_idname)
+    _COMPLETION_RECORD = CompletionRecord(
+        window_pointer=token.window_pointer,
+        object_name=token.object_name,
+        mesh_name=token.mesh_name,
+        route=token.native_idname,
+        operator=identity,
+        fingerprint=props,
+    )
+
+
+def _completion_context(record: CompletionRecord | None):
+    if record is None or bpy is None:
+        return None, None, None, None
+    window = next((w for w in getattr(bpy.context, "window_manager", ()).windows if _reference_alive(w) and int(w.as_pointer()) == record.window_pointer), None)
+    if window is None:
+        return None, None, None, None
+    obj = bpy.data.objects.get(record.object_name)
+    mesh = bpy.data.meshes.get(record.mesh_name)
+    try:
+        with bpy.context.temp_override(window=window):
+            operator = getattr(bpy.context, "active_operator", None)
+    except Exception:
+        operator = None
+    return window, obj, mesh, operator
+
+
+def _mark_completion_suspended() -> None:
+    global _COMPLETION_RECORD
+    if _COMPLETION_RECORD is not None:
+        _COMPLETION_RECORD = replace(_COMPLETION_RECORD, status=CompletionStatus.SUSPENDED)
+
+
+def _f9_current_operator(record: CompletionRecord):
+    if bpy is None:
+        return None, None
+    try:
+        for window in bpy.context.window_manager.windows:
+            if not _reference_alive(window) or int(window.as_pointer()) != record.window_pointer:
+                continue
+            with bpy.context.temp_override(window=window):
+                return getattr(bpy.context, "active_operator", None), window
+    except Exception:
+        return None, None
+    return None, None
+
+
+def _discard_repeat_token_without_restore() -> None:
+    """Invalidate a prior F9 token; undo_post already restored its step."""
+    global _ACTIVE_TOKEN
+    token = _ACTIVE_TOKEN
+    if token is not None and token.repeat_origin:
+        try:
+            _cleanup_inset_backup(token)
+        except Exception:
+            traceback.print_exc()
+        _discard_active_token()
+
+
+def _neutralize_for_f9(token: _InsetBevelToken) -> bool:
+    obj, mesh, bm = _edit_mesh_for_token(token)
+    if obj is None or mesh is None or bm is None:
+        return False
+    try:
+        for face in bm.faces:
+            face.select = False
+        for edge in bm.edges:
+            edge.select = False
+        for vertex in bm.verts:
+            vertex.select = False
+        bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+        token.restore_only = True
+        token.s0_prime = token.s0
+        return True
+    except Exception:
+        traceback.print_exc()
+        return False
+
+
+def _f9_gate_and_plan(operator, window, record: CompletionRecord):
+    """Return (token prerequisites, plan) or ``None`` for fail-closed."""
+    if bpy is None or window is None:
+        return None
+
+
+    try:
+        from . import element_pairs, matching, session_state
+        with bpy.context.temp_override(window=window):
+            context = bpy.context
+            if context.mode != "EDIT_MESH" or session_state.sessions_active():
+                return None
+            obj = context.edit_object
+            if obj is None or obj.type != "MESH" or len(context.objects_in_mode_unique_data) != 1:
+                return None
+            axes = matching.enabled_mesh_symmetry_axes(obj)
+            if len(axes) != 1:
+                return None
+            _axis_name, axis_index = axes[0]
+            tolerance = float(context.scene.ydd_symmetric_edit.tolerance)
+            mesh = obj.data
+            bm = bmesh.from_edit_mesh(mesh)
+            try:
+                from . import layer_names
+                # History token layers persist on committed meshes long after
+                # the cut settled; their mere presence must not veto F9.  The
+                # mutation-owner conflict exists only while a repair is
+                # queued/running, or while our own backup layer marks an
+                # unfinished replay transaction.
+                if session_state.history_repair_active():
+                    return None
+                if bm.verts.layers.int.get(layer_names.VERT_BACKUP_ID_LAYER) is not None:
+                    return None
+            except Exception:
+                # Marker inspection is fail-closed: an unreadable marker API
+                # must not permit a second mutation owner to run.
+                return None
+            affect = None
+            if record.route == "mesh.bevel":
+                affect = getattr(getattr(operator, "properties", None), "affect", DEFAULT_BEVEL_AFFECT)
+                affect = _enum_identifier(affect)
+            domains = leading_domains_for_route(record.route, affect)
+            if domains is None:
+                return None
+            pair_maps = element_pairs.build_element_pair_maps(bm, axis_index, tolerance, mesh_object=obj)
+            plan = element_pairs.plan_leading_domain_expansion(bm, pair_maps, domains=domains)
+            if plan.hidden_counterpart_count or plan.unmatched_count:
+                return None
+            selected = {
+                "VERT": frozenset(int(v.index) for v in bm.verts if v.select),
+                "EDGE": frozenset(int(e.index) for e in bm.edges if e.select),
+                "FACE": frozenset(int(f.index) for f in bm.faces if f.select),
+            }
+            relation, self_mixed = classify_selection_relation(selected, pair_maps, domains=domains)
+            if relation is not SelectionRelation.DISJOINT:
+                return None
+            s0 = _capture_selection(bm)
+            m0 = SelectionSnapshot(
+                frozenset(plan.add_vert_indices), frozenset(plan.add_edge_indices),
+                frozenset(plan.add_face_indices), s0.counts,
+            )
+            try:
+                mesh_select_mode = tuple(bool(value) for value in context.tool_settings.mesh_select_mode)
+            except Exception:
+                mesh_select_mode = (False, True, False)
+            sign, manual = _classify_bevel_sides(bm, domains, axis_index, tolerance)
+            token = _register_dormant_token(
+                context=context, obj=obj, s0=s0, recorded_op=_identity_from_operator(operator),
+                native_idname=record.route, axis_index=axis_index, tolerance=tolerance,
+                mode="inset" if record.route == "mesh.inset" else "bevel", m0=m0,
+                relation=relation, self_mixed=self_mixed, mesh_select_mode=mesh_select_mode,
+                user_sign=sign, manual_both_sides=manual, repeat_origin=True,
+                props_fingerprint=fingerprint(operator, route=record.route),
+            )
+            return token, plan, bm, mesh, context
+    except Exception:
+        traceback.print_exc()
+        return None
+
+
+def _f9_current_edit_names(window) -> tuple[str | None, str | None]:
+    """Names of the mesh actually being edited in *window* right now.
+
+    The record-match in classify/reactivate must compare against the live
+    context, not the record's own values, or the object/mesh conditions
+    become tautologies.
+    """
+
+    try:
+        with bpy.context.temp_override(window=window):
+            obj = bpy.context.edit_object
+            if obj is None or obj.type != "MESH":
+                return None, None
+            return str(obj.name), str(obj.data.name)
+    except Exception:
+        traceback.print_exc()
+        return None, None
+
+
+def _schedule_deferred_f9_restore(token: _InsetBevelToken) -> None:
+    """Restore the pre-F9 selection after the imminent native replay.
+
+    Only used when the poller could not be armed inside the undo_post
+    handler: the replay is about to run synchronously, so the restore has to
+    happen on a later timer tick.  Falls back to a warning (selection left
+    neutralized) when the timer cannot be registered either.
+    """
+
+    snapshot = token.s0_prime if token.s0_prime is not None else token.s0
+    object_name = token.object_name
+    mesh_name = token.mesh_name
+    landing_counts = token.invoke_counts
+
+    def _deferred_restore():
+        try:
+            obj = bpy.data.objects.get(object_name)
+            if obj is None or obj.mode != "EDIT" or obj.data.name != mesh_name:
+                return None
+            bm = bmesh.from_edit_mesh(obj.data)
+            counts = MeshCounts(len(bm.verts), len(bm.edges), len(bm.faces))
+            if counts != landing_counts:
+                _record_report("WARNING", "F9 neutralization did not hold; selection restore skipped")
+                return None
+            _write_selection(bm, snapshot, flush=False)
+            bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+        except Exception:
+            traceback.print_exc()
+            _record_report("WARNING", RESTORE_FAILED_WARNING)
+        return None
+
+    try:
+        bpy.app.timers.register(_deferred_restore, first_interval=0.3)
+    except Exception:
+        traceback.print_exc()
+        _record_report("WARNING", "F9 restore could not be scheduled; selection left cleared")
+
+
+def _create_restore_only_token(operator, window, record: CompletionRecord):
+    if bpy is None or window is None:
+        return None
+    try:
+        with bpy.context.temp_override(window=window):
+            context = bpy.context
+            obj = context.edit_object
+            if obj is None or obj.type != "MESH":
+                return None
+            mesh = obj.data
+            bm = bmesh.from_edit_mesh(mesh)
+            axes = _read_only_symmetry_parameters(context)
+            if axes is None:
+                return None
+            _obj, axis_index, tolerance = axes
+            token = _register_dormant_token(
+                context=context, obj=obj, s0=_capture_selection(bm),
+                recorded_op=_identity_from_operator(operator), native_idname=record.route,
+                axis_index=axis_index, tolerance=tolerance,
+                mode="inset" if record.route == "mesh.inset" else "bevel",
+                relation=SelectionRelation.PARTIAL, repeat_origin=True,
+                restore_only=True,
+                props_fingerprint=fingerprint(operator, route=record.route),
+            )
+            if token is None:
+                return None
+            token.s0_prime = token.s0
+            _neutralize_for_f9(token)
+            if not _arm_poller(token):
+                # The native replay runs right after this handler returns;
+                # restoring the selection now would hand it that selection
+                # and defeat the neutralization.  Restore must wait until
+                # after the replay.
+                _record_report("WARNING", ARM_FAILED_WARNING)
+                _schedule_deferred_f9_restore(token)
+                _discard_active_token()
+                return None
+            return token
+    except Exception:
+        traceback.print_exc()
+        return None
+
+
+def _capture_inset_props(token: _InsetBevelToken) -> dict[str, object] | None:
+    try:
+        with _token_override(token):
+            operator = getattr(bpy.context, "active_operator", None)
+            if _identity_from_operator(operator).idname != "mesh.inset":
+                return None
+            properties = getattr(operator, "properties", None)
+            if properties is None:
+                return None
+            result: dict[str, object] = {}
+            rna_properties = getattr(getattr(properties, "bl_rna", None), "properties", None)
+            for name in INSET_REPLAY_PROPS:
+                if not hasattr(properties, name):
+                    return None
+                rna_property = rna_properties.get(name) if rna_properties is not None else None
+                if rna_property is not None and bool(getattr(rna_property, "is_readonly", False)):
+                    return None
+                result[name] = getattr(properties, name)
+            return result
+    except Exception:
+        traceback.print_exc()
+        return None
+
+
+def _read_select_mirrored(token: _InsetBevelToken) -> bool | None:
+    try:
+        with _token_override(token):
+            settings = getattr(getattr(bpy.context, "scene", None), "ydd_symmetric_edit", None)
+            if settings is None:
+                return False
+            return bool(getattr(settings, "select_mirrored", False))
+    except Exception:
+        traceback.print_exc()
+        return None
+
+
+def _cleanup_inset_backup(token: _InsetBevelToken, bm=None) -> None:
+    try:
+        if bm is None:
+            _obj, _mesh, bm = _edit_mesh_for_token(token)
+        _remove_live_backup_layer(bm)
+        token.live_layer_cleaned = True
+    finally:
+        if token.topology_backup is not None:
+            try:
+                from . import backup
+
+                backup.remove_backup(token.topology_backup)
+            except Exception:
+                traceback.print_exc()
+            finally:
+                token.topology_backup = None
+
+
+def _inset_replay_abort(token: _InsetBevelToken, native_context: SelectionContextSnapshot | None) -> None:
+    """Restore native topology/selection after a pre-commit EXEC failure."""
+
+    try:
+        _obj, mesh, bm = _edit_mesh_for_token(token)
+        if mesh is not None and token.topology_backup is not None:
+            from . import backup
+
+            backup.restore_topology_backup(mesh, token.topology_backup)
+            _obj, mesh, bm = _edit_mesh_for_token(token)
+            _remove_live_backup_layer(bm)
+            if bm is not None and native_context is not None:
+                restored = False
+                for _attempt in range(RESTORE_VERIFY_ATTEMPTS):
+                    _write_selection(bm, native_context.selection, flush=False)
+                    if _selection_matches_snapshot(bm, native_context.selection):
+                        restored = True
+                        break
+                if not restored:
+                    _record_report("WARNING", RESTORE_FAILED_WARNING)
+                _restore_selection_history(bm, native_context)
+                bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+    except Exception:
+        traceback.print_exc()
+        _record_report("WARNING", "Inset mirror replay rollback failed")
+    finally:
+        _cleanup_inset_backup(token)
+
+
+def _run_inset_replay(token: _InsetBevelToken) -> InsetReplayState:
+    """Execute the §5A post-confirm replay and return its terminal state."""
+
+    # The replay issues bpy.ops calls (EXEC + undo_push); keep the F9 handler
+    # disabled for the whole sequence so it can never observe our own ops.
+    global _UNDO_POST_GUARD
+    previous_guard = _UNDO_POST_GUARD
+    _UNDO_POST_GUARD = True
+    try:
+        return _run_inset_replay_guarded(token)
+    finally:
+        _UNDO_POST_GUARD = previous_guard
+
+
+def _run_inset_replay_guarded(token: _InsetBevelToken) -> InsetReplayState:
+    token.replay_state = next_inset_replay_state(token.replay_state, InsetReplayEvent.CONFIRMED)
+    props = _capture_inset_props(token)
+    if props is not None:
+        token.props_fingerprint = tuple(
+            (name, round(value, 6) if isinstance(value, float) else value)
+            for name, value in props.items()
+        )
+    token.select_mirrored = _read_select_mirrored(token)
+    obj, mesh, bm = _edit_mesh_for_token(token)
+    if props is None or token.select_mirrored is None or bm is None or mesh is None:
+        token.replay_state = next_inset_replay_state(token.replay_state, InsetReplayEvent.REPLAY_FAILED)
+        _cleanup_inset_backup(token, bm)
+        _record_report("WARNING", "Inset mirror replay prerequisites were unavailable")
+        return token.replay_state
+    native_context = _capture_native_selection_context(token, bm)
+    token.f_user = native_context
+    m0 = token.m0
+    if m0 is None:
+        token.replay_state = next_inset_replay_state(token.replay_state, InsetReplayEvent.REPLAY_FAILED)
+        _cleanup_inset_backup(token, bm)
+        _record_report("WARNING", "Inset mirror replay selection was unavailable")
+        return token.replay_state
+    for indices, count in ((m0.verts, len(bm.verts)), (m0.edges, len(bm.edges)), (m0.faces, len(bm.faces))):
+        if any(index < 0 or index >= count for index in indices):
+            token.replay_state = next_inset_replay_state(token.replay_state, InsetReplayEvent.REPLAY_FAILED)
+            _cleanup_inset_backup(token, bm)
+            _record_report("WARNING", "Inset mirror replay selection was out of range")
+            return token.replay_state
+    try:
+        from . import backup
+
+        token.topology_backup = backup.create_topology_backup(bm)
+    except Exception:
+        traceback.print_exc()
+        _remove_live_backup_layer(bm)
+        token.replay_state = next_inset_replay_state(token.replay_state, InsetReplayEvent.REPLAY_FAILED)
+        _cleanup_inset_backup(token, bm)
+        _record_report("WARNING", "Inset mirror replay backup could not be created")
+        return token.replay_state
+    try:
+        token.replay_state = next_inset_replay_state(token.replay_state, InsetReplayEvent.PROPS_READY)
+        _write_selection(bm, m0, flush=True)
+        bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+        with _token_override(token):
+            result = bpy.ops.mesh.inset("EXEC_DEFAULT", **props)
+        if not _undo_push_finished(result):
+            raise RuntimeError("mesh.inset replay did not finish")
+        token.replay_state = next_inset_replay_state(token.replay_state, InsetReplayEvent.EXEC_FINISHED)
+    except Exception:
+        traceback.print_exc()
+        _inset_replay_abort(token, native_context)
+        token.replay_state = next_inset_replay_state(token.replay_state, InsetReplayEvent.REPLAY_FAILED)
+        _record_report("WARNING", "Inset mirror replay failed; the result is one-sided")
+        return token.replay_state
+
+    # EXEC_COMMITTED: no rollback to one-sided is permitted from here on.
+    try:
+        _obj, mesh, bm = _edit_mesh_for_token(token)
+        if bm is None or mesh is None:
+            raise RuntimeError("mesh disappeared after inset replay")
+        token.f_mirror = _capture_selection(bm)
+        if token.select_mirrored:
+            merged = SelectionSnapshot(
+                verts=frozenset(native_context.selection.verts | token.f_mirror.verts),
+                edges=frozenset(native_context.selection.edges | token.f_mirror.edges),
+                faces=frozenset(native_context.selection.faces | token.f_mirror.faces),
+                counts=token.f_mirror.counts,
+            )
+        else:
+            merged = native_context.selection
+        _write_selection(bm, merged, flush=True)
+        _restore_selection_history(bm, native_context)
+        _remove_live_backup_layer(bm)
+        bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+        token.live_layer_cleaned = True
+        _cleanup_inset_backup(token, bm)
+        with _token_override(token):
+            push_result = bpy.ops.ed.undo_push(message="Symmetric inset")
+        if not _undo_push_finished(push_result):
+            raise RuntimeError("undo_push did not finish")
+        token.replay_state = next_inset_replay_state(token.replay_state, InsetReplayEvent.PUSH_FINISHED)
+    except Exception:
+        traceback.print_exc()
+        try:
+            _obj, mesh, bm = _edit_mesh_for_token(token)
+            if bm is None or mesh is None:
+                raise RuntimeError("mesh disappeared while restoring native selection")
+            _write_selection(bm, native_context.selection, flush=False)
+            _restore_selection_history(bm, native_context)
+            bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+        except Exception:
+            traceback.print_exc()
+            _record_report("WARNING", "Symmetric inset could not restore the native selection context")
+        _record_report("WARNING", "Symmetric inset applied; selection/undo may be degraded")
+        token.replay_state = next_inset_replay_state(token.replay_state, InsetReplayEvent.POSTPROCESS_FAILED)
+        _cleanup_inset_backup(token)
+    return token.replay_state
+
+
 def _tag_view3d_redraw(token: _InsetBevelToken) -> None:
     window = token.window if _reference_alive(token.window) else None
     if window is None:
@@ -735,11 +1861,42 @@ def _run_confirm_diagnostic(token: _InsetBevelToken, operator=None) -> None:
 
 
 def _apply_settled_verdict(token: _InsetBevelToken, verdict: PollerVerdict, *, staged_restore: bool = False) -> None:
+    global _COMPLETION_RECORD
     if verdict is PollerVerdict.CONFIRMED:
+        observed = _read_active_operator(token)
+        if observed.idname in TARGET_OPERATOR_IDNAMES:
+            token.onset_op = observed
+        if token.mode == "inset":
+            replay_state = _run_inset_replay(token)
+            if replay_state in {InsetReplayState.PUSHED, InsetReplayState.DEGRADED_SYMMETRIC}:
+                _run_confirm_diagnostic(token)
+                _save_completion_record(token)
+            elif token.repeat_origin:
+                _COMPLETION_RECORD = None
+            _discard_active_token()
+            return
+        token.select_mirrored = _read_select_mirrored(token)
+        active_operator = _active_operator_for_token(token)
+        if active_operator is not None:
+            token.props_fingerprint = fingerprint(active_operator, route="mesh.bevel", override=_token_override(token))
+        _obj, _mesh, bm = _edit_mesh_for_token(token)
+        if token.select_mirrored is None:
+            _record_report("WARNING", "Bevel selection normalization skipped: select_mirrored was unreadable")
+        elif bm is not None and token.select_mirrored is False:
+            if not _normalize_bevel_selection_in_mesh(token, bm):
+                _record_report("WARNING", "Bevel selection normalization failed")
+        if token.normalizing:
+            return
         _run_confirm_diagnostic(token)
+        _save_completion_record(token)
         _discard_active_token()
         return
     if verdict is PollerVerdict.CANCELLED:
+        if token.mode == "inset":
+            if token.repeat_origin:
+                _COMPLETION_RECORD = None
+            _discard_active_token()
+            return
         try:
             _restore_s0(token)
         except Exception:
@@ -755,6 +1912,8 @@ def _apply_settled_verdict(token: _InsetBevelToken, verdict: PollerVerdict, *, s
             return
         _discard_active_token()
         return
+    if token.repeat_origin:
+        _COMPLETION_RECORD = None
     _discard_active_token()
 
 
@@ -776,6 +1935,9 @@ def _prior_token_view(token: _InsetBevelToken) -> PriorTokenView:
         elapsed_s=0.0 if token.t0 is None else time.monotonic() - token.t0,
         s0=token.s0.verts,
         discard=discard,
+        onset_op=token.onset_op,
+        mode=token.mode,
+        replay_state=token.replay_state,
     )
 
 
@@ -783,12 +1945,24 @@ def _settle_prior_token_sync() -> Literal["none", "consume", "settled"]:
     token = _ACTIVE_TOKEN
     if token is None:
         return "none"
+    if token.normalizing:
+        # A pending normalization is owned by the poller; synchronous
+        # completion makes this defensive consume path unreachable normally.
+        return "consume"
     result = apply_invoke_preamble(_prior_token_view(token), frozenset())
     if result.decision is PreambleDecision.CONSUME_EVENT:
         return "consume"
+    if result.verdict is PollerVerdict.CONFIRMED or (
+        token.mode == "inset" and token.replay_state is not InsetReplayState.WATCHING
+    ):
+        # Confirmed post-processing is exclusively owned by the poller; the
+        # new event is consumed and must not abandon replay or normalization.
+        # The replay-pending branch is defensive; synchronous completion
+        # makes it unreachable in normal operation.
+        return "consume"
     if result.verdict is PollerVerdict.CONFIRMED:
         _run_confirm_diagnostic(token)
-    if result.restored_s0:
+    if result.restored_s0 and token.mode != "inset":
         try:
             _restore_s0(token)
         except Exception:
@@ -807,6 +1981,16 @@ def _register_dormant_token(
     native_idname: str,
     axis_index: int,
     tolerance: float,
+    mode: Literal["inset", "bevel"] = "bevel",
+    m0: SelectionSnapshot | None = None,
+    relation: SelectionRelation = SelectionRelation.DISJOINT,
+    self_mixed: bool = False,
+    mesh_select_mode: tuple[bool, bool, bool] = (False, True, False),
+    user_sign: int = 1,
+    manual_both_sides: bool = False,
+    repeat_origin: bool = False,
+    props_fingerprint: tuple = (),
+    restore_only: bool = False,
 ) -> _InsetBevelToken | None:
     global _ACTIVE_TOKEN
     window = getattr(context, "window", None)
@@ -831,6 +2015,16 @@ def _register_dormant_token(
         native_idname=native_idname,
         axis_index=axis_index,
         tolerance=tolerance,
+        mode=mode,
+        m0=m0,
+        relation=relation,
+        self_mixed=self_mixed,
+        mesh_select_mode=mesh_select_mode,
+        user_sign=user_sign,
+        manual_both_sides=manual_both_sides,
+        repeat_origin=repeat_origin,
+        props_fingerprint=props_fingerprint,
+        restore_only=restore_only,
     )
     _ACTIVE_TOKEN = token
     return token
@@ -859,6 +2053,22 @@ def _poller_timer() -> float | None:
         token = _ACTIVE_TOKEN
         if token is None or _ARMED_GENERATION is None or token.generation != _ARMED_GENERATION:
             return None
+        if token.restore_only:
+            if token.restore_attempts == 0:
+                token.restore_attempts = 1
+                return POLLER_INTERVAL
+            current = _current_counts_from_token(token)
+            if current is not None and current != token.invoke_counts:
+                _record_report("WARNING", "F9 neutral replay changed topology; restoring selection best-effort")
+            if token.s0_prime is not None:
+                if not _restore_s0(token):
+                    _record_report("WARNING", RESTORE_FAILED_WARNING)
+                    _record_report("WARNING", "F9 restore-only failed; clearing all selection")
+                    _clear_all_selection(token)
+            global _COMPLETION_RECORD
+            _COMPLETION_RECORD = None
+            _discard_active_token()
+            return None
         if token.restoring:
             if discard_reason(**_token_discard_flags(token)) is not None:
                 _discard_active_token()
@@ -868,18 +2078,47 @@ def _poller_timer() -> float | None:
                 _discard_active_token()
                 return None
             if token.restore_attempts >= RESTORE_VERIFY_ATTEMPTS:
-                # Leave whatever selection survived: the expanded selection is
-                # still symmetric, so not restoring is the safe degradation.
                 _record_report("WARNING", RESTORE_FAILED_WARNING)
+                _record_report("WARNING", "Inset/Bevel restore failed; clearing all selection")
+                _clear_all_selection(token)
                 _discard_active_token()
                 return None
             token.restore_attempts += 1
             if not _restore_s0(token):
                 _record_report("WARNING", RESTORE_FAILED_WARNING)
+                _record_report("WARNING", "Inset/Bevel restore failed; clearing all selection")
+                _clear_all_selection(token)
                 _discard_active_token()
                 return None
             return min(
                 RESTORE_VERIFY_BASE_INTERVAL * token.restore_attempts,
+                RESTORE_VERIFY_MAX_INTERVAL,
+            )
+        if token.normalizing:
+            if discard_reason(**_token_discard_flags(token)) is not None:
+                _discard_active_token()
+                return None
+            if _selection_matches(token, token.pending_selection):
+                _tag_view3d_redraw(token)
+                token.normalizing = False
+                token.pending_selection = None
+                _run_confirm_diagnostic(token)
+                _save_completion_record(token)
+                _discard_active_token()
+                return None
+            if token.normalize_attempts >= RESTORE_VERIFY_ATTEMPTS:
+                _record_report("WARNING", "Bevel selection normalization could not be verified")
+                _discard_active_token()
+                return None
+            token.normalize_attempts += 1
+            _obj, mesh, bm = _edit_mesh_for_token(token)
+            if mesh is None or bm is None or token.pending_selection is None:
+                _record_report("WARNING", "Bevel selection normalization failed")
+                _discard_active_token()
+                return None
+            _write_selection(bm, token.pending_selection, flush=False)
+            return min(
+                RESTORE_VERIFY_BASE_INTERVAL * token.normalize_attempts,
                 RESTORE_VERIFY_MAX_INTERVAL,
             )
         flags = _token_discard_flags(token)
@@ -894,6 +2133,17 @@ def _poller_timer() -> float | None:
         else:
             modal_alive = _target_modal_alive(token)
             current_op = _read_active_operator(token)
+            if (
+                token.repeat_origin
+                and token.mode == "bevel"
+                and not modal_alive
+                and current_op.idname == "mesh.bevel"
+                and counts == token.invoke_counts
+            ):
+                active_object = _active_operator_for_token(token)
+                if active_object is not None and fingerprint(active_object, route="mesh.bevel", override=_token_override(token)) == token.props_fingerprint:
+                    _apply_settled_verdict(token, PollerVerdict.CONFIRMED)
+                    return POLLER_INTERVAL if _ACTIVE_TOKEN is token else None
             # The S1 comparison walks the whole mesh; only the no-onset
             # timeout branch consumes it, so skip it everywhere else.
             sel_matches = (
@@ -912,15 +2162,19 @@ def _poller_timer() -> float | None:
             onset=token.onset,
             elapsed_s=elapsed,
             selection_matches_s1=sel_matches,
+            onset_op=token.onset_op,
+            mode=token.mode,
             **flags,
         )
         if result is TickResult.WAIT:
-            if modal_alive:
+            if modal_alive and current_op.idname in TARGET_OPERATOR_IDNAMES and current_op.pointer is not None:
                 token.onset = True
+                if token.onset_op is None and current_op.idname in TARGET_OPERATOR_IDNAMES:
+                    token.onset_op = current_op
             return POLLER_INTERVAL
         if result is TickResult.CONFIRMED:
             _apply_settled_verdict(token, PollerVerdict.CONFIRMED)
-            return None
+            return POLLER_INTERVAL if _ACTIVE_TOKEN is token else None
         if result is TickResult.CANCELLED:
             _apply_settled_verdict(token, PollerVerdict.CANCELLED, staged_restore=True)
             return POLLER_INTERVAL if _ACTIVE_TOKEN is token else None
@@ -928,6 +2182,12 @@ def _poller_timer() -> float | None:
         return None
     except Exception:
         traceback.print_exc()
+        token = _ACTIVE_TOKEN
+        if token is not None and token.mode == "inset":
+            try:
+                _cleanup_inset_backup(token)
+            except Exception:
+                traceback.print_exc()
         try:
             _discard_active_token()
         except Exception:
@@ -986,8 +2246,9 @@ def _undo_push_finished(result: object) -> bool:
 
 @persistent
 def _on_load_pre(_dummy) -> None:
-    global _LOAD_PRE
+    global _LOAD_PRE, _COMPLETION_RECORD
     _LOAD_PRE = True
+    _COMPLETION_RECORD = None
     _discard_active_token()
 
 
@@ -999,21 +2260,162 @@ def _on_load_post(_dummy) -> None:
     _LOAD_PRE = False
 
 
+@persistent
+def _on_undo_post(_dummy) -> None:
+    """Re-enter native Inset/Bevel F9 between undo and operator replay."""
+    global _UNDO_POST_GUARD, _COMPLETION_RECORD
+    if _UNDO_POST_GUARD or bpy is None or _UNREGISTERED or _COMPLETION_RECORD is None:
+        return
+    _UNDO_POST_GUARD = True
+    try:
+        record = _COMPLETION_RECORD
+        recorded_obj = bpy.data.objects.get(record.object_name)
+        if recorded_obj is None or recorded_obj.data.name != record.mesh_name:
+            # The recorded object/mesh no longer exists: the record can never
+            # match a live context again.
+            _COMPLETION_RECORD = None
+            return
+        operator, window = _f9_current_operator(record)
+        if operator is None:
+            _mark_completion_suspended()
+            return
+        try:
+            window_pointer = int(window.as_pointer())
+        except Exception:
+            window_pointer = None
+        current_object_name, current_mesh_name = _f9_current_edit_names(window)
+        classification = classify_f9_intervention(
+            operator,
+            record,
+            window_pointer=window_pointer,
+            object_name=current_object_name,
+            mesh_name=current_mesh_name,
+            route=record.route,
+        )
+        _COMPLETION_RECORD = classification.record
+        if classification.decision is F9Decision.SUSPEND:
+            return
+        if classification.decision is not F9Decision.INTERVENE:
+            return
+        token = _ACTIVE_TOKEN
+        if token is not None:
+            decision = supersede_decision(
+                repeat_origin=token.repeat_origin,
+                restore_only=token.restore_only,
+                mode=token.mode,
+                replay_state=token.replay_state,
+                same_context=(
+                    token.window_pointer == window_pointer
+                    and token.object_name == current_object_name
+                    and token.mesh_name == current_mesh_name
+                ),
+            )
+            if decision == "SUPERSEDE":
+                _discard_repeat_token_without_restore()
+            elif token.restore_only:
+                if not _restore_s0(token):
+                    _record_report("WARNING", RESTORE_FAILED_WARNING)
+                    _record_report("WARNING", "F9 restore-only supersede failed; clearing all selection")
+                    _clear_all_selection(token)
+                _discard_active_token()
+            else:
+                _record_report("WARNING", "F9 intervention skipped while another token is active")
+                return
+        prepared = _f9_gate_and_plan(operator, window, record)
+        if prepared is None:
+            _record_report("WARNING", "F9 symmetry gate failed; native replay neutralized")
+            if _create_restore_only_token(operator, window, record) is None:
+                _COMPLETION_RECORD = None
+            return
+        token, plan, bm, mesh, context = prepared
+        if token is None:
+            return
+        try:
+            if token.mode == "bevel":
+                token.s0_prime = token.s0
+                _write_selection(bm, SelectionSnapshot(
+                    frozenset(plan.add_vert_indices) | token.s0.verts,
+                    frozenset(plan.add_edge_indices) | token.s0.edges,
+                    frozenset(plan.add_face_indices) | token.s0.faces,
+                    token.s0.counts,
+                ))
+                bm.select_flush_mode()
+                bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+                token.s1 = _capture_selection(bm)
+            armed = _arm_poller(token)
+        except Exception:
+            traceback.print_exc()
+            armed = False
+        if not armed:
+            # The replay runs right after this handler; a synchronous restore
+            # (or a partially expanded selection) would hand it a wrong
+            # selection.  Neutralize and defer the restore instead
+            # (fail-closed); the token must not stay registered un-armed.
+            _record_report("WARNING", ARM_FAILED_WARNING)
+            token.s0_prime = token.s0_prime if token.s0_prime is not None else token.s0
+            try:
+                _neutralize_for_f9(token)
+                _schedule_deferred_f9_restore(token)
+            except Exception:
+                traceback.print_exc()
+                _record_report("WARNING", RESTORE_FAILED_WARNING)
+            _discard_active_token()
+    except Exception:
+        traceback.print_exc()
+    finally:
+        _UNDO_POST_GUARD = False
+
+
+@persistent
+def _on_redo_post(_dummy) -> None:
+    global _REDO_POST_GUARD, _COMPLETION_RECORD
+    if _REDO_POST_GUARD or bpy is None or _UNREGISTERED or _COMPLETION_RECORD is None:
+        return
+    _REDO_POST_GUARD = True
+    try:
+        record = _COMPLETION_RECORD
+        operator, window = _f9_current_operator(record)
+        if operator is None:
+            return
+        try:
+            pointer = int(window.as_pointer())
+        except Exception:
+            pointer = None
+        current_object_name, current_mesh_name = _f9_current_edit_names(window)
+        _COMPLETION_RECORD = reactivate_completion_record(
+            record,
+            operator,
+            window_pointer=pointer,
+            object_name=current_object_name,
+            mesh_name=current_mesh_name,
+        )
+    except Exception:
+        traceback.print_exc()
+    finally:
+        _REDO_POST_GUARD = False
+
+
 def install_runtime_hooks() -> None:
     global _UNREGISTERED, _LOAD_PRE
     _UNREGISTERED = False
     _LOAD_PRE = False
     if bpy is None:
         return
-    if _on_load_pre not in bpy.app.handlers.load_pre:
-        bpy.app.handlers.load_pre.append(_on_load_pre)
-    if _on_load_post not in bpy.app.handlers.load_post:
-        bpy.app.handlers.load_post.append(_on_load_post)
+    hooks = (
+        (bpy.app.handlers.load_pre, _on_load_pre),
+        (bpy.app.handlers.load_post, _on_load_post),
+        (bpy.app.handlers.undo_post, _on_undo_post),
+        (bpy.app.handlers.redo_post, _on_redo_post),
+    )
+    for handler_list, handler in hooks:
+        if handler not in handler_list:
+            handler_list.append(handler)
 
 
 def cleanup_runtime() -> None:
-    global _UNREGISTERED, _LOAD_PRE
+    global _UNREGISTERED, _LOAD_PRE, _COMPLETION_RECORD
     _UNREGISTERED = True
+    _COMPLETION_RECORD = None
     _discard_active_token()
     if bpy is None:
         _LOAD_PRE = False
@@ -1022,6 +2424,8 @@ def cleanup_runtime() -> None:
     for handler_list, handler in (
         (bpy.app.handlers.load_pre, _on_load_pre),
         (bpy.app.handlers.load_post, _on_load_post),
+        (bpy.app.handlers.undo_post, _on_undo_post),
+        (bpy.app.handlers.redo_post, _on_redo_post),
     ):
         try:
             if handler in handler_list:
@@ -1036,11 +2440,11 @@ _OperatorBase = bpy.types.Operator if bpy is not None else object
 
 
 class MESH_OT_ydd_symmetric_edit_inset_bevel_intercept(_OperatorBase):
-    """Expand a symmetric selection, then let the native Inset or Bevel event continue."""
+    """Intercept native Inset/Bevel routes and apply their contract-specific postprocess."""
 
     bl_idname = "mesh.ydd_symmetric_edit_inset_bevel_intercept"
     bl_label = "Prepare ydd Symmetric Edit for Inset/Bevel"
-    bl_description = "Expand the mirrored selection, then pass the native Inset or Bevel event through"
+    bl_description = "Prepare a symmetric Inset or Bevel route and pass the native event through"
     bl_options = {"INTERNAL"}
 
     if TYPE_CHECKING:
@@ -1119,12 +2523,41 @@ class MESH_OT_ydd_symmetric_edit_inset_bevel_intercept(_OperatorBase):
             return {"PASS_THROUGH"}
         if _count_selected_leading(bm, domains) == 0:
             return {"PASS_THROUGH"}
+        selected = {
+            "VERT": frozenset(int(vertex.index) for vertex in bm.verts if vertex.select and not vertex.hide),
+            "EDGE": frozenset(int(edge.index) for edge in bm.edges if edge.select and not edge.hide),
+            "FACE": frozenset(int(face.index) for face in bm.faces if face.select and not face.hide),
+        }
+        relation, self_mixed = classify_selection_relation(selected, pair_maps, domains=domains)
+        if relation is SelectionRelation.UNMATCHED:
+            _operator_report(self, {"WARNING"}, UNMATCHED_WARNING)
+            return {"PASS_THROUGH"}
+        if relation is SelectionRelation.SELF_MIRRORED or relation is SelectionRelation.PARTIAL:
+            if relation is SelectionRelation.PARTIAL or (self_mixed and route.native_operator == "mesh.inset"):
+                _operator_report(self, {"WARNING"}, "Inset/Bevel selection overlap is not guaranteed symmetric")
+            return {"PASS_THROUGH"}
+        if self_mixed and route.native_operator == "mesh.inset":
+            _operator_report(self, {"WARNING"}, "Inset/Bevel selection overlap is not guaranteed symmetric")
+            return {"PASS_THROUGH"}
         if not plan.add_vert_indices and not plan.add_edge_indices and not plan.add_face_indices:
             return {"PASS_THROUGH"}
 
         try:
             s0 = _capture_selection(bm)
             state = replace(state, snapshot_exists=True)
+            try:
+                mesh_select_mode = tuple(bool(value) for value in context.tool_settings.mesh_select_mode)
+            except Exception:
+                mesh_select_mode = (False, True, False)
+            m0 = SelectionSnapshot(
+                verts=frozenset(plan.add_vert_indices),
+                edges=frozenset(plan.add_edge_indices),
+                faces=frozenset(plan.add_face_indices),
+                counts=s0.counts,
+            )
+            bevel_user_sign, manual_both_sides = _classify_bevel_sides(
+                bm, domains, axis_index, tolerance
+            )
             token = _register_dormant_token(
                 context=context,
                 obj=obj,
@@ -1133,6 +2566,13 @@ class MESH_OT_ydd_symmetric_edit_inset_bevel_intercept(_OperatorBase):
                 native_idname=route.native_operator,
                 axis_index=axis_index,
                 tolerance=tolerance,
+                mode="inset" if route.native_operator == "mesh.inset" else "bevel",
+                m0=m0,
+                relation=relation,
+                self_mixed=self_mixed,
+                mesh_select_mode=mesh_select_mode,
+                user_sign=bevel_user_sign,
+                manual_both_sides=manual_both_sides if route.native_operator == "mesh.bevel" else False,
             )
             if token is None:
                 return self._apply_transaction_action(
@@ -1142,6 +2582,9 @@ class MESH_OT_ydd_symmetric_edit_inset_bevel_intercept(_OperatorBase):
                 )
             state = replace(state, token_registered=True)
 
+            if route.native_operator == "mesh.inset":
+                return self._arm_or_leave(context, state, token, warn_on_success=False)
+
             # A partially applied plan must already restore S0, so flag the
             # mutation before the first select write, not after the flush.
             state = replace(state, selection_mutated=True)
@@ -1149,16 +2592,6 @@ class MESH_OT_ydd_symmetric_edit_inset_bevel_intercept(_OperatorBase):
             bm.select_flush_mode()
             bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
             token.s1 = _capture_selection(bm)
-
-            push_result = bpy.ops.ed.undo_push(message=UNDO_PUSH_MESSAGE)
-            if not _undo_push_finished(push_result):
-                return self._apply_transaction_action(
-                    context,
-                    state,
-                    next_transaction_action(state, TransactionEvent.PUSH_FAILED),
-                )
-            state = replace(state, push_finished=True)
-
             return self._arm_or_leave(context, state, token, warn_on_success=False)
         except Exception:
             traceback.print_exc()
@@ -1184,8 +2617,11 @@ class MESH_OT_ydd_symmetric_edit_inset_bevel_intercept(_OperatorBase):
             if action is TransactionAction.ATTEMPT_ARM:
                 continue
             _operator_report(self, {"WARNING"}, ARM_FAILED_WARNING)
-            _discard_active_token()
-            return {"PASS_THROUGH"}
+            return self._apply_transaction_action(
+                context,
+                state,
+                TransactionAction.RESTORE_S0_DISCARD_TOKEN_WARN_PASS_THROUGH,
+            )
 
     def _apply_transaction_action(self, context, state: TransactionState, action: TransactionAction):
         token = _ACTIVE_TOKEN
@@ -1204,14 +2640,21 @@ class MESH_OT_ydd_symmetric_edit_inset_bevel_intercept(_OperatorBase):
             TransactionAction.RESTORE_S0_DISCARD_TOKEN_WARN_PASS_THROUGH,
         }:
             if action is TransactionAction.RESTORE_S0_DISCARD_TOKEN_WARN_PASS_THROUGH:
-                _operator_report(self, {"WARNING"}, PUSH_FAILED_WARNING)
+                _operator_report(self, {"WARNING"}, ARM_FAILED_WARNING)
             if token is not None:
                 try:
                     if not _restore_s0(token):
                         _operator_report(self, {"WARNING"}, RESTORE_FAILED_WARNING)
+                        _operator_report(self, {"WARNING"}, "Inset/Bevel restore failed; clearing all selection")
+                        _clear_all_selection(token)
                 except Exception:
                     traceback.print_exc()
                     _operator_report(self, {"WARNING"}, RESTORE_FAILED_WARNING)
+                    _operator_report(self, {"WARNING"}, "Inset/Bevel restore failed; clearing all selection")
+                    try:
+                        _clear_all_selection(token)
+                    except Exception:
+                        traceback.print_exc()
             _discard_active_token()
             return {"PASS_THROUGH"}
         if action is TransactionAction.ATTEMPT_ARM:
@@ -1220,10 +2663,6 @@ class MESH_OT_ydd_symmetric_edit_inset_bevel_intercept(_OperatorBase):
             return self._arm_or_leave(context, state, token, warn_on_success=True)
         if action is TransactionAction.WARN_PASS_THROUGH:
             _operator_report(self, {"WARNING"}, ARM_FAILED_WARNING)
-            return {"PASS_THROUGH"}
-        if action is TransactionAction.LEAVE_EXPANDED_WARN_DISCARD_TOKEN:
-            _operator_report(self, {"WARNING"}, ARM_FAILED_WARNING)
-            _discard_active_token()
             return {"PASS_THROUGH"}
         if action is TransactionAction.WARN_ONLY:
             _operator_report(self, {"WARNING"}, RESTORE_FAILED_WARNING)

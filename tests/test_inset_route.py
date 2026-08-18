@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""GUI regression for Inset Faces EXPAND_PASSTHROUGH (contract v3.1 §9 / §0).
+"""GUI regression for Inset Faces REPLAY_POSTCONFIRM (contract v4.3 §9 / §0).
 
 Run with Blender's real window/event loop::
 
@@ -123,10 +123,10 @@ def clear_scene():
             bpy.data.meshes.remove(old_mesh)
 
 
-def build_grid(*, select_mode="FACE"):
+def build_grid(*, select_mode="FACE", x_subdivisions=4):
     clear_scene()
     with override():
-        bpy.ops.mesh.primitive_grid_add(x_subdivisions=4, y_subdivisions=4, size=2.0)
+        bpy.ops.mesh.primitive_grid_add(x_subdivisions=x_subdivisions, y_subdivisions=4, size=2.0)
         bpy.ops.wm.tool_set_by_id(name="builtin.select_box")
     obj = bpy.context.active_object
     obj.use_mesh_mirror_x = True
@@ -396,10 +396,25 @@ def case_i_confirm():
     sel = selected_face_centers(obj)
     print(f"YSE_INSET_I_CONFIRM={before}->{after} sel={sel}", flush=True)
     assert after != before, "I confirm produced no net topology change"
+    assert after[0] - before[0] == 8, f"single-face mirrored inset must add 8 verts, {before}->{after}"
     assert after[0] > before[0] and after[2] > before[2], f"expected inset net increment, {before}->{after}"
     assert_x_symmetric(obj, label="i_confirm")
-    assert both_sides_selected(sel), f"I confirm left a one-sided selection {sel}"
+    assert not any(center[0] < 0 for center in sel), f"I confirm OFF retained mirror-side selection {sel}"
     assert_no_temp_state(label="i_confirm")
+
+
+def case_select_mirrored_on():
+    STATE["case"] = "select_mirrored_on"
+    print("YSE_INSET_CASE=select_mirrored_on", flush=True)
+    obj = build_grid()
+    select_faces(obj, [FACE_PLUS])
+    bpy.context.scene.ydd_symmetric_edit.select_mirrored = True
+    yield from wait_route("I")
+    yield from inset_key_confirm()
+    sel = selected_face_centers(obj)
+    assert both_sides_selected(sel), f"select_mirrored ON did not retain F_user ∪ F_mirror {sel}"
+    bpy.context.scene.ydd_symmetric_edit.select_mirrored = False
+    assert_no_temp_state(label="select_mirrored_on")
 
 
 def case_undo_redo():
@@ -421,14 +436,15 @@ def case_undo_redo():
     undone = topology_counts(obj)
     sel_undone = selected_face_centers(obj)
     print(f"YSE_INSET_UNDO={undone} sel={sel_undone} pre={sel_before}", flush=True)
-    assert undone == baseline, f"undo 1 did not restore baseline {undone} != {baseline}"
-    # Keymap path: undo 1 lands on the §0 select step (pre-op mesh + expanded
-    # selection). The spike-INVOKE path in §7's parenthetical "拡張前選択" is
-    # a different undo grouping.
-    assert both_sides_selected(sel_undone), f"undo landing was not the expanded select-step {sel_undone}"
-    assert any(
-        abs(center[0] - FACE_PLUS[0]) < 1e-3 and abs(center[1] - FACE_PLUS[1]) < 1e-3 for center in sel_undone
-    ), f"original face missing from undo landing {sel_undone}"
+    assert undone != baseline, "undo 1 skipped the native one-sided intermediate state"
+    assert not any(center[0] < 0 for center in sel_undone), f"undo 1 was not the native one-sided result {sel_undone}"
+    with override():
+        undo_result = bpy.ops.ed.undo()
+    assert undo_result == {"FINISHED"}, undo_result
+    assert topology_counts(current_object()) == baseline, "undo 2 did not restore the baseline"
+    with override():
+        redo_result = bpy.ops.ed.redo()
+    assert redo_result == {"FINISHED"}, redo_result
     with override():
         redo_result = bpy.ops.ed.redo()
     assert redo_result == {"FINISHED"}, redo_result
@@ -437,27 +453,6 @@ def case_undo_redo():
     assert redone == confirmed, f"redo did not restore confirmed topology {redone} != {confirmed}"
     assert_x_symmetric(obj, label="undo_redo redo")
     assert_no_temp_state(label="undo_redo")
-
-
-def case_f9_undo_redo():
-    STATE["case"] = "f9_undo_redo"
-    print("YSE_INSET_CASE=f9_undo_redo", flush=True)
-    obj = build_grid()
-    select_faces(obj, [FACE_PLUS])
-    yield from wait_route("I")
-    yield from inset_key_confirm()
-    before = topology_counts(obj)
-    assert_x_symmetric(obj, label="f9 before")
-    assert bpy.ops.ed.undo_redo.poll(), "ed.undo_redo.poll() is False after inset confirm"
-    with override():
-        result = bpy.ops.ed.undo_redo()
-    assert result == {"FINISHED"}, result
-    obj = current_object()
-    after = topology_counts(obj)
-    print(f"YSE_INSET_F9={before}->{after}", flush=True)
-    assert after == before, f"undo_redo changed topology {before}->{after}"
-    assert_x_symmetric(obj, label="f9 after undo_redo")
-    assert_no_temp_state(label="f9_undo_redo")
 
 
 def case_esc_cancel():
@@ -501,15 +496,19 @@ def case_zero_drag():
     select_faces(obj, [FACE_PLUS])
     yield from wait_route("I")
     before = topology_counts(obj)
-    sel_before = selected_face_centers(obj)
     yield from inset_key_confirm(drag=False, confirm="LMB")
     after = topology_counts(obj)
     sel_after = selected_face_centers(obj)
     print(f"YSE_INSET_ZERO={before}->{after} sel={sel_after}", flush=True)
     assert after != before, "zero-drag inset produced no topology change (RG8)"
     assert_x_symmetric(obj, label="zero_drag")
-    assert sel_after != sel_before, f"zero-drag treated as CANCELLED restore {sel_after}"
-    assert both_sides_selected(sel_after), f"zero-drag selection not CONFIRMED/both-sided {sel_after}"
+    # select_mirrored is OFF here: the contract lands on F_user (the native
+    # final selection), which for a FACE inset keeps the same face centers.
+    # The replay itself is proven by the count change + symmetry above.
+    assert sel_after, "zero-drag confirm left nothing selected"
+    assert not any(center[0] < 0 for center in sel_after), (
+        f"zero-drag OFF normalization retained mirror-side selection {sel_after}"
+    )
     assert_no_temp_state(label="zero_drag")
 
 
@@ -540,6 +539,28 @@ def case_midplane():
     assert_no_temp_state(label="midplane")
 
 
+def case_mixed_sm_passthrough():
+    STATE["case"] = "mixed_sm_passthrough"
+    print("YSE_INSET_CASE=mixed_sm_passthrough", flush=True)
+    obj = build_grid(x_subdivisions=5)
+    select_faces(obj, [(0.0, 0.25), (0.4, 0.25)])
+    inset_bevel._REPORTS.clear()
+    yield from wait_route("I")
+    cx, cy = viewport_center()
+    send_move(cx, cy)
+    yield 0.1
+    send_key("I", x=cx, y=cy)
+    yield 0.3
+    assert inset_bevel._ACTIVE_TOKEN is None, "mixed SM inset must not arm a replay token"
+    assert any("overlap" in message.lower() for _level, message in inset_bevel._REPORTS)
+    send_move(cx + 60, cy + 40)
+    yield 0.15
+    send_mouse("LEFTMOUSE", cx + 60, cy + 40)
+    yield "modal_exit"
+    yield from wait_token_cleared()
+    assert_no_temp_state(label="mixed_sm_passthrough")
+
+
 def case_tool_click_drag():
     STATE["case"] = "tool_click_drag"
     print("YSE_INSET_CASE=tool_click_drag", flush=True)
@@ -554,7 +575,7 @@ def case_tool_click_drag():
     print(f"YSE_INSET_TOOL={before}->{after} sel={sel}", flush=True)
     assert after != before, "tool CLICK_DRAG produced no topology change"
     assert_x_symmetric(obj, label="tool_click_drag")
-    assert both_sides_selected(sel), f"tool inset left a one-sided selection {sel}"
+    assert not any(center[0] < 0 for center in sel), f"tool inset OFF retained mirror-side selection {sel}"
     assert_no_temp_state(label="tool_click_drag")
 
 
@@ -611,12 +632,13 @@ def case_unmatched():
 
 def main_gen():
     yield from case_i_confirm()
+    yield from case_select_mirrored_on()
     yield from case_undo_redo()
-    yield from case_f9_undo_redo()
     yield from case_esc_cancel()
     yield from case_rmb_cancel()
     yield from case_zero_drag()
     yield from case_midplane()
+    yield from case_mixed_sm_passthrough()
     yield from case_tool_click_drag()
     yield from case_hidden()
     yield from case_unmatched()

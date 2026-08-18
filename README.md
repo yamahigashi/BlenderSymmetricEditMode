@@ -19,9 +19,10 @@ symmetrical mesh:
   extrusion is built on confirm and follows Adjust Last Operation (F9). See
   the [Extrude section](#extrude-e--toolbar-extrude-tools--alte) for details.
 - **Inset Faces and Bevel** — **I**, **Ctrl+B**, **Ctrl+Shift+B**, and the
-  toolbar **Inset Faces** / **Bevel** tools. The selection is expanded to
-  the mirrored side, then the native modal runs, so the drag preview is
-  already symmetric. See the
+  toolbar **Inset Faces** / **Bevel** tools. Inset runs on your side and is
+  repeated on the mirror side when you confirm (the exact mirror of a
+  one-sided inset); Bevel expands the selection first so an edge chain
+  crossing the symmetry plane bevels as one continuous strip. See the
   [Inset / Bevel section](#inset-faces-and-bevel-i--ctrlb--toolbar).
 
 In all cases the native tool remains the one you are using: shortcuts, modal
@@ -211,28 +212,51 @@ keeps the native layout; **Limited Dissolve** stays native (out of scope).
 ## Inset Faces and Bevel (I / Ctrl+B / toolbar)
 
 With the add-on enabled and one symmetry axis active, **Inset Faces** and
-**Bevel** expand the selection to the mirrored side and then let Blender's
-own modal run:
+**Bevel** are mirrored, each with the semantics that matches the tool:
 
-- **I** insets the selected faces. **Ctrl+B** bevels edges; **Ctrl+Shift+B**
-  bevels vertices. The toolbar **Inset Faces** and **Bevel** tools (click-drag
-  in the viewport) are included. Because the native modal sees both sides
-  already selected, the live preview is symmetric from the first drag.
+- **Inset (I, and the toolbar Inset Faces tool)** runs Blender's modal on
+  your own selection, untouched — the drag preview shows your side only.
+  When you confirm, the add-on repeats the same inset (same values) once on
+  the mirrored region. The result is exactly the mirror of what a one-sided
+  inset produces: a region that touches the symmetry plane keeps its inset
+  rim along the plane, on both sides.
+- **Bevel (Ctrl+B edges, Ctrl+Shift+B vertices, and the toolbar Bevel
+  tool)** expands the selection to the mirrored side first and then lets the
+  native modal run, so an edge chain crossing the symmetry plane bevels as
+  one continuous, symmetric strip and the preview is symmetric from the
+  first drag.
+- After the operation the selection follows the **Select Mirrored** option:
+  when it is off (default) only your side of the result stays selected;
+  when it is on, both sides stay selected.
 - If every selected element has a visible mirrored counterpart, the confirmed
   result is symmetric. A counterpart that is only hidden declines the
   operation (nothing changes, with a warning). A mesh that is itself
   asymmetric — no counterpart exists — runs the native operator on the
   selected side only, with a warning; the result is not guaranteed.
-- The Adjust Last Operation (**F9**) panel stays the native `Inset Faces` /
-  `Bevel` operator. Changing a property and applying it again stays
-  symmetric. One undo restores the mesh to the pre-operation state; redo
-  brings the symmetric result back.
 
 Known limits:
 
-- When the add-on expands the selection it records that as an undo step, so
-  any redo branch you had open is discarded. Immediately after cancelling
-  (Esc / right-click), Ctrl+Z may show the expanded selection for a moment.
+- **Inset undo is two steps**: the first undo shows the one-sided (native)
+  result, the second returns to the pre-operation state. Redo walks the same
+  states in reverse. Bevel undo is a single step back to the pre-operation
+  state with your own selection.
+- **The F9 panel stays symmetric for both tools**: adjusting a value in the
+  Adjust Last Operation panel re-applies the mirror side automatically. If
+  the mesh can no longer be mirrored at that moment (a hidden counterpart
+  appeared, the mesh became asymmetric), the adjustment is neutralized with
+  a console warning instead of producing a one-sided result.
+- **Redo after an undo of a Bevel** restores the native result with both
+  sides selected; the selection is normalized again only after your next
+  operation.
+- For inset, a selection that mixes faces sitting across the symmetry plane
+  with one-sided faces cannot be mirrored by a repeat run; it passes through
+  to the native operator with a warning. The same applies to a selection
+  that already partially includes both sides. Bevel handles the crossing
+  case natively via its expanded selection.
+- Neither tool touches the undo stack when it starts, so opening an inset
+  or bevel no longer discards a redo branch.
+- If the mirror-side repeat of an inset fails, the mesh keeps the one-sided
+  native result and a warning is reported.
 - Dragging a toolbar **gizmo handle** (`VIEW3D_GGT_tool_generic_handle_normal`
   / `_free`) does not go through the keymap and is not mirrored.
 - F3 search, menus, and scripted calls to `mesh.inset` / `mesh.bevel` are

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""GUI regression for Bevel EXPAND_PASSTHROUGH (contract v3.1 §9 / §0).
+"""GUI regression for Bevel EXPAND_PASSTHROUGH (contract v4.3 §9 / §0).
 
 Run with Blender's real window/event loop::
 
@@ -119,14 +119,14 @@ def clear_scene():
             bpy.data.meshes.remove(old_mesh)
 
 
-def build_grid(*, select_mode="EDGE"):
+def build_grid(*, select_mode="EDGE", mirror_axis="X"):
     clear_scene()
     with override():
         bpy.ops.mesh.primitive_grid_add(x_subdivisions=4, y_subdivisions=4, size=2.0)
         bpy.ops.wm.tool_set_by_id(name="builtin.select_box")
     obj = bpy.context.active_object
-    obj.use_mesh_mirror_x = True
-    obj.use_mesh_mirror_y = False
+    obj.use_mesh_mirror_x = mirror_axis == "X"
+    obj.use_mesh_mirror_y = mirror_axis == "Y"
     obj.use_mesh_mirror_z = False
     with override():
         bpy.ops.object.mode_set(mode="EDIT")
@@ -159,7 +159,7 @@ def coordinate_key(co):
     return tuple(round(float(value), PRECISION) for value in co)
 
 
-def select_one_side_edge(obj, *, on_plane=False):
+def select_one_side_edge(obj, *, on_plane=False, axis="X"):
     bm = bmesh.from_edit_mesh(obj.data)
     bpy.context.tool_settings.mesh_select_mode = (False, True, False)
     clear_selection(bm)
@@ -167,14 +167,17 @@ def select_one_side_edge(obj, *, on_plane=False):
     target = None
     for edge in bm.edges:
         first, second = edge.verts
-        xs = (first.co.x, second.co.x)
+        xs = (first.co.x, second.co.x) if axis == "X" else (first.co.y, second.co.y)
         if on_plane:
-            if abs(first.co.x) > 1e-6 or abs(second.co.x) > 1e-6:
+            if abs(xs[0]) > 1e-6 or abs(xs[1]) > 1e-6:
                 continue
         else:
-            if not (abs(first.co.x - 0.5) < 1e-6 and abs(second.co.x - 0.5) < 1e-6):
+            if not (abs(xs[0] - 0.5) < 1e-6 and abs(xs[1] - 0.5) < 1e-6):
                 continue
-        if -0.1 < first.co.y < 0.6 and -0.1 < second.co.y < 0.6:
+        if axis == "X" and -0.1 < first.co.y < 0.6:
+            target = edge
+            break
+        if axis == "Y" and -0.1 < first.co.x < 0.6:
             target = edge
             break
     if target is None:
@@ -201,6 +204,45 @@ def select_one_side_vert(obj):
     bm.select_flush_mode()
     bmesh.update_edit_mesh(obj.data)
     return wanted
+
+
+def select_manual_both_side_edges(obj):
+    bm = bmesh.from_edit_mesh(obj.data)
+    bpy.context.tool_settings.mesh_select_mode = (False, True, False)
+    clear_selection(bm)
+    bm.edges.ensure_lookup_table()
+    chosen = []
+    for edge in bm.edges:
+        xs = tuple(vertex.co.x for vertex in edge.verts)
+        ys = tuple(vertex.co.y for vertex in edge.verts)
+        center_y = sum(ys) / len(ys)
+        if all(abs(x - 0.5) < 1e-6 for x in xs) and 0.1 < center_y < 0.6:
+            chosen.append(edge)
+        elif all(abs(x + 0.5) < 1e-6 for x in xs) and -0.6 < center_y < -0.1:
+            chosen.append(edge)
+        if len(chosen) == 2:
+            break
+    if len(chosen) != 2:
+        raise AssertionError("manual-both-sides edge pair not found")
+    for edge in chosen:
+        edge.select = True
+    bm.select_flush_mode()
+    bmesh.update_edit_mesh(obj.data)
+    return tuple(sorted(coordinate_key(vertex.co) for edge in chosen for vertex in edge.verts))
+
+
+def select_span_edge(obj):
+    bm = bmesh.from_edit_mesh(obj.data)
+    bpy.context.tool_settings.mesh_select_mode = (False, True, False)
+    clear_selection(bm)
+    for edge in bm.edges:
+        xs = tuple(vertex.co.x for vertex in edge.verts)
+        if min(xs) < -1e-6 < max(xs) and all(-0.6 < vertex.co.y < 0.6 for vertex in edge.verts):
+            edge.select = True
+            bm.select_flush_mode()
+            bmesh.update_edit_mesh(obj.data)
+            return tuple(sorted(coordinate_key(vertex.co) for vertex in edge.verts))
+    raise AssertionError("span edge not found")
 
 
 def selected_edge_keys(obj):
@@ -420,7 +462,79 @@ def case_ctrl_b():
     print(f"YSE_BEVEL_CTRL_B={before}->{after}", flush=True)
     assert after != before, "Ctrl+B produced no topology change"
     assert_x_symmetric(obj, label="ctrl_b")
+    selected = selected_edge_keys(obj)
+    assert not any(edge[0][0] < -1e-5 or edge[1][0] < -1e-5 for edge in selected), (
+        f"select_mirrored OFF retained mirror-side bevel edges: {selected}"
+    )
     assert_no_temp_state(label="ctrl_b")
+
+
+def case_select_mirrored_on():
+    STATE["case"] = "select_mirrored_on"
+    print("YSE_BEVEL_CASE=select_mirrored_on", flush=True)
+    obj = build_grid(select_mode="EDGE")
+    select_one_side_edge(obj)
+    bpy.context.scene.ydd_symmetric_edit.select_mirrored = True
+    yield from wait_route("B", ctrl=True)
+    yield from bevel_key_confirm()
+    selected = selected_edge_keys(obj)
+    assert any(edge[0][0] < -1e-5 or edge[1][0] < -1e-5 for edge in selected), (
+        f"select_mirrored ON did not retain mirror-side bevel edges: {selected}"
+    )
+    bpy.context.scene.ydd_symmetric_edit.select_mirrored = False
+    assert_no_temp_state(label="select_mirrored_on")
+
+
+def case_undo_one_stage():
+    STATE["case"] = "undo_one_stage"
+    print("YSE_BEVEL_CASE=undo_one_stage", flush=True)
+    obj = build_grid(select_mode="EDGE")
+    user_key = select_one_side_edge(obj)
+    # Interactive selection produces its own undo step; without it the undo
+    # lands on the grid-creation snapshot (everything selected).
+    with override():
+        bpy.ops.ed.undo_push(message="user select")
+    baseline = topology_counts(obj)
+    yield from wait_route("B", ctrl=True)
+    yield from bevel_key_confirm()
+    confirmed = topology_counts(obj)
+    assert confirmed != baseline
+    with override():
+        assert bpy.ops.ed.undo() == {"FINISHED"}
+    yield from wait_token_cleared()
+    assert topology_counts(obj) == baseline, "bevel undo did not collapse to one native step"
+    assert selected_edge_keys(obj) == [user_key], (
+        f"undo landing selection is not the user's own selection {selected_edge_keys(obj)}"
+    )
+    with override():
+        assert bpy.ops.ed.redo() == {"FINISHED"}
+    yield from wait_token_cleared()
+    assert topology_counts(obj) == confirmed
+    assert_x_symmetric(obj, label="undo_one_stage redo")
+    redo_selection = selected_edge_keys(obj)
+    xs = [vertex[0] for edge in redo_selection for vertex in edge]
+    assert any(x < -1e-4 for x in xs) and any(x > 1e-4 for x in xs), (
+        f"redo did not restore the native both-side selection {redo_selection}"
+    )
+    # Plain undo x2 / redo x2: the F9 handler must not touch the landings.
+    with override():
+        assert bpy.ops.ed.undo() == {"FINISHED"}
+    yield 0.4
+    assert topology_counts(obj) == baseline
+    assert selected_edge_keys(obj) == [user_key], "plain undo landing was altered by the handler"
+    with override():
+        assert bpy.ops.ed.undo() == {"FINISHED"}
+    yield 0.4
+    assert topology_counts(obj) == baseline, "second plain undo changed topology"
+    with override():
+        assert bpy.ops.ed.redo() == {"FINISHED"}
+    yield 0.4
+    with override():
+        assert bpy.ops.ed.redo() == {"FINISHED"}
+    yield 0.4
+    assert topology_counts(obj) == confirmed
+    assert_x_symmetric(obj, label="undo_one_stage plain redo")
+    assert_no_temp_state(label="undo_one_stage")
 
 
 def case_ctrl_shift_b():
@@ -534,14 +648,61 @@ def case_tool_verts_ctrl_b_edges():
     assert_no_temp_state(label="tool_verts_ctrl_b_edges")
 
 
+def case_manual_both_sides_skip():
+    STATE["case"] = "manual_both_sides_skip"
+    print("YSE_BEVEL_CASE=manual_both_sides_skip", flush=True)
+    obj = build_grid(select_mode="EDGE")
+    selected_before = select_manual_both_side_edges(obj)
+    yield from wait_route("B", ctrl=True)
+    yield from bevel_key_confirm()
+    selected_after = selected_edge_keys(obj)
+    # The bevel consumes the selected edges themselves, so the skip is
+    # observable only through the rim selection: both sides must survive
+    # (OFF normalization would have dropped every mirror-side element).
+    xs = [vertex[0] for edge in selected_after for vertex in edge]
+    assert any(x < -1e-4 for x in xs) and any(x > 1e-4 for x in xs), (
+        f"manual two-sided bevel unexpectedly normalized selection {selected_before} -> {selected_after}"
+    )
+    assert_no_temp_state(label="manual_both_sides_skip")
+
+
+def case_span_retention():
+    STATE["case"] = "span_retention"
+    print("YSE_BEVEL_CASE=span_retention", flush=True)
+    obj = build_grid(select_mode="EDGE")
+    select_span_edge(obj)
+    yield from wait_route("B", ctrl=True)
+    yield from bevel_key_confirm()
+    selected = selected_edge_keys(obj)
+    assert any(min(edge[0][0], edge[1][0]) < -1e-5 < max(edge[0][0], edge[1][0]) for edge in selected)
+    assert_no_temp_state(label="span_retention")
+
+
+def case_y_axis_normalization():
+    STATE["case"] = "y_axis_normalization"
+    print("YSE_BEVEL_CASE=y_axis_normalization", flush=True)
+    obj = build_grid(select_mode="EDGE", mirror_axis="Y")
+    select_one_side_edge(obj, axis="Y")
+    yield from wait_route("B", ctrl=True)
+    yield from bevel_key_confirm()
+    selected = selected_edge_keys(obj)
+    assert not any(edge[0][1] < -1e-5 or edge[1][1] < -1e-5 for edge in selected)
+    assert_no_temp_state(label="y_axis_normalization")
+
+
 def main_gen():
     yield from case_ctrl_b()
+    yield from case_undo_one_stage()
+    yield from case_select_mirrored_on()
     yield from case_ctrl_shift_b()
     yield from case_on_plane()
     yield from case_esc_cancel()
     yield from case_tool_edges()
     yield from case_tool_verts()
     yield from case_tool_verts_ctrl_b_edges()
+    yield from case_manual_both_sides_skip()
+    yield from case_span_retention()
+    yield from case_y_axis_normalization()
 
     print(MARKER_OK, flush=True)
     sys.stdout.flush()
