@@ -6,7 +6,7 @@ bl_info = {
     "version": (0, 9, 0),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Edit Mode > Edit tab",
-    "description": "Mirror native cut, connect, merge, delete, and extrude edits without a modifier",
+    "description": "Mirror native cut, connect, merge, delete, extrude, rip, inset, and bevel edits without a modifier",
     "category": "Mesh",
     "license": "GPL-3.0-or-later",
 }

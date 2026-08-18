@@ -322,8 +322,10 @@ uv run ty check
 ```
 
 Shared semantic types and structural protocols live in
-`ydd_symmetric_edit/_types.py`; the test procedure, pass criteria, and release
-packaging steps are documented in `docs/testing.md`.
+`ydd_symmetric_edit/_types.py`. The test suite is classified by
+`tests/manifest.toml` and driven by `scripts/run_tests.py`, a WSL-only runner
+that launches Blender through `cmd.exe`; release packaging is handled by
+`scripts/build_dist.py`.
 
 ## License
 
