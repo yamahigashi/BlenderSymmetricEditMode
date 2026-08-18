@@ -2,8 +2,11 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Build (and optionally validate) the ydd_symmetric_edit extension ZIP.
 
-Runs from WSL and drives the Windows Blender executables via cmd.exe. Supports
-a plain build and a trial build (name suffix + trial.py constants patched).
+Supports native Windows and WSL execution. On WSL, Windows Blender
+executables are launched through ``cmd.exe`` and WSL paths are converted with
+``wslpath``. On native Windows, Blender is launched directly and paths are
+already in the format it expects. Supports a plain build and a trial build
+(name suffix + trial.py constants patched).
 """
 
 from __future__ import annotations
@@ -49,6 +52,7 @@ EXPECTED_PACKAGE_FILES = frozenset(
         "gc_gate.py",
         "gizmo_adopt.py",
         "history.py",
+        "inset_bevel.py",
         "keymaps.py",
         "layer_names.py",
         "matching.py",
@@ -74,6 +78,11 @@ EXPECTED_PACKAGE_FILES = frozenset(
 
 class BuildError(RuntimeError):
     pass
+
+
+def running_on_windows() -> bool:
+    """Whether this Python process can invoke Windows executables directly."""
+    return os.name == "nt"
 
 
 def replace_unique(text: str, old: str, new: str) -> str:
@@ -126,10 +135,35 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def normalize_executable_path(value: str | None, setting: str) -> str | None:
+    """Normalize a Blender executable setting without altering its inner path."""
+    if value is None:
+        return None
+
+    normalized = value.strip()
+    if not normalized or all(character in {"'", '"'} for character in normalized):
+        raise BuildError(f"{setting} executable path is empty")
+
+    if len(normalized) >= 2 and normalized[0] == normalized[-1] and normalized[0] in {"'", '"'}:
+        normalized = normalized[1:-1].strip()
+        if not normalized:
+            raise BuildError(f"{setting} executable path is empty")
+
+    return normalized
+
+
 def resolve_blender_paths(args: argparse.Namespace) -> tuple[str, str | None]:
     """Executable paths are machine-local: flags or env vars only, no shipped defaults."""
-    blender52 = args.blender52 or os.environ.get("YSE_BLENDER52")
-    blender42 = args.blender42 or os.environ.get("YSE_BLENDER42")
+    blender52 = normalize_executable_path(
+        args.blender52 if args.blender52 is not None else os.environ.get("YSE_BLENDER52"),
+        "Blender 5.2",
+    )
+    blender42 = None
+    if not args.skip_validate:
+        blender42 = normalize_executable_path(
+            args.blender42 if args.blender42 is not None else os.environ.get("YSE_BLENDER42"),
+            "Blender 4.2",
+        )
     if not blender52:
         raise BuildError("no Blender 5.2 executable configured; pass --blender52 or set YSE_BLENDER52")
     if not blender42 and not args.skip_validate:
@@ -140,18 +174,37 @@ def resolve_blender_paths(args: argparse.Namespace) -> tuple[str, str | None]:
 
 
 def to_windows_path(path: Path) -> str:
-    result = subprocess.run(
-        ["wslpath", "-w", str(path)],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+    """Return a path suitable for Blender's Windows command-line interface."""
+    if running_on_windows():
+        return str(path)
+
+    try:
+        result = subprocess.run(
+            ["wslpath", "-w", str(path)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except FileNotFoundError as error:
+        raise BuildError("wslpath is required when build_dist.py runs outside native Windows") from error
+    except subprocess.CalledProcessError as error:
+        raise BuildError(f"wslpath failed to convert {path}") from error
     return result.stdout.strip()
 
 
+def blender_command(blender_exe: str, arguments: list[str]) -> list[str]:
+    """Build the subprocess command for the current host environment."""
+    if running_on_windows():
+        return [blender_exe, *arguments]
+    return ["cmd.exe", "/c", blender_exe, *arguments]
+
+
 def run_blender_command(blender_exe: str, arguments: list[str], cwd: Path) -> None:
-    command = ["cmd.exe", "/c", blender_exe, *arguments]
-    result = subprocess.run(command, cwd=str(cwd))
+    command = blender_command(blender_exe, arguments)
+    try:
+        result = subprocess.run(command, cwd=str(cwd))
+    except OSError as error:
+        raise BuildError(f"failed to execute Blender command {command}: {error}") from error
     if result.returncode != 0:
         raise BuildError(f"Blender command failed (exit {result.returncode}): {command}")
 

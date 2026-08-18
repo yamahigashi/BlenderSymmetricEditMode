@@ -23,6 +23,13 @@ versions = ["4.2", "5.2"]
 tags = ["fast", "unit"]
 
 [[tests]]
+file = "test_build_dist.py"
+mode = "fast-pytest"
+markers = []
+versions = ["4.2", "5.2"]
+tags = ["fast", "unit"]
+
+[[tests]]
 file = "test_inset_bevel_units.py"
 mode = "fast-pytest"
 markers = []
