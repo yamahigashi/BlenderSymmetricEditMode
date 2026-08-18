@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 """Dependency-neutral names for BMesh layers and mesh attributes."""
 
 EDGE_ORIGINAL_LAYER = ".yse_original_edge"
